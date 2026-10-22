@@ -54,7 +54,7 @@ def load_config(sheets_only: bool = False) -> Config:
     return Config(
         bot_token=need("BOT_TOKEN"),
         openrouter_api_key=need("OPENROUTER_API_KEY"),
-        openrouter_model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini").strip(),
+        openrouter_model=os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free").strip(),
         spreadsheet_id=_required("SPREADSHEET_ID"),
         google_credentials_file=os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json").strip(),
         timezone=os.getenv("TIMEZONE", "Europe/Moscow").strip(),
