@@ -6,10 +6,11 @@ credentials.json
 # Python
 __pycache__/
 *.py[cod]
+*.pyc
 .venv/
 venv/
 
-# IDE / OS
+# Редакторы / ОС
 .idea/
 .vscode/
 Thumbs.db

@@ -4,8 +4,30 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from datetime import date, timedelta
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+
+def use_venv() -> None:
+    """Если рядом есть .venv — перезапускаемся его интерпретатором."""
+    exe = ROOT / ".venv" / ("Scripts" if os.name == "nt" else "bin") / (
+        "python.exe" if os.name == "nt" else "python"
+    )
+    if not exe.is_file() or Path(sys.prefix).resolve() == (ROOT / ".venv").resolve():
+        return
+    try:
+        code = subprocess.call([str(exe), str(Path(__file__).resolve())], cwd=ROOT)
+    except KeyboardInterrupt:
+        code = 0
+    sys.exit(code)
+
+
+use_venv()
 
 import gspread
 

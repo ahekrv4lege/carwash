@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 import time
@@ -46,7 +47,30 @@ def _has_module(name: str) -> bool:
 def check_packages() -> None:
     missing = [p for p in REQUIRED_PACKAGES if not _has_module(p)]
     if missing:
-        fail("Не установлены зависимости. Выполните: pip install -r requirements.txt")
+        fail(
+            "Не установлены зависимости. Выполните:\n"
+            "  python3 -m venv .venv\n"
+            "  .venv/bin/pip install -r requirements.txt   (Windows: .venv\\Scripts\\pip)"
+        )
+
+
+def _venv_python() -> Path | None:
+    """Путь до интерпретатора из .venv, если окружение создано."""
+    subdir = "Scripts" if os.name == "nt" else "bin"
+    exe = ROOT / ".venv" / subdir / ("python.exe" if os.name == "nt" else "python")
+    return exe if exe.is_file() else None
+
+
+def use_venv() -> None:
+    """Если рядом есть .venv — перезапускаемся его интерпретатором."""
+    vpy = _venv_python()
+    if vpy is None or Path(sys.prefix).resolve() == (ROOT / ".venv").resolve():
+        return
+    try:
+        code = subprocess.call([str(vpy), str(Path(__file__).resolve())], cwd=ROOT)
+    except KeyboardInterrupt:
+        code = 0
+    sys.exit(code)
 
 
 def check_config() -> None:
@@ -84,6 +108,7 @@ def run_forever() -> None:
 
 def main() -> None:
     print("── Бот-администратор автомойки ──")
+    use_venv()
     check_python()
     check_files()
     check_packages()

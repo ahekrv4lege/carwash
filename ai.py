@@ -7,7 +7,7 @@ import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from openai import AsyncOpenAI
 
@@ -153,11 +153,11 @@ class Agent:
         self,
         cfg: Config,
         store: Store,
-        notify_admin: Callable[[str], Awaitable[None]] | None = None,
+        reporter=None,  # admin.AdminReporter — уведомления администратору
     ):
         self.cfg = cfg
         self.store = store
-        self.notify_admin = notify_admin
+        self.reporter = reporter
         self.client = AsyncOpenAI(
             api_key=cfg.openrouter_api_key,
             base_url="https://openrouter.ai/api/v1",
@@ -317,8 +317,8 @@ class Agent:
                 tg_id=user.id,
                 username=user.username,
             )
-            if res.get("ok") and self.notify_admin:
-                await self.notify_admin(self._admin_text(res, a, user))
+            if res.get("ok") and self.reporter:
+                await self.reporter.send(self._admin_text(res, a, user), username=user.username)
             return res
 
         if name == "get_my_bookings":
@@ -326,10 +326,11 @@ class Agent:
 
         if name == "cancel_booking":
             res = await asyncio.to_thread(s.cancel_booking, a.get("booking_id", ""), user.id)
-            if res.get("ok") and self.notify_admin:
-                await self.notify_admin(
+            if res.get("ok") and self.reporter:
+                await self.reporter.send(
                     f"❌ Клиент отменил запись #{res['booking_id']} ({res['date']} {res['time']}), "
-                    f"{user.full_name} {'@' + user.username if user.username else ''}"
+                    f"{user.full_name} {'@' + user.username if user.username else ''}",
+                    username=user.username,
                 )
             return res
 

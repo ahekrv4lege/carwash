@@ -9,6 +9,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 from aiogram.utils.chat_action import ChatActionSender
 
+from admin import AdminReporter
 from ai import Agent, ChatUser
 from config import Config, load_config
 from sheets import Store
@@ -32,13 +33,14 @@ def split_text(text: str, limit: int = TG_LIMIT) -> list[str]:
     return parts
 
 
-async def ask_agent(message: Message, agent: Agent, text: str) -> None:
+async def ask_agent(message: Message, agent: Agent, reporter: AdminReporter, text: str) -> None:
     u = message.from_user
     user = ChatUser(id=u.id, username=u.username, full_name=u.full_name)
     async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
         answer = await agent.reply(user, text)
     for chunk in split_text(answer):
         await message.answer(chunk)
+    await reporter.dialog(u.id, u.full_name, u.username, text, answer)
 
 
 @router.message(CommandStart())
@@ -64,13 +66,13 @@ async def cmd_reset(message: Message, agent: Agent) -> None:
 
 
 @router.message(F.contact)
-async def on_contact(message: Message, agent: Agent) -> None:
-    await ask_agent(message, agent, f"Мой номер телефона: {message.contact.phone_number}")
+async def on_contact(message: Message, agent: Agent, reporter: AdminReporter) -> None:
+    await ask_agent(message, agent, reporter, f"Мой номер телефона: {message.contact.phone_number}")
 
 
 @router.message(F.text)
-async def on_text(message: Message, agent: Agent) -> None:
-    await ask_agent(message, agent, message.text)
+async def on_text(message: Message, agent: Agent, reporter: AdminReporter) -> None:
+    await ask_agent(message, agent, reporter, message.text)
 
 
 @router.message()
@@ -83,18 +85,10 @@ async def main() -> None:
     cfg = load_config()
     bot = Bot(cfg.bot_token)
     store = Store(cfg)
+    reporter = AdminReporter(bot, cfg.admin_chat_id)
+    agent = Agent(cfg, store, reporter)
 
-    async def notify_admin(text: str) -> None:
-        if not cfg.admin_chat_id:
-            return
-        try:
-            await bot.send_message(cfg.admin_chat_id, text)
-        except Exception:
-            log.exception("Не удалось отправить уведомление администратору")
-
-    agent = Agent(cfg, store, notify_admin)
-
-    dp = Dispatcher(agent=agent, cfg=cfg)  # попадут в хэндлеры по имени параметров
+    dp = Dispatcher(agent=agent, cfg=cfg, reporter=reporter)  # попадут в хэндлеры по имени параметров
     dp.include_router(router)
 
     await bot.delete_webhook(drop_pending_updates=True)
