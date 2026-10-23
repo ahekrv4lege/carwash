@@ -1,0 +1,11 @@
+# Секреты — никогда не коммитить
+.env
+credentials.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Редакторы
+.vscode/
