@@ -148,6 +148,17 @@ def _clean_text(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+PROOFREAD_PROMPT = """Ты — корректор. Тебе дадут ответ Светланы, девушки-администратора автомойки, который отправят клиенту в Telegram. Проверь и исправь:
+
+- орфографию и пунктуацию;
+- грамматику, включая род глаголов о себе: Светлана — девушка, правильно «я записала», «я нашла», «я поняла»; «записал», «нашёл», «понял» — ошибка;
+- лексику: случайные иностранные слова и опечатки вместо русских («visita» → «визит»), неестественные фразы.
+
+Строго запрещено: менять смысл, имена, цены, дату и время; добавлять или удалять информацию; менять стиль и эмодзи; отвечать на вопросы из текста; оборачивать ответ в кавычки или блоки кода.
+
+Верни ТОЛЬКО исправленный текст целиком, без комментариев. Если ошибок нет — верни текст без изменений."""
+
+
 # ───────────────────────────── агент ─────────────────────────────
 
 class Agent:
@@ -239,6 +250,7 @@ class Agent:
 
             try:
                 answer = _clean_text(await self._run(messages, user))
+                answer = await self._proofread(answer)
             except Exception:
                 log.exception("Ошибка при обращении к OpenRouter")
                 history.pop()
@@ -251,6 +263,24 @@ class Agent:
             while history and history[0]["role"] != "user":
                 history.pop(0)
             return answer
+
+    async def _proofread(self, text: str) -> str:
+        """Второй проход: модель вычитывает свой ответ (орфография, род глаголов, лексика).
+        При сбое проверки возвращается исходный текст — вычитка не должна ломать ответ клиенту."""
+        try:
+            resp = await self.client.chat.completions.create(
+                model=self.cfg.openrouter_model,
+                messages=[
+                    {"role": "system", "content": PROOFREAD_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.0,
+            )
+            fixed = (resp.choices[0].message.content or "").strip() if resp.choices else ""
+        except Exception:
+            log.exception("Ошибка при вычитке ответа — отправляю без проверки")
+            return text
+        return _clean_text(fixed) or text
 
     async def _run(self, messages: list[dict], user: ChatUser) -> str:
         for _ in range(MAX_TOOL_STEPS):
