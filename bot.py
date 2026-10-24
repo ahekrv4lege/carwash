@@ -1,8 +1,13 @@
 """Telegram-бот «администратор автомойки» на aiogram 3. Запуск: python bot.py"""
 from __future__ import annotations
 
+if __name__ == "__main__":
+    from run import main as launch
+    raise SystemExit(launch())
+
 import asyncio
 import logging
+from contextlib import suppress
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -38,8 +43,10 @@ async def ask_agent(message: Message, agent: Agent, reporter: AdminReporter, tex
     user = ChatUser(id=u.id, username=u.username, full_name=u.full_name)
     async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
         answer = await agent.reply(user, text)
+    delivery_token = agent.delivery_token(u.id)
     for chunk in split_text(answer):
         await message.answer(chunk)
+    agent.mark_delivered(u.id, delivery_token)
     await reporter.dialog(u.id, u.full_name, u.username, text, answer)
 
 
@@ -80,6 +87,12 @@ async def on_other(message: Message) -> None:
     await message.answer("Пожалуйста, напишите ваш вопрос текстом 🙂")
 
 
+async def maintain_sessions(agent: Agent) -> None:
+    while True:
+        await asyncio.sleep(60)
+        agent.cleanup_sessions()
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_config()
@@ -90,11 +103,20 @@ async def main() -> None:
 
     dp = Dispatcher(agent=agent, cfg=cfg, reporter=reporter)  # попадут в хэндлеры по имени параметров
     dp.include_router(router)
+    maintenance = asyncio.create_task(maintain_sessions(agent))
 
-    await bot.delete_webhook(drop_pending_updates=True)
-    log.info("Бот запущен. Модель: %s", cfg.openrouter_model)
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        if cfg.sheets_adaptive_enabled and cfg.sheets_discover_on_start:
+            await asyncio.to_thread(store.refresh_schema, force=cfg.sheets_force_schema_refresh)
+        await bot.delete_webhook(drop_pending_updates=False)
+        log.info("Бот запущен. Модель: %s", cfg.conversation_model if cfg.ai_enabled else "AI отключён")
+        await dp.start_polling(bot, close_bot_session=False)
+    finally:
+        maintenance.cancel()
+        with suppress(asyncio.CancelledError):
+            await maintenance
+        try:
+            if agent.client is not None:
+                await agent.client.close()
+        finally:
+            await bot.session.close()

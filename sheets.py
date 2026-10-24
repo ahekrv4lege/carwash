@@ -10,6 +10,7 @@ import re
 import threading
 import time
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Callable
@@ -92,6 +93,11 @@ def digits(value: Any) -> str:
     return re.sub(r"\D", "", str(value))
 
 
+def valid_phone(value: Any) -> bool:
+    return (isinstance(value, str) and 10 <= len(digits(value)) <= 15 and
+            re.fullmatch(r"[+\d\s().\-\u2010-\u2015\u2212\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]+", value) is not None)
+
+
 def _fail(text: str, **extra: Any) -> dict:
     return {"ok": False, "error": text, **extra}
 
@@ -128,8 +134,7 @@ class Catalog:
         for c in self.size_classes:
             if c.lower() == v:
                 return c
-        found = [c for c in self.size_classes if v in c.lower()]
-        return found[0] if len(found) == 1 else None
+        return None
 
     # ---- тариф = сумма цен ДОСТУПНЫХ услуг из состава минус скидка
     def tariff_quote(self, t: Tariff, cls: str) -> dict | None:
@@ -163,7 +168,11 @@ class Catalog:
         if tariff and tariff.strip():
             t = self.tariffs.get(tariff.strip().lower())
             if not t or not t.enabled:
-                return self._err(f"Тариф «{tariff}» не найден или сейчас недоступен")
+                result = self._err(f"Тариф «{tariff}» не найден или сейчас недоступен")
+                if tariff.strip().lower() in self.services:
+                    result.update(field="tariff", code="service_is_not_tariff",
+                                  clarification="Это отдельная услуга; уточните выбор, не подменяйте тариф автоматически")
+                return result
             r = self.tariff_quote(t, cls)
             if not r:
                 return self._err(f"Тариф «{t.name}» сейчас недоступен: все его позиции убраны")
@@ -181,7 +190,10 @@ class Catalog:
         for raw in services or []:
             s = self.services.get(str(raw).strip().lower())
             if not s:
-                return self._err(f"Услуга «{raw}» не найдена в прайсе")
+                result = self._err(f"Услуга «{raw}» не найдена в прайсе")
+                if str(raw).strip().lower() in self.tariffs:
+                    result.update(field="services", code="tariff_is_not_service")
+                return result
             if not s.available:
                 return self._err(f"Услуга «{s.name}» сейчас недоступна")
             price = s.prices.get(cls)
@@ -272,6 +284,19 @@ class Store:
         self._lock = threading.RLock()
         self._cache: dict[str, tuple[float, Any]] = {}
         self._ss = None  # gspread.Spreadsheet, подключаемся лениво
+        self._adaptive = None
+        self._observed = None
+        if cfg.sheets_adaptive_enabled:
+            from adaptive import AdaptiveSheets
+            self._adaptive = AdaptiveSheets(cfg, self._spreadsheet)
+
+    def refresh_schema(self, force: bool = True, validate: bool = False) -> dict:
+        if not self._adaptive:
+            raise RuntimeError("Включите SHEETS_ADAPTIVE_ENABLED для проверки mappings")
+        with self._lock:
+            document = self._adaptive.refresh(force=force, validate=validate)
+            self._invalidate("catalog", "slots", "bookings")
+            return document
 
     # ---------- низкий уровень ----------
     def _spreadsheet(self):
@@ -280,16 +305,21 @@ class Store:
 
             kwargs: dict[str, Any] = {}
             backoff = getattr(gspread, "BackOffHTTPClient", None)  # авто-повтор при лимитах API
-            if backoff:
+            if backoff and not self.cfg.sheets_adaptive_enabled:
                 kwargs["http_client"] = backoff
             gc = gspread.service_account(
                 filename=self.cfg.google_credentials_file, scopes=SCOPES, **kwargs
             )
+            gc.set_timeout((10, 30))
             self._ss = gc.open_by_key(self.cfg.spreadsheet_id)
         return self._ss
 
     def _table(self, title: str) -> tuple[list[str], list[dict[str, Any]]]:
         """Лист -> (заголовки, список строк-словарей). Пустые строки пропускаются."""
+        if self._adaptive:
+            roles = {self.cfg.sheet_services: "services", self.cfg.sheet_tariffs: "tariffs",
+                     self.cfg.sheet_slots: "slots", self.cfg.sheet_bookings: "bookings"}
+            return self._adaptive.table(roles[title], _observed=self._observed)
         values = self._spreadsheet().worksheet(title).get_all_values()
         if not values:
             return [], []
@@ -305,14 +335,30 @@ class Store:
             rows.append(rec)
         return headers, rows
 
+    @contextmanager
+    def fresh_tables(self):
+        """Один свежий пакет для расчёта; финальный write-preflight остаётся независимым."""
+        with self._lock:
+            previous = self._observed
+            self._invalidate("catalog", "slots", "bookings")
+            try:
+                self._observed = self._adaptive.observe() if self._adaptive else None
+                yield
+            except BaseException:
+                self._invalidate("catalog", "slots", "bookings")
+                raise
+            finally:
+                self._observed = previous
+
     def _cached(self, key: str, ttl: int, loader: Callable[[], Any]) -> Any:
-        now = time.monotonic()
-        hit = self._cache.get(key)
-        if hit and now - hit[0] < ttl:
-            return hit[1]
-        value = loader()
-        self._cache[key] = (now, value)
-        return value
+        with self._lock:
+            now = time.monotonic()
+            hit = self._cache.get(key)
+            if hit and now - hit[0] < ttl:
+                return hit[1]
+            value = loader()
+            self._cache[key] = (now, value)
+            return value
 
     def _invalidate(self, *keys: str) -> None:
         for k in keys:
@@ -331,9 +377,10 @@ class Store:
 
     # ---------- прайс и тарифы ----------
     def get_catalog(self, fresh: bool = False) -> Catalog:
-        if fresh:
-            self._invalidate("catalog")
-        return self._cached("catalog", self.cfg.catalog_cache_sec, self._load_catalog)
+        with self._lock:
+            if fresh:
+                self._invalidate("catalog")
+            return self._cached("catalog", self.cfg.catalog_cache_sec, self._load_catalog)
 
     def _load_catalog(self) -> Catalog:
         headers, rows = self._table(self.cfg.sheet_services)
@@ -380,8 +427,8 @@ class Store:
         data["currency"] = self.cfg.currency
         return data
 
-    def calculate_price(self, size_class: str, tariff: str | None, services: list[str]) -> dict:
-        cat = self.get_catalog()
+    def calculate_price(self, size_class: str, tariff: str | None, services: list[str], *, fresh: bool = False) -> dict:
+        cat = self.get_catalog(fresh=fresh)
         cls = cat.match_class(size_class)
         if not cls:
             return _fail("Неизвестный класс автомобиля", size_classes=cat.size_classes)
@@ -432,8 +479,9 @@ class Store:
         )
 
     def free_slots(self, date_str: str | None = None, days: int = 7) -> dict:
-        slots = self._get_slots()
-        _, brows = self._get_bookings()
+        with self._lock:
+            slots = self._get_slots()
+            _, brows = self._get_bookings()
         busy = self._busy(brows)
 
         if date_str:
@@ -467,6 +515,7 @@ class Store:
         self, *, date_str: str, time_str: str, name: str, phone: str, car: str,
         size_class: str, tariff: str | None, services: list[str], comment: str,
         tg_id: int, username: str | None,
+        expected_quote: dict | None = None,
     ) -> dict:
         d, t = parse_date(date_str), parse_time(time_str)
         if not d or not t:
@@ -476,10 +525,10 @@ class Store:
             return _fail("Не указано имя клиента")
         if not car:
             return _fail("Не указан автомобиль")
-        if len(digits(phone)) < 10:
+        if not valid_phone(phone):
             return _fail("Нужен корректный номер телефона клиента")
 
-        with self._lock:  # защита от двойной записи на один слот
+        with self.fresh_tables():  # один свежий снимок под блокировкой до завершения записи
             cat = self.get_catalog(fresh=True)  # актуальные цены/наличие на момент записи
             cls = cat.match_class(size_class)
             if not cls:
@@ -494,6 +543,11 @@ class Store:
             self._invalidate("slots", "bookings")  # слоты и записи — только свежие данные
             slots = self._get_slots()
             headers, brows = self._get_bookings()
+            duplicate = next((r for r in brows if pick(r, "Telegram ID") == str(tg_id)
+                              and parse_date(pick(r, "Дата")) == d and parse_time(pick(r, "Время")) == t
+                              and pick(r, "Автомобиль").casefold() == car.casefold() and self._is_active(r)), None)
+            if duplicate:
+                return _fail("У клиента уже есть такая запись", booking_id=pick(duplicate, "ID"))
             busy = self._busy(brows)
             if slots.get((d, t), 0) - busy.get((d, t), 0) <= 0:
                 return _fail(
@@ -501,10 +555,17 @@ class Store:
                     free_times_that_day=self._free_times(d, slots, busy),
                 )
 
-            ws = self._spreadsheet().worksheet(self.cfg.sheet_bookings)
-            if not headers:
-                ws.append_row(BOOKING_HEADERS, value_input_option="RAW")
-                headers = BOOKING_HEADERS
+            if expected_quote is not None:
+                fields = ("size_class", "tariff", "extras", "lines", "total")
+                if any(q.get(k) != expected_quote.get(k) for k in fields):
+                    return _fail("Цена или состав услуги изменились; нужно новое подтверждение",
+                                 quote_changed=True, quote=dict(q, currency=self.cfg.currency))
+
+            if not self._adaptive:
+                ws = self._spreadsheet().worksheet(self.cfg.sheet_bookings)
+                if not headers:
+                    ws.append_row(BOOKING_HEADERS, value_input_option="RAW")
+                    headers = BOOKING_HEADERS
 
             ids = [int(x) for x in (pick(r, "ID") for r in brows) if x.isdigit()]
             booking_id = max(ids, default=0) + 1
@@ -537,8 +598,11 @@ class Store:
                 "username": f"@{username}" if username else "",
                 "статус": "Новая",
             }
-            row = [data.get(h.strip().lower(), "") for h in headers]
-            ws.append_row(row, value_input_option="RAW")
+            if self._adaptive:
+                self._adaptive.create(data, expected_bookings=brows)
+            else:
+                row = [data.get(h.strip().lower(), "") for h in headers]
+                ws.append_row(row, value_input_option="RAW")
             self._invalidate("bookings")
 
             return {
@@ -557,11 +621,12 @@ class Store:
 
     # ---------- записи клиента ----------
     def my_bookings(self, tg_id: int) -> dict:
-        self._invalidate("bookings")
-        _, rows = self._get_bookings()
+        with self._lock:
+            self._invalidate("bookings")
+            _, rows = self._get_bookings()
         out = []
         for r in rows:
-            if digits(pick(r, "Telegram ID")) != str(tg_id) or not self._is_active(r):
+            if pick(r, "Telegram ID") != str(tg_id) or not self._is_active(r):
                 continue
             d, t = parse_date(pick(r, "Дата")), parse_time(pick(r, "Время"))
             if not d or not t or self._slot_dt(d, t) < self.now():
@@ -580,25 +645,35 @@ class Store:
         out.sort(key=lambda b: (b["date"], b["time"]))
         return {"ok": True, "bookings": out}
 
-    def cancel_booking(self, booking_id: Any, tg_id: int) -> dict:
+    def cancel_booking(self, booking_id: Any, tg_id: int, *, expected_booking: dict | None = None) -> dict:
         with self._lock:
             self._invalidate("bookings")
             headers, rows = self._get_bookings()
             for r in rows:
                 if pick(r, "ID") != str(booking_id).strip():
                     continue
-                if digits(pick(r, "Telegram ID")) != str(tg_id):
+                if pick(r, "Telegram ID") != str(tg_id):
                     return _fail("Запись с таким номером не найдена среди записей этого клиента")
                 if not self._is_active(r):
                     return _fail("Эта запись уже отменена")
                 d, t = parse_date(pick(r, "Дата")), parse_time(pick(r, "Время"))
+                if expected_booking is not None:
+                    observed = {"date": d.isoformat() if d else "", "time": t,
+                                **{key: pick(r, column) for key, column in
+                                   (("car", "Автомобиль"), ("tariff", "Тариф"), ("extras", "Доп. услуги"),
+                                    ("total", "Сумма"), ("status", "Статус"))}}
+                    if any(str(value) != str(expected_booking.get(key)) for key, value in observed.items()):
+                        return _fail("Детали записи изменились. Проверьте свои записи и подтвердите отмену заново")
                 if d and t and self._slot_dt(d, t) < self.now():
                     return _fail("Прошедшую запись отменить нельзя")
                 col = next((i for i, h in enumerate(headers, 1) if h.strip().lower() == "статус"), None)
                 if not col:
                     return _fail("В таблице нет колонки «Статус»")
-                ws = self._spreadsheet().worksheet(self.cfg.sheet_bookings)
-                ws.update_cell(r["__row__"], col, "Отменена")
+                if self._adaptive:
+                    self._adaptive.cancel(r, tg_id)
+                else:
+                    ws = self._spreadsheet().worksheet(self.cfg.sheet_bookings)
+                    ws.update_cell(r["__row__"], col, "Отменена")
                 self._invalidate("bookings")
                 return {
                     "ok": True,

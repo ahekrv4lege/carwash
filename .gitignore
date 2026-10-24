@@ -15,3 +15,12 @@ venv/
 .vscode/
 Thumbs.db
 desktop.ini
+
+# Локальные конфигурации, блокировки и отчёты
+.env.*
+!.env.example
+credentials*.json
+.runtime/
+.pytest_cache/
+.coverage
+tmp/

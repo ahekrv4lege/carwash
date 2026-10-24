@@ -35,8 +35,8 @@ class AdminReporter:
             ]])
         try:
             await self.bot.send_message(self.chat_id, text, reply_markup=kb, parse_mode=parse_mode)
-        except Exception:
-            log.exception("Не удалось отправить сообщение администратору")
+        except Exception as exc:
+            log.error("Не удалось отправить сообщение администратору (%s)", type(exc).__name__)
 
     async def dialog(
         self,
