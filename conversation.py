@@ -70,18 +70,23 @@ def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
         if not isinstance(entry, list) or len(entry) != 2:
             raise ValueError("invalid_fact_entry")
         value, source = entry
-        if not isinstance(source, str) or not source.strip() or folded(source) not in text_value:
+        if not tentative and (not isinstance(source, str) or not source.strip() or folded(source) not in text_value):
             raise ValueError("missing_customer_source")
         if value is None:
             result[field] = None
             continue
         if field == "services":
+            if isinstance(value, str):
+                value = [value]
             if not isinstance(value, list) or len(value) > 30 or any(not isinstance(field_value, str) for field_value in value):
                 raise ValueError("invalid_services")
         elif not isinstance(value, str) or not value.strip() or len(value) > 500:
             raise ValueError("invalid_fact_value")
         else:
             value = value.strip()
+        if tentative:
+            result[field] = value
+            continue
         if field in CATALOG_FIELDS:
             if catalog is None:
                 raise ValueError("catalog_required")
@@ -94,7 +99,7 @@ def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
                 matches = [name for name in names if folded(name) == folded(raw)]
                 previous = known.get(field, []) if field == "services" else [known.get(field, "")]
                 carried = any(folded(raw) == folded(field_value) for field_value in previous)
-                if len(matches) != 1 or not tentative and not carried and folded(matches[0]) not in folded(source):
+                if len(matches) != 1 or not carried and folded(matches[0]) not in folded(source):
                     raise ValueError("unverified_catalog_value")
                 canonical.append(matches[0])
             value = list(dict.fromkeys(canonical)) if field == "services" else canonical[0]
@@ -106,15 +111,10 @@ def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
             relative = {"сегодня": 0, "завтра": 1, "послезавтра": 2}
             if folded(source) in relative:
                 origin = now.date() + timedelta(days=relative[folded(source)])
-            if not parsed_date or not tentative and parsed_date != origin:
+            if not parsed_date or parsed_date != origin:
                 raise ValueError("invalid_date_source")
             value = parsed_date.isoformat()
         elif field == "time":
-            if tentative:
-                if not re.fullmatch(r"\d{2}:\d{2}", value) or not parse_time(value):
-                    raise ValueError("invalid_tentative_time")
-                result[field] = value
-                continue
             if any(not re.fullmatch(r"\s*\d{1,2}[:.]\d{2}(?::00)?\s*", field_value) for field_value in (source, value)):
                 raise ValueError("invalid_time_source")
             value = parse_time(value)

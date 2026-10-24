@@ -14,7 +14,7 @@ from config import ProviderConfig, load_config
 from ai import Agent
 from openai import APIConnectionError, APIStatusError
 from tests.fakes import suggest_mappings
-from providers import client_options, completion_options
+from providers import client_options, completion_options, invalid_tool_output
 from tests.fakes import config, fixture
 
 
@@ -23,6 +23,13 @@ ENV = {"BOT_TOKEN": "123456:synthetic_token_never_used_12345", "SPREADSHEET_ID":
 
 
 class ProviderTests(unittest.TestCase):
+    def test_only_cloudflare_invalid_generated_tool_json_is_recoverable(self):
+        body = {"errors": [{"code": 3030, "message": "AiError: Invalid JSON: expected value"}]}
+        self.assertTrue(invalid_tool_output(N(status_code=400, body=body)))
+        for status, detail in ((429, body), (400, None), (400, {"errors": None}),
+                               (400, {"errors": [{"code": 3030, "message": "Invalid input"}]})):
+            self.assertFalse(invalid_tool_output(N(status_code=status, body=detail)))
+
     def load(self, **env):
         with patch.dict(os.environ, dict(ENV, **env), clear=True):
             return load_config()
@@ -225,6 +232,29 @@ class Fallback(unittest.IsolatedAsyncioTestCase):
 
     async def test_success_does_not_create_backup(self):
         await self.agent._request(messages=[])
+        self.assertEqual(self.factory.call_count, 1)
+
+    async def test_cloudflare_tool_output_uses_one_named_response_retry(self):
+        error = self.error(400)
+        error.body = {"errors": [{"code": 3030, "message": "Invalid JSON: expected value"}]}
+        client = self.clients[0].chat.completions.create
+        client.side_effect = [error, "synthetic-result"]
+        result = await self.agent._request(messages=[], tools=[{"function": {"name": "respond"}}], tool_choice="required")
+        self.assertEqual(result, "synthetic-result")
+        self.assertEqual(client.await_count, 2)
+        self.assertEqual(client.call_args.kwargs["tool_choice"], {"type": "function", "function": {"name": "respond"}})
+        self.assertEqual(self.factory.call_count, 1)
+
+    async def test_cloudflare_output_recovery_is_not_repeated_or_used_for_input_errors(self):
+        client = self.clients[0].chat.completions.create
+        for message, expected in (("Invalid JSON", 2), ("Invalid input", 1)):
+            error = self.error(400)
+            error.body = {"errors": [{"code": 3030, "message": message}]}
+            client.reset_mock()
+            client.side_effect = error
+            with self.assertRaises(APIStatusError):
+                await self.agent._request(messages=[], tools=[{"function": {"name": "respond"}}])
+            self.assertEqual(client.await_count, expected)
         self.assertEqual(self.factory.call_count, 1)
 
     async def test_backup_connection_and_client_are_reused(self):

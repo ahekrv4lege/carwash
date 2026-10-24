@@ -5,6 +5,14 @@ import logging
 from urllib.parse import urlsplit
 
 
+def invalid_tool_output(error) -> bool:
+    body = getattr(error, "body", None)
+    return (getattr(error, "status_code", None) == 400 and isinstance(body, dict)
+            and isinstance(body.get("errors"), list) and any(
+                isinstance(item, dict) and item.get("code") == 3030
+                and "Invalid JSON" in str(item.get("message", "")) for item in body["errors"]))
+
+
 def private_sdk_logging() -> None:
     # SDK может печатать тела запросов при OPENAI_LOG=debug.
     prefixes = ("openai", "httpx", "httpx2", "httpcore")

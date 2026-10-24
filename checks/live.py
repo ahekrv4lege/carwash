@@ -79,6 +79,14 @@ class GoogleSheets(unittest.TestCase):
             google.http_client.session.close()
 
 
+class BookingDialog(unittest.IsolatedAsyncioTestCase):
+    async def test_real_ai_booking_confirmation_and_followup_questions(self):
+        from booking_dialog import run_dialog
+
+        with tempfile.TemporaryDirectory() as folder:
+            await run_dialog(self.config, folder)
+
+
 class AIProvider(unittest.IsolatedAsyncioTestCase):
     async def test_real_dialog_preserves_name_and_car(self):
         from tests.fakes import fixture
@@ -149,7 +157,7 @@ def suite():
     config = validate_config()
     providers = [ProviderConfig(config.ai_base_url, config.ai_api_key, config.ai_model), *config.llm_fallbacks]
     result = unittest.TestSuite()
-    for base in (Telegram, GoogleSheets):
+    for base in (Telegram, GoogleSheets, BookingDialog):
         case = type(base.__name__, (base,), {"config": config, "__module__": __name__})
         result.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(case))
     for index, provider in enumerate(providers, 1):

@@ -14,7 +14,7 @@ from typing import Any
 from openai import AsyncOpenAI, APIConnectionError, APIStatusError, RateLimitError
 
 from config import Config
-from providers import client_options, completion_options
+from providers import client_options, completion_options, invalid_tool_output
 from sheets import WEEKDAYS_RU, Store, parse_date, parse_time, digits, valid_phone
 from conversation import (CATALOG_FIELDS, FIELDS, apply_patch, folded, model_state,
                           redact_phone, safe_reply, same, strict_json, unpack, validate_patch)
@@ -44,7 +44,7 @@ SELECTION = {"size_class": {"type": "string", "description": "From size_classes"
 BOOKING = {"date": {"type": "string", "description": "ГГГГ-ММ-ДД"},
            "time": {"type": "string", "description": "HH:MM, available slot"},
            "client_name": TEXT, "phone": TEXT, "car": TEXT, **SELECTION, "comment": TEXT}
-UPDATES = {"type": "object", "description": "Changes: client_name,phone,car,size_class,requested_service,requested_datetime,tariff,services,date,time,comment. Values [value,exact CURRENT customer quote]; null clears. For service edits include full services and tariff (null removes); known catalog values may be carried from CUSTOMER. Copy free text/new catalog labels literally. ISO date from explicit date or сегодня/завтра/послезавтра; time HH:MM. Uncertain interpretations go to tentative."}
+UPDATES = {"type": "object", "description": "Changes: client_name,phone,car,size_class,requested_service,requested_datetime,tariff,services,date,time,comment. Values [value,exact CURRENT customer quote]; [null,quote] clears. For service edits include full services and tariff (null removes); known catalog values may be carried from CUSTOMER. Copy free text/new catalog labels literally. ISO date from explicit date or сегодня/завтра/послезавтра; time HH:MM. Uncertain interpretations go to tentative."}
 TOOLS = [
     _tool("respond", "Final reply + same-call memory update. CUSTOMER: facts=user-provided, tentative=uncertain. STATE=tool-verified. May accompany tools; await results. Python fills known booking fields.",
           {"reply": TEXT, "facts": UPDATES, "tentative": {"type": "object", "description": "Uncertain/inferred options in the same [value,quote] format; never book these."}}, ("reply",)),
@@ -193,6 +193,7 @@ car копируй буквально из цитаты: «лансер девя
 Не копируй прежние факты из CUSTOMER в facts: цитаты проверяются только по текущему сообщению.
 Неуверенные предположения помещай в tentative; класс не угадывай. Без новых фактов facts={{}}, tentative={{}}.
 Одно поле передавай либо в facts, либо в tentative, не в обоих сразу.
+Пример facts для услуги: {{"services":[["Мойка"],"Мойка"]}}. Сброс: [null,"цитата клиента"], без цитаты поле не передавай.
 Для данных таблицы сначала вызови инструмент, дождись результата и ответь через respond.
 Изменения памяти можно передать через respond рядом с инструментом."""
 
@@ -320,24 +321,30 @@ car копируй буквально из цитаты: «лансер девя
         if not isinstance(changes, dict) or not isinstance(tentative, dict) or changes.keys() & tentative.keys():
             raise ValueError("contradictory_fact_status")
         source = self._turn_text.get(user.id, "")
+        text_value = folded(source)
         for updates, key in ((changes, "facts"), (tentative, "tentative")):
             known = self._state[user.id].get(key, {})
             for field, entry in list(updates.items()):
-                if (field in known and isinstance(entry, list) and len(entry) == 2 and entry[0] == known[field]
-                        and isinstance(entry[1], str) and folded(entry[1]) not in folded(source)):
+                if field == "services" and isinstance(entry, list) and len(entry) == 1:
+                    entry = updates[field] = entry[0]
+                if entry is None or entry == [None, None] or (field in known and isinstance(entry, list) and len(entry) == 2
+                        and (entry[0] == known[field] or field == "services" and _service_names(entry[0]) == known[field])
+                        and isinstance(entry[1], str) and folded(entry[1]) not in text_value):
                     del updates[field]
         sources = (changes, tentative)
         catalog = None
-        if (set(changes) | set(tentative)) & CATALOG_FIELDS:
+        if set(changes) & CATALOG_FIELDS:
             catalog = await asyncio.to_thread(self.store.get_catalog)
         changes = validate_patch(changes, source, self.store.now(), catalog, known=self._state[user.id].get("facts"))
         tentative = validate_patch(tentative, source, self.store.now(), catalog, tentative=True)
         positions = {}
-        text_value = folded(source) if changes or tentative else ""
         for values, entries, current in ((changes, sources[0], self._state[user.id].get("facts", {})),
                                          (tentative, sources[1], self._state[user.id].get("tentative", {}))):
             for field, value in values.items():
-                quote = folded(entries[field][1])
+                quote = entries[field][1]
+                if not isinstance(quote, str) or folded(quote) not in text_value:
+                    continue
+                quote = folded(quote)
                 position = text_value.rfind(quote) + len(quote)
                 previous = self._turn_sources.get(user.id, {}).get(field, -1)
                 if position < previous and not same(field, value, current.get(field)):
@@ -360,7 +367,11 @@ car копируй буквально из цитаты: «лансер девя
                     raise ValueError("booking_conflicts_with_customer_facts")
                 result[field] = facts[field]
             elif field in self._state[user.id].get("invalidated", []) and result.get(field):
-                raise ValueError("invalidated_booking_field_requires_new_customer_fact")
+                if field not in {"tariff", "services"} or any(
+                    folded(value) not in folded(facts.get("requested_service", ""))
+                    for value in _service_names(result[field])
+                ):
+                    raise ValueError("invalidated_booking_field_requires_new_customer_fact")
         for field in ("date", "time", "client_name", "phone", "car", "size_class"):
             if not result.get(field):
                 raise ValueError("missing_booking_details")
@@ -371,7 +382,10 @@ car копируй буквально из цитаты: «лансер девя
                     continue
                 values = value if field == "services" else [value]
                 if any(folded(field_value) not in folded(source) for field_value in values):
-                    raise ValueError("booking_details_not_supplied_by_customer")
+                    if field == "comment":
+                        result[field] = ""
+                    else:
+                        raise ValueError("booking_details_not_supplied_by_customer")
         return result
 
     def _tools(self, user):
@@ -467,6 +481,12 @@ car копируй буквально из цитаты: «лансер девя
             try:
                 return await client.chat.completions.create(**completion_options(config), **arguments)
             except (APIConnectionError, APIStatusError) as error:
+                if invalid_tool_output(error) and any(
+                    tool["function"]["name"] == "respond" for tool in arguments.get("tools", [])
+                ):
+                    log.warning("API вернул неверный JSON инструмента; одна попытка respond")
+                    return await client.chat.completions.create(**completion_options(config), **dict(
+                        arguments, tool_choice={"type": "function", "function": {"name": "respond"}}))
                 if not self._retryable_api_error(error) or attempt == retries:
                     raise
                 await asyncio.sleep(0.25 * (attempt + 1))
@@ -595,6 +615,7 @@ car копируй буквально из цитаты: «лансер девя
         try:
             arguments = strict_json(raw)
             if isinstance(arguments, dict):
+                arguments = {key: value for key, value in arguments.items() if value is not None}
                 if name == "calculate_price":
                     arguments = self._quote_args(arguments, user)
                 normalized = dict(arguments)
@@ -733,6 +754,7 @@ car копируй буквально из цитаты: «лансер девя
             args = strict_json(raw_args or "{}")
             if not isinstance(args, dict) or set(args) - set(schema["properties"]):
                 raise ValueError
+            args = {key: value for key, value in args.items() if value is not None}
             if name == "calculate_price":
                 args = self._quote_args(args, user)
             if any(field_name not in args or not args[field_name] for field_name in schema["required"]):

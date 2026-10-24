@@ -314,6 +314,85 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         await self.agent.reply(self.user, "Старая машина, но оставляю Новая машина")
         self.assertEqual(self.facts()["car"], "Новая машина")
 
+    async def test_bare_null_means_no_update_but_sourced_null_still_clears_a_fact(self):
+        await self.say("Никита", {"client_name": ["Никита", "Никита"]})
+        await self.say("лансер девятый", {"client_name": None, "car": ["лансер девятый", "лансер девятый"]})
+        self.assertEqual(self.facts(), {"client_name": "Никита", "car": "лансер девятый"})
+        await self.say("лансер 9", {"client_name": [None, None], "car": ["лансер 9", "лансер 9"]})
+        self.assertEqual(self.facts()["client_name"], "Никита")
+        await self.say("Уберите имя", {"client_name": [None, "Уберите имя"]})
+        self.assertNotIn("client_name", self.facts())
+        self.assertIn("client_name", self.agent._state[self.user.id]["invalidated"])
+
+    async def test_single_service_string_is_normalized_without_accepting_unknown_catalog_values(self):
+        await self.say("Мойка", {"services": ["Мойка", "Мойка"], "tariff": [None, None]})
+        self.assertEqual(self.facts()["services"], ["Мойка"])
+        await self.say("Неизвестная услуга", {"services": ["Неизвестная услуга", "Неизвестная услуга"]})
+        self.assertEqual(self.facts()["services"], ["Мойка"])
+
+    async def test_optional_null_tool_fields_are_omitted_but_required_and_unknown_fields_stay_checked(self):
+        result = await self.agent._call_tool("get_price_list", '{"size_class":null}', self.user)
+        self.assertTrue(result["ok"])
+        for name, arguments in (("cancel_booking", '{"booking_id":null}'),
+                                ("get_price_list", '{"unknown":null}')):
+            result = await self.agent._call_tool(name, arguments, self.user)
+            self.assertFalse(result["ok"])
+
+    async def test_single_wrapped_service_pair_still_requires_customer_source(self):
+        await self.say("Мойка", {"services": [["Мойка", "Мойка"]]})
+        self.assertEqual(self.facts()["services"], ["Мойка"])
+        await self.say("11:00", {"services": [["Мойка", "Мойка"]], "time": ["11:00", "11:00"]})
+        self.assertEqual(self.facts()["time"], "11:00")
+        self.assertEqual(self.facts()["services"], ["Мойка"])
+        await self.say("Что дальше?", {"services": [["Воск", "Воск"]]})
+        self.assertEqual(self.facts()["services"], ["Мойка"])
+
+    async def test_null_price_argument_cache_uses_the_actual_customer_class(self):
+        self.agent._state[self.user.id]["facts"] = {"size_class": "Легковой"}
+        first = self.agent._normalized_arguments("calculate_price", '{"size_class":null,"services":["Мойка"]}', self.user)
+        self.assertEqual(json.loads(first)["size_class"], "легковой")
+        self.agent._state[self.user.id]["facts"]["size_class"] = "Кроссовер"
+        second = self.agent._normalized_arguments("calculate_price", '{"size_class":null,"services":["Мойка"]}', self.user)
+        self.assertEqual(json.loads(second)["size_class"], "кроссовер")
+        self.assertNotEqual(first, second)
+
+    async def test_inferred_options_need_no_customer_quote_but_cannot_authorize_booking(self):
+        await self.say("Какие есть варианты?", tentative={
+            "date": ["2099-01-02", "из расписания"], "time": ["11:00", None],
+            "size_class": ["Седан", "по модели автомобиля"]})
+        self.assertFalse(self.facts())
+        self.assertEqual(self.agent._state[self.user.id]["tentative"]["time"], "11:00")
+        with self.assertRaisesRegex(ValueError, "tentative_choice_requires_clarification"):
+            self.agent._booking_args(ARGS, self.user)
+        await self.say("2099-01-02 в 11:00, класс Легковой", facts={
+            "date": ["2099-01-02", "2099-01-02"], "time": ["11:00", "11:00"],
+            "size_class": ["Легковой", "Легковой"]})
+        self.assertFalse(self.agent._state[self.user.id].get("tentative"))
+        self.assertEqual(self.facts()["size_class"], "Легковой")
+
+    async def test_explicit_service_can_prepare_booking_without_an_invented_summary_comment(self):
+        state = self.agent._state[self.user.id]
+        state.update(facts={key: value for key, value in ARGS.items() if key != "tariff"},
+                     invalidated=["services", "tariff"])
+        state["facts"]["requested_service"] = "Мойка"
+        self.agent._turn_text[self.user.id] = "Хочу услугу Мойка"
+        result = await self.agent._call_tool("create_booking", json.dumps({
+            "services": ["Мойка"], "comment": "Сводка заявки, которую клиент не диктовал"}), self.user)
+        self.assertTrue(result["confirmation_required"])
+        self.assertEqual(self.agent._pending[self.user.id]["args"]["comment"], "")
+        self.assertFalse(sum(len(sheet.writes) for sheet in self.spreadsheet.sheets))
+
+    async def test_explicit_service_does_not_authorize_other_selection_or_drop_literal_comment(self):
+        state = self.agent._state[self.user.id]
+        state.update(facts={key: value for key, value in ARGS.items() if key != "tariff"},
+                     invalidated=["services", "tariff"])
+        state["facts"]["requested_service"] = "Мойка"
+        self.agent._turn_text[self.user.id] = "Мойка. Салон не мочить"
+        with self.assertRaisesRegex(ValueError, "invalidated_booking_field"):
+            self.agent._booking_args({"services": ["Воск"]}, self.user)
+        arguments = self.agent._booking_args({"services": ["Мойка"], "comment": "Салон не мочить"}, self.user)
+        self.assertEqual(arguments["comment"], "Салон не мочить")
+
     async def test_repair_cannot_accept_a_fabricated_customer_quote(self):
         self.transport.side_effect = [response("Учту.", raw=True), response(calls=[
             ("respond", {"reply": "Учту Toyota.", "facts": {"car": ["Toyota", "Toyota"]}})])]
