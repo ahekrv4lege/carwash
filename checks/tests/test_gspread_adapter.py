@@ -26,19 +26,21 @@ class OfflineHTTP(gspread.http_client.HTTPClient):
     def values_get(self, id, range_name, params=None):
         match = re.fullmatch(r"'((?:[^']|'')+)'(?:!(.*))?", range_name)
         title, cells = match.groups()
-        ws = self.source.worksheet(title.replace("''", "'"))
+        worksheet = self.source.worksheet(title.replace("''", "'"))
         render = (params or {}).get("valueRenderOption")
-        values = ws.get(cells, render) if cells else ws.get_all_values(render)
+        values = worksheet.get(cells, render) if cells else worksheet.get_all_values(render)
         return {"range": range_name + "!A1:AD100" if not cells else range_name,
                 "majorDimension": "ROWS", "values": values}
 
     def values_batch_update(self, id, body):
         self.updates.append(deepcopy(body))
         assert body["valueInputOption"] == "RAW"
+        grouped = {}
         for item in body["data"]:
             title, cells = re.fullmatch(r"'((?:[^']|'')+)'!(.*)", item["range"]).groups()
-            self.source.worksheet(title.replace("''", "'")).batch_update(
-                [{"range": cells, "values": item["values"]}], value_input_option="RAW")
+            grouped.setdefault(title.replace("''", "'"), []).append({"range": cells, "values": item["values"]})
+        for title, updates in grouped.items():
+            self.source.worksheet(title).batch_update(updates, value_input_option="RAW")
         return {"totalUpdatedCells": len(body["data"])}
 
 
@@ -47,9 +49,9 @@ class GspreadContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             original, fake = fixture(temp)
             http = OfflineHTTP(fake)
-            ss = gspread.Spreadsheet(http, {"id": "synthetic"})
-            store = Store(original.cfg)
-            store._ss = ss
+            spreadsheet = gspread.Spreadsheet(http, {"id": "synthetic"})
+            store = Store(original.config)
+            store._spreadsheet = spreadsheet
             self.assertTrue(store.create_booking(**booking())["ok"])
             self.assertEqual(len(store.my_bookings(111)["bookings"]), 1)
             self.assertTrue(store.cancel_booking(1, 111)["ok"])
@@ -61,9 +63,9 @@ class GspreadContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             original, fake = fixture(temp)
             http = OfflineHTTP(fake)
-            ss = gspread.Spreadsheet(http, {"id": "synthetic"})
-            store = Store(original.cfg)
-            store._ss = ss
+            spreadsheet = gspread.Spreadsheet(http, {"id": "synthetic"})
+            store = Store(original.config)
+            store._spreadsheet = spreadsheet
             store._adaptive.table("bookings")
             fake.worksheet("Записи").title = "Renamed bookings"
             values_get = http.values_get

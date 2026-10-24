@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 import run
 from config import load_config
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class AuditStartupTests(unittest.TestCase):
@@ -21,9 +21,9 @@ class AuditStartupTests(unittest.TestCase):
         self.root = Path(self.temp.name)
 
     @unittest.skipUnless(os.name == "posix", "Actual Linux execution")
-    def test_direct_bot_script_bootstraps_before_third_party_imports(self):
+    def test_run_script_bootstraps_before_third_party_imports(self):
         # -S removes site packages from the initial interpreter. Reexec must use .venv.
-        proc = subprocess.run([getattr(sys, "_base_executable", sys.executable), "-S", str(ROOT / "bot.py"), "--setup-only", "--no-install"],
+        proc = subprocess.run([getattr(sys, "_base_executable", sys.executable), "-S", str(ROOT / "run.py"), "--setup-only", "--no-install"],
                               cwd=self.root, capture_output=True, text=True, timeout=20)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("готовы", proc.stdout)

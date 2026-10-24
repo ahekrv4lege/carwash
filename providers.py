@@ -9,34 +9,29 @@ def private_sdk_logging() -> None:
     # SDK может печатать тела запросов при OPENAI_LOG=debug.
     prefixes = ("openai", "httpx", "httpx2", "httpcore")
     for name in (*prefixes, *tuple(logging.Logger.manager.loggerDict)):
-        if any(name == p or name.startswith(p + ".") for p in prefixes):
+        if any(name == prefix or name.startswith(prefix + ".") for prefix in prefixes):
             logging.getLogger(name).setLevel(logging.CRITICAL + 1)
 
 
-def client_options(cfg, *, mapping: bool = False) -> dict:
+def client_options(config, *, mapping: bool = False) -> dict:
     private_sdk_logging()
-    url = (cfg.sheets_ai_base_url if mapping else "") or cfg.ai_base_url
-    host = urlsplit(url).hostname
-    if mapping and cfg.sheets_ai_base_url and host != urlsplit(cfg.ai_base_url).hostname:
-        key = cfg.sheets_ai_api_key
+    url = (config.sheets_ai_base_url if mapping else "") or config.ai_base_url
+    if mapping and config.sheets_ai_base_url and urlsplit(url)[:2] != urlsplit(config.ai_base_url)[:2]:
+        key = config.sheets_ai_api_key
     else:
-        key = (cfg.sheets_ai_api_key if mapping else "") or cfg.ai_api_key
-        if not key and host == "openrouter.ai":
-            key = cfg.openrouter_api_key
+        key = (config.sheets_ai_api_key if mapping else "") or config.ai_api_key
     if not key:
         raise RuntimeError("Для выбранного адреса AI нужен отдельный AI_API_KEY или SHEETS_AI_API_KEY")
     options = dict(api_key=key, base_url=url,
-                   timeout=cfg.ai_timeout_sec, max_retries=0)
-    if host == "openrouter.ai":
-        options["default_headers"] = {"X-Title": "CarWash Telegram Bot"}
+                   timeout=config.ai_timeout_sec, max_retries=0)
     return options
 
 
-def completion_options(cfg, *, mapping: bool = False) -> dict:
-    model = (cfg.sheets_ai_model if mapping else "") or cfg.conversation_model
-    options = {"model": model, cfg.ai_token_limit_parameter: 1500 if mapping else cfg.ai_max_output_tokens}
-    if cfg.ai_temperature is not None:
-        options["temperature"] = 0 if mapping else cfg.ai_temperature
-    if cfg.ai_reasoning_effort and not mapping:
-        options["reasoning_effort"] = cfg.ai_reasoning_effort
+def completion_options(config, *, mapping: bool = False) -> dict:
+    model = (config.sheets_ai_model if mapping else "") or config.ai_model
+    options = {"model": model, config.ai_token_limit_parameter: 1500 if mapping else config.ai_max_output_tokens}
+    if config.ai_temperature is not None:
+        options["temperature"] = 0 if mapping else config.ai_temperature
+    if config.ai_reasoning_effort and not mapping:
+        options["reasoning_effort"] = config.ai_reasoning_effort
     return options

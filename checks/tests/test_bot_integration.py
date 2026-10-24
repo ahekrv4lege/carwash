@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from ai import Agent, ChatUser
-from tests.fakes import booking, fixture
+from tests.fakes import fixture
 
 
 class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -11,7 +11,7 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp:
             store, _ = fixture(temp)
             with patch("ai.AsyncOpenAI") as provider:
-                agent = Agent(store.cfg, store)
+                agent = Agent(store.config, store)
                 user = ChatUser(id=111, username=None, full_name="Synthetic")
                 prices = await agent._execute("get_price_list", {}, user)
                 self.assertEqual(prices["services"][0]["prices"]["Легковой"], 700)
@@ -33,14 +33,14 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
             transport.delete_webhook = AsyncMock()
             transport.session.close = AsyncMock()
             agent = Mock()
-            agent.client.close = AsyncMock()
+            agent.close = AsyncMock()
             dispatcher = Mock()
             dispatcher.start_polling = AsyncMock()
-            with patch("bot.load_config", return_value=store.cfg), patch("bot.Bot", return_value=transport), \
+            with patch("bot.load_config", return_value=store.config), patch("bot.Bot", return_value=transport), \
                  patch("bot.Store", return_value=store), patch("bot.Agent", return_value=agent), \
                  patch("bot.Dispatcher", return_value=dispatcher):
                 await bot.main()
             transport.delete_webhook.assert_awaited_once_with(drop_pending_updates=False)
             dispatcher.start_polling.assert_awaited_once_with(transport, close_bot_session=False)
             transport.session.close.assert_awaited_once()
-            agent.client.close.assert_awaited_once()
+            agent.close.assert_awaited_once()

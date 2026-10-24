@@ -10,10 +10,10 @@ from sheets import BOOKING_HEADERS, Store
 
 def coord(cell):
     letters, digits = re.fullmatch(r"([A-Z]+)(\d+)", cell).groups()
-    col = 0
+    column = 0
     for c in letters:
-        col = col * 26 + ord(c) - 64
-    return int(digits), col
+        column = column * 26 + ord(c) - 64
+    return int(digits), column
 
 
 class Worksheet:
@@ -52,16 +52,16 @@ class Worksheet:
             raise OSError("simulated unknown response")
         self.writes.append(deepcopy(updates))
         for update in updates:
-            row, col = coord(update["range"])
+            row, column = coord(update["range"])
             while len(self.values) < row:
                 self.values.append([])
-            while len(self.values[row - 1]) < col:
+            while len(self.values[row - 1]) < column:
                 self.values[row - 1].append("")
-            self.values[row - 1][col - 1] = update["values"][0][0]
+            self.values[row - 1][column - 1] = update["values"][0][0]
 
-    def update_cell(self, row, col, value):
+    def update_cell(self, row, column, value):
         from adaptive import cell_name
-        self.batch_update([{"range": cell_name(row, col), "values": [[value]]}], "RAW")
+        self.batch_update([{"range": cell_name(row, column), "values": [[value]]}], "RAW")
 
     def append_row(self, row, value_input_option=None):
         assert value_input_option == "RAW"
@@ -72,6 +72,9 @@ class Worksheet:
 class Spreadsheet:
     def __init__(self, sheets):
         self.sheets = sheets
+        self.id = "synthetic"
+        from tests.test_gspread_adapter import OfflineHTTP
+        self.client = OfflineHTTP(self)
         self.metadata_reads = 0
 
     def fetch_sheet_metadata(self, params=None):
@@ -80,10 +83,10 @@ class Spreadsheet:
                                           "gridProperties": {"rowCount": s.row_count, "columnCount": s.col_count}},
                             "merges": deepcopy(s.merges)} for s in self.sheets]}
         if (params or {}).get("includeGridData"):
-            for entry, ws in zip(result["sheets"], self.sheets):
+            for entry, worksheet in zip(result["sheets"], self.sheets):
                 entry["data"] = [{"startRow": 0, "startColumn": 0, "rowData": [
-                    {"values": [{"userEnteredValue": {"formulaValue": v}} if str(v).startswith("=") and (r, c) not in ws.literal_cells else {}
-                                for c, v in enumerate(row, 1)]} for r, row in enumerate(ws.values, 1)]}]
+                    {"values": [{"userEnteredValue": {"formulaValue": v}} if str(v).startswith("=") and (r, c) not in worksheet.literal_cells else {}
+                                for c, v in enumerate(row, 1)]} for r, row in enumerate(worksheet.values, 1)]}]
         return result
 
     def values_batch_get(self, ranges, params=None):
@@ -99,8 +102,8 @@ class Spreadsheet:
 
 
 def config(path, **kwargs):
-    cfg = Config(bot_token="123456:synthetic_token_never_used_12345", openrouter_api_key="synthetic",
-                 openrouter_model="existing-model", spreadsheet_id="synthetic-spreadsheet",
+    cfg = Config(bot_token="123456:synthetic_token_never_used_12345", ai_api_key="synthetic",
+                 ai_model="existing-model", spreadsheet_id="synthetic-spreadsheet",
                  google_credentials_file="unused", timezone="Europe/Moscow", carwash_name="Test",
                  carwash_address="", carwash_phone="", currency="₽", admin_chat_id=None,
                  min_lead_minutes=0, catalog_cache_sec=60, slots_cache_sec=15, max_history=24,
@@ -111,19 +114,28 @@ def config(path, **kwargs):
 
 def fixture(path, **kwargs):
     cfg = config(path, **kwargs)
-    ss = Spreadsheet([
+    spreadsheet = Spreadsheet([
         Worksheet(1, "Услуги", [["Услуга", "Описание", "Легковой", "Кроссовер", "Доступна"],
                                  ["Мойка", "Кузов", "700", "800", "да"], ["Воск", "Защита", "200", "300", "нет"]]),
         Worksheet(2, "Тарифы", [["Тариф", "Состав", "Скидка %", "Доступен"], ["Базовый", "Мойка, Воск", "10", "да"]]),
         Worksheet(3, "Слоты", [["Дата", "Время", "Постов"], ["01.01.2099", "10:00", "2"]]),
         Worksheet(4, "Записи", [BOOKING_HEADERS])])
     store = Store(cfg)
-    store._ss = ss
-    return store, ss
+    store._spreadsheet = spreadsheet
+    return store, spreadsheet
 
 
 def booking(**kwargs):
     args = dict(date_str="2099-01-01", time_str="10:00", name="Synthetic", phone="00000000000", car="Fixture car",
-                size_class="Легковой", tariff="Базовый", services=[], comment="", tg_id=111, username=None)
+                size_class="Легковой", tariff="Базовый", services=[], comment="", telegram_id=111, username=None)
     args.update(kwargs)
     return args
+
+
+def suggest_mappings(adaptive, client=None):
+    from mapping_ai import suggest_mappings as suggest
+    if client is None:
+        return suggest(adaptive)
+    from unittest.mock import patch
+    with patch("openai.OpenAI", return_value=client):
+        return suggest(adaptive)

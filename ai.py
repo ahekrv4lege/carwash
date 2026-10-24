@@ -8,7 +8,7 @@ import re
 import time
 from collections import defaultdict, OrderedDict
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from openai import AsyncOpenAI, APIConnectionError, APIStatusError, RateLimitError
@@ -20,6 +20,7 @@ from conversation import (CATALOG_FIELDS, FIELDS, apply_patch, folded, model_sta
                           redact_phone, safe_reply, same, strict_json, unpack, validate_patch)
 
 log = logging.getLogger(__name__)
+PROVIDER_COOLDOWN_SEC = 60
 
 
 @dataclass
@@ -57,18 +58,18 @@ TOOLS = [
     _tool("cancel_booking", "Propose own cancellation; Python requires explicit confirmation before writing.",
           {"booking_id": TEXT}, ("booking_id",)),
 ]
-SCHEMAS = {t["function"]["name"]: t["function"]["parameters"] for t in TOOLS}
+SCHEMAS = {tool["function"]["name"]: tool["function"]["parameters"] for tool in TOOLS}
 
 
-def _as_list(value: Any) -> list[str]:
+def _service_names(value: Any) -> list[str]:
     if value is None or value == "":
         return []
     if isinstance(value, str):
         return [value]
-    return [str(v) for v in value]
+    return [str(field_value) for field_value in value]
 
 
-def _json(value) -> str:
+def _compact_json(value) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -82,9 +83,17 @@ PROOFREAD_PROMPT = "Ты — корректор. Исправь только о�
 
 
 class Agent:
-    def __init__(self, cfg: Config, store: Store, reporter=None):
-        self.cfg, self.store, self.reporter = cfg, store, reporter
-        self.client = AsyncOpenAI(**client_options(cfg)) if cfg.ai_enabled else None
+    def __init__(self, config: Config, store: Store, reporter=None):
+        self.config, self.store, self.reporter = config, store, reporter
+        self.client = AsyncOpenAI(**client_options(config)) if config.ai_enabled else None
+        self._provider_configs = (config, *(
+            replace(config, ai_base_url=provider.base_url, ai_api_key=provider.api_key, ai_model=provider.model)
+            for provider in config.llm_fallbacks
+        ))
+        self._provider_clients = [self.client] + [None] * len(config.llm_fallbacks)
+        self._provider_retry_at = [0.0] * len(self._provider_configs)
+        self._provider_probes: set[int] = set()
+        self._closed = False
         self._history: dict[int, list[dict]] = defaultdict(list)
         self._locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._state: dict[int, dict] = defaultdict(dict)
@@ -98,13 +107,13 @@ class Agent:
     def cleanup_sessions(self, now=None, reserve=0):
         now = time.monotonic() if now is None else now
         expired = []
-        for uid, seen in self._last_seen.items():
-            if now - seen < self.cfg.ai_session_ttl_sec and len(self._last_seen) - len(expired) + reserve <= self.cfg.ai_max_sessions:
+        for user_id, seen in self._last_seen.items():
+            if now - seen < self.config.ai_session_ttl_sec and len(self._last_seen) - len(expired) + reserve <= self.config.ai_max_sessions:
                 break
-            if not self._active.get(uid):
-                expired.append(uid)
-        for uid in expired:
-            self.reset(uid)
+            if not self._active.get(user_id):
+                expired.append(user_id)
+        for user_id in expired:
+            self.reset(user_id)
 
     @asynccontextmanager
     async def _session(self, user_id):
@@ -136,8 +145,11 @@ class Agent:
         self._turn_text.pop(user_id, None)
         self._turn_sources.pop(user_id, None)
 
-    def delivery_token(self, user_id: int):
-        return self._pending.get(user_id, {}).get("delivery_token")
+    def delivery_token(self, user_id: int, reply: str | None = None):
+        pending = self._pending.get(user_id, {})
+        if reply is not None and pending.get("reply") != reply:
+            return None
+        return pending.get("delivery_token")
 
     def mark_delivered(self, user_id: int, token) -> None:
         pending = self._pending.get(user_id)
@@ -147,20 +159,20 @@ class Agent:
 
     def _offer(self, user_id, pending, prefix=""):
         answer = prefix + self._proposal_text(pending)
-        pending.update(delivery_token=object(), delivered=False)
+        pending.update(delivery_token=object(), delivered=False, reply=answer)
         self._pending[user_id] = pending
         self._state[user_id]["pending"] = {"action": pending["action"], "delivered": False}
         return answer
 
-    def _system_prompt(self, user: ChatUser) -> str:
-        c, now = self.cfg, self.store.now()
-        contacts = ", ".join(x for x in (c.carwash_address, c.carwash_phone) if x) or "не указаны"
-        return f"""Ты — Светлана, приветливый администратор автомойки «{c.carwash_name}». О себе — женский род.
-Контакты: {contacts}. Сейчас {now:%Y-%m-%d %H:%M}, {WEEKDAYS_RU[now.weekday()]} ({c.timezone}).
+    def _system_prompt(self) -> str:
+        config, now = self.config, self.store.now()
+        contacts = ", ".join(contact for contact in (config.carwash_address, config.carwash_phone) if contact) or "не указаны"
+        return f"""Ты — Светлана, приветливый администратор автомойки «{config.carwash_name}». О себе — женский род.
+Контакты: {contacts}. Сейчас {now:%Y-%m-%d %H:%M}, {WEEKDAYS_RU[now.weekday()]} ({config.timezone}).
 Пиши естественно по-русски, коротко, 1–3 предложения и один вопрос. Обычный текст без Markdown.
 Помогай выбрать услугу и записаться. Нужны имя, автомобиль/класс, тариф или услуги, дата/время и телефон.
 Не переспрашивай известное; исправления клиента важнее прежних данных. Не угадывай неизвестный класс авто.
-Цены в {c.currency}, состав тарифов и свободное время — только из инструментов. calculate_price считает итог.
+Цены в {config.currency}, состав тарифов и свободное время — только из инструментов. calculate_price считает итог.
 Если класс и услуга уже известны, сразу calculate_price; полный прайс нужен для выбора.
 Показывай недоступные позиции тарифа и изменение цены. При вопросе о времени сначала get_free_slots, затем варианты.
 Точные дата, время и услуга НЕ означают согласие на запись. create_booking только готовит предложение;
@@ -184,8 +196,8 @@ STATE ниже — проверенные инструментами данны�
             saved = f"Результат операции #{result['booking_id']} подтверждён Python; детали в STATE."
         history.extend([{"role": "user", "content": redact_phone(text, phone)},
                         {"role": "assistant", "content": redact_phone(saved, phone)}])
-        while history and (len(history) > min(self.cfg.max_history, self.cfg.ai_recent_turns * 2) or
-                           sum(len(m["content"]) for m in history) > self.cfg.ai_history_chars):
+        while history and (len(history) > min(self.config.max_history, self.config.ai_recent_turns * 2) or
+                           sum(len(message["content"]) for message in history) > self.config.ai_history_chars):
             del history[:2]
         return answer
 
@@ -202,9 +214,9 @@ STATE ниже — проверенные инструментами данны�
     async def reply(self, user: ChatUser, text: str) -> str:
         async with self._session(user.id):
             generation = self._generation[user.id]
-            if not self.cfg.ai_enabled:
+            if not self.config.ai_enabled:
                 return "Автоматический помощник сейчас отключён. Для записи свяжитесь с администратором."
-            if len(text) > self.cfg.ai_history_chars:
+            if len(text) > self.config.ai_history_chars:
                 self._pending.pop(user.id, None)
                 self._state[user.id].update(stage="collecting", confirmed=False)
                 for field in ("pending", "outstanding"):
@@ -238,31 +250,31 @@ STATE ниже — проверенные инструментами данны�
                 if state.get("stage") == "uncertain":
                     return self._remember(user.id, text, "Результат операции не подтверждён. Сначала проверьте свои записи или свяжитесь с администратором; автоматически повторять операцию не буду.")
             state.setdefault("confirmed", False)
-            messages = [{"role": "system", "content": self._system_prompt(user)}]
+            messages = [{"role": "system", "content": self._system_prompt()}]
             projected = model_state(state)
-            customer = {k: projected.pop(k) for k in ("facts", "tentative", "missing", "invalidated") if k in projected}
+            customer = {field_name: projected.pop(field_name) for field_name in ("facts", "tentative", "missing", "invalidated") if field_name in projected}
             if customer:
-                messages.append({"role": "system", "content": "CUSTOMER " + _json(customer)})
+                messages.append({"role": "system", "content": "CUSTOMER " + _compact_json(customer)})
             if projected.keys() - {"confirmed"}:
-                messages.append({"role": "system", "content": "STATE " + _json(projected)})
+                messages.append({"role": "system", "content": "STATE " + _compact_json(projected)})
             history = list(self._history[user.id])
-            while history and sum(len(m["content"]) for m in history) + len(text) > self.cfg.ai_history_chars:
+            while history and sum(len(message["content"]) for message in history) + len(text) > self.config.ai_history_chars:
                 del history[:2]
             messages.extend([*history, {"role": "user", "content": text}])
             try:
                 answer = _clean_text(await self._run(messages, user))
-                if self.cfg.ai_proofread_enabled and user.id not in self._pending:
+                if self.config.ai_proofread_enabled and user.id not in self._pending:
                     answer = await self._proofread(answer)
                 if user.id not in self._pending:
                     checked = safe_reply(answer)
                     if checked != answer:
                         checked = self._receipt(state) or checked
                     answer = checked
-            except Exception as exc:
-                log.error("Ошибка AI (%s)", type(exc).__name__)
+            except Exception as error:
+                log.error("Ошибка AI (%s)", type(error).__name__)
                 self._pending.pop(user.id, None)
                 self._state[user.id].pop("pending", None)
-                phone = f" или позвоните нам: {self.cfg.carwash_phone}" if self.cfg.carwash_phone else ""
+                phone = f" или позвоните нам: {self.config.carwash_phone}" if self.config.carwash_phone else ""
                 answer = f"Сейчас не получилось получить ответ. Попробуйте позже{phone}."
             if generation != self._generation[user.id]:
                 self._pending.pop(user.id, None)
@@ -275,11 +287,11 @@ STATE ниже — проверенные инструментами данны�
         if not state.get("confirmed"):
             return None
         if state.get("stage") == "booked":
-            b = state["booking"]
-            return f"Подтверждённая запись #{b['booking_id']}: {b['date']} в {b['time']}, {b['car']}. Итого {b['total']} {b['currency']}."
+            booking = state["booking"]
+            return f"Подтверждённая запись #{booking['booking_id']}: {booking['date']} в {booking['time']}, {booking['car']}. Итого {booking['total']} {booking['currency']}."
         if state.get("stage") == "cancelled":
-            b = state["cancelled"]
-            return f"Подтверждена отмена записи #{b['booking_id']} на {b['date']} в {b['time']}."
+            booking = state["cancelled"]
+            return f"Подтверждена отмена записи #{booking['booking_id']} на {booking['date']} в {booking['time']}."
         return None
 
     async def _ingest(self, user, content, extra=None):
@@ -287,7 +299,7 @@ STATE ниже — проверенные инструментами данны�
         if extra is not None:
             other_reply, other_changes, other_tentative = unpack(extra)
             for left, right in ((changes, other_changes), (tentative, other_tentative)):
-                if not isinstance(left, dict) or not isinstance(right, dict) or any(left[k] != right[k] for k in left.keys() & right.keys()):
+                if not isinstance(left, dict) or not isinstance(right, dict) or any(left[field_name] != right[field_name] for field_name in left.keys() & right.keys()):
                     raise ValueError("conflicting_memory_sources")
             reply = other_reply or reply
             changes, tentative = {**changes, **other_changes}, {**tentative, **other_tentative}
@@ -333,12 +345,12 @@ STATE ниже — проверенные инструментами данны�
             if not result.get(field):
                 raise ValueError("missing_booking_details")
         if user.id in self._turn_text:
-            source = " ".join([self._turn_text[user.id], *[m["content"] for m in self._history[user.id] if m["role"] == "user"]])
+            source = " ".join([self._turn_text[user.id], *[message["content"] for message in self._history[user.id] if message["role"] == "user"]])
             for field, value in result.items():
                 if field in facts or not value:
                     continue
                 values = value if field == "services" else [value]
-                if any(folded(v) not in folded(source) for v in values):
+                if any(folded(field_value) not in folded(source) for field_value in values):
                     raise ValueError("booking_details_not_supplied_by_customer")
         return result
 
@@ -349,7 +361,7 @@ STATE ниже — проверенные инструментами данны�
             function = tool["function"]
             schema = function["parameters"]
             if function["name"] == "create_booking":
-                schema = dict(schema, properties={k: v for k, v in BOOKING.items() if k not in known})
+                schema = dict(schema, properties={field_name: field_schema for field_name, field_schema in BOOKING.items() if field_name not in known})
             elif function["name"] == "calculate_price" and known.get("size_class"):
                 schema = dict(schema, required=[])
             else:
@@ -364,10 +376,10 @@ STATE ниже — проверенные инструментами данны�
         fields = ["size_class"]
         if not {"tariff", "services"} & args.keys():
             fields += ["tariff", "services"]
-        return {**{k: facts[k] for k in fields if k in facts and k not in guessed}, **args}
+        return {**{field_name: facts[field_name] for field_name in fields if field_name in facts and field_name not in guessed}, **args}
 
     def _quote_state(self, quote):
-        return {**{k: quote[k] for k in ("total", "currency", "lines")},
+        return {**{field_name: quote[field_name] for field_name in ("total", "currency", "lines")},
                 "checked_at": self.store.now().isoformat(timespec="seconds")}
 
     def _failed_read(self, name, user):
@@ -380,8 +392,8 @@ STATE ниже — проверенные инструментами данны�
     def _remember_slots(self, user, result, selected=None):
         state = self._state[user.id]
         state["availability"] = {"checked_at": self.store.now().isoformat(), "days": [
-            {"date": d["date"], "free_times": d["free_times"][:8], **({"more": True} if len(d["free_times"]) > 8 else {})}
-            for d in result["days"][:7]]}
+            {"date": available_day["date"], "free_times": available_day["free_times"][:8], **({"more": True} if len(available_day["free_times"]) > 8 else {})}
+            for available_day in result["days"][:7]]}
         selected = selected or state.get("facts", {})
         for day in result["days"]:
             if selected.get("date") == day["date"] and selected.get("time"):
@@ -393,126 +405,262 @@ STATE ниже — проверенные инструментами данны�
     def _call_record(self, call, user):
         raw = call.function.arguments or "{}"
         if call.function.name == "respond":
-            raw = redact_phone(_json(strict_json(raw)), self._state[user.id].get("facts", {}).get("phone"))
+            raw = redact_phone(_compact_json(strict_json(raw)), self._state[user.id].get("facts", {}).get("phone"))
         return {"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": raw}}
 
     def _cache_key(self, name, normalized, user):
         key = (name, normalized)
         if name == "create_booking":
             state = self._state[user.id]
-            context = {k: state.get(k) for k in ("facts", "tentative", "invalidated", "catalog")}
-            context["availability"] = {k: v for k, v in state.get("availability", {}).items() if k != "checked_at"}
-            key += (_json(context),)
+            context = {field_name: state.get(field_name) for field_name in ("facts", "tentative", "invalidated", "catalog")}
+            context["availability"] = {field_name: field_value for field_name, field_value in state.get("availability", {}).items() if field_name != "checked_at"}
+            key += (_compact_json(context),)
         return key
 
-    async def _request(self, **kwargs):
-        for attempt in range(self.cfg.ai_request_retries + 1):
+    async def close(self) -> None:
+        self._closed = True
+        clients, self._provider_clients = self._provider_clients, [None] * len(self._provider_configs)
+        for client in clients:
+            if client is not None:
+                try:
+                    await client.close()
+                except Exception as error:
+                    log.error("Ошибка закрытия AI-клиента (%s)", type(error).__name__)
+
+    @staticmethod
+    def _retryable_api_error(error) -> bool:
+        status = getattr(error, "status_code", 0)
+        return (
+            isinstance(error, (APIConnectionError, RateLimitError, asyncio.TimeoutError))
+            or status in {408, 429}
+            or status >= 500
+        )
+
+    async def _request_provider(self, index, retries, arguments):
+        config = self._provider_configs[index]
+        if self._provider_clients[index] is None:
+            self._provider_clients[index] = AsyncOpenAI(**client_options(config))
+        client = self._provider_clients[index]
+        for attempt in range(retries + 1):
             try:
-                return await self.client.chat.completions.create(**completion_options(self.cfg), **kwargs)
-            except (APIConnectionError, APIStatusError) as exc:
-                retryable = isinstance(exc, (APIConnectionError, RateLimitError)) or getattr(exc, "status_code", 0) >= 500
-                if not retryable or attempt == self.cfg.ai_request_retries:
+                return await client.chat.completions.create(**completion_options(config), **arguments)
+            except (APIConnectionError, APIStatusError) as error:
+                if not self._retryable_api_error(error) or attempt == retries:
                     raise
                 await asyncio.sleep(0.25 * (attempt + 1))
 
+    async def _request(self, **kwargs):
+        if self._closed:
+            raise RuntimeError("AI-клиенты уже закрыты")
+        now = time.monotonic()
+        available = [
+            index
+            for index, retry_at in enumerate(self._provider_retry_at)
+            if retry_at <= now and index not in self._provider_probes
+        ]
+        if not available:
+            raise RuntimeError("Настроенные AI API временно недоступны; повторите позже")
+        # Бюджет общий для одной генерации и всей цепочки API.
+        deadline = now + self.config.ai_request_budget_sec
+        for position, index in enumerate(available):
+            if self._provider_retry_at[index] > time.monotonic() or index in self._provider_probes:
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError("Истёк общий бюджет AI-запроса")
+            recovering = bool(self._provider_retry_at[index])
+            if recovering:
+                self._provider_probes.add(index)
+            try:
+                share = remaining if position == 0 else remaining / (len(available) - position)
+                budget = min(self.config.ai_timeout_sec, share)
+                # При наличии резерва переходим к нему без повторного ожидания.
+                retries = self.config.ai_request_retries if len(available) == 1 else 0
+                result = await asyncio.wait_for(
+                    self._request_provider(index, retries, kwargs), timeout=budget
+                )
+            except (APIConnectionError, APIStatusError, asyncio.TimeoutError) as error:
+                failover = self._retryable_api_error(error) or getattr(error, "status_code", 0) in {
+                    401,
+                    402,
+                    403,
+                    404,
+                }
+                if not failover:
+                    raise
+                self._provider_retry_at[index] = time.monotonic() + PROVIDER_COOLDOWN_SEC
+                log.warning(
+                    "AI API %d недоступен (%s), модель %s; пауза %d с",
+                    index + 1,
+                    type(error).__name__,
+                    self._provider_configs[index].ai_model,
+                    PROVIDER_COOLDOWN_SEC,
+                )
+                if position == len(available) - 1:
+                    raise
+            else:
+                self._provider_retry_at[index] = 0.0
+                if recovering:
+                    log.info(
+                        "AI API %d снова доступен; модель %s",
+                        index + 1,
+                        self._provider_configs[index].ai_model,
+                    )
+                return result
+            finally:
+                self._provider_probes.discard(index)
+        raise RuntimeError("Настроенные AI API временно недоступны; повторите позже")
+
     async def _proofread(self, text: str) -> str:
         try:
-            resp = await self._request(messages=[{"role": "system", "content": PROOFREAD_PROMPT},
-                                                 {"role": "user", "content": text}])
-            if not resp.choices or getattr(resp.choices[0], "finish_reason", None) == "length":
+            response = await self._request(
+                messages=[{"role": "system", "content": PROOFREAD_PROMPT}, {"role": "user", "content": text}]
+            )
+            if not response.choices or getattr(response.choices[0], "finish_reason", None) == "length":
                 return text
-            return _clean_text(resp.choices[0].message.content or "") or text
-        except Exception as exc:
-            log.error("Ошибка при вычитке ответа (%s)", type(exc).__name__)
+            return _clean_text(response.choices[0].message.content or "") or text
+        except Exception as error:
+            log.error("Ошибка при вычитке ответа (%s)", type(error).__name__)
             return text
 
-    async def _run(self, messages: list[dict], user: ChatUser) -> str:
-        cache, count, visible = {}, 0, set()
-        for iteration in range(self.cfg.ai_max_tool_iterations):
-            projected = model_state(self._state[user.id])
-            for field in visible:
-                projected.pop(field, None)
-            customer = {k: projected.pop(k) for k in ("facts", "tentative", "missing", "invalidated") if k in projected}
+    def _update_context(self, messages, user, sent_fields, redact):
+        projected = model_state(self._state[user.id])
+        for field in sent_fields:
+            projected.pop(field, None)
+        customer = {
+            field_name: projected.pop(field_name)
+            for field_name in ("facts", "tentative", "missing", "invalidated")
+            if field_name in projected
+        }
+        for message in messages:
+            if message["role"] == "system" and message["content"].startswith("CUSTOMER "):
+                message["content"] = "CUSTOMER " + _compact_json(customer)
+            elif message["role"] == "system" and message["content"].startswith("STATE "):
+                message["content"] = "STATE " + _compact_json(projected)
+        phone = self._state[user.id].get("facts", {}).get("phone")
+        if redact and phone and digits(phone) in digits(self._turn_text.get(user.id, "")):
             for message in messages:
-                if message["role"] == "system" and message["content"].startswith("CUSTOMER "):
-                    message["content"] = "CUSTOMER " + _json(customer)
-                elif message["role"] == "system" and message["content"].startswith("STATE "):
-                    message["content"] = "STATE " + _json(projected)
-            phone = self._state[user.id].get("facts", {}).get("phone")
-            if iteration and phone and digits(phone) in digits(self._turn_text.get(user.id, "")):
-                for message in messages:
-                    if message["role"] == "user":
-                        message["content"] = redact_phone(message["content"], phone)
-            resp = await self._request(messages=messages, tools=self._tools(user), tool_choice="auto")
-            if not resp.choices:
+                if message["role"] == "user":
+                    message["content"] = redact_phone(message["content"], phone)
+
+    @staticmethod
+    def _valid_tool_calls(calls) -> bool:
+        identifiers = [tool_call.id for tool_call in calls]
+        if any(not isinstance(tool_id, str) or not tool_id for tool_id in identifiers) or len(
+            set(identifiers)
+        ) != len(identifiers):
+            raise ValueError("invalid_tool_ids")
+        if any(
+            not isinstance(tool_call.function.name, str)
+            or not isinstance(tool_call.function.arguments, (str, type(None)))
+            or len(tool_call.function.arguments or "") > 16000
+            for tool_call in calls
+        ):
+            return False
+        return True
+
+    async def _ingest_response(self, message, calls, user):
+        replies = [tool_call for tool_call in calls if tool_call.function.name == "respond"]
+        if len(replies) > 1:
+            raise ValueError("multiple_memory_replies")
+        content = message.content or ""
+        if calls and not content.lstrip().startswith(("{", "```")):
+            content = ""  # внутренний текст при tools не является ответом клиенту
+        return await self._ingest(user, content, extra=replies[0].function.arguments if replies else None)
+
+    def _normalized_arguments(self, name, raw, user):
+        normalized = raw
+        try:
+            arguments = strict_json(raw)
+            if isinstance(arguments, dict):
+                if name == "calculate_price":
+                    arguments = self._quote_args(arguments, user)
+                normalized = dict(arguments)
+                for field in ("size_class", "tariff"):
+                    if isinstance(arguments.get(field), str):
+                        normalized[field] = arguments[field].strip().lower()
+                if isinstance(arguments.get("services"), list) and all(
+                    isinstance(field_value, str) for field_value in arguments["services"]
+                ):
+                    normalized["services"] = sorted(
+                        {field_value.strip().lower() for field_value in arguments["services"]}
+                    )
+                normalized = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except (ValueError, TypeError, RecursionError):
+            pass
+        return normalized
+
+    async def _run_tools(self, messages, message, calls, user, tool_cache, sent_fields):
+        mutations = [
+            tool_call
+            for tool_call in calls
+            if tool_call.function.name in {"create_booking", "cancel_booking"}
+        ]
+        if len(mutations) > 1:
+            return "Уточните одну запись, которую нужно оформить или отменить."
+        phone = self._state[user.id].get("facts", {}).get("phone")
+        messages.append(
+            {
+                "role": "assistant",
+                "content": redact_phone(message.content or "", phone),
+                "tool_calls": [self._call_record(tool_call, user) for tool_call in calls],
+            }
+        )
+        for tool_call in calls:
+            if tool_call.function.name == "respond":
+                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": '{"ok":true}'})
+                continue
+            raw = tool_call.function.arguments or "{}"
+            normalized = self._normalized_arguments(tool_call.function.name, raw, user)
+            key = self._cache_key(tool_call.function.name, normalized, user)
+            if key in tool_cache and not tool_cache[key].get("ok"):
+                return "Повторный запрос с теми же неверными данными остановлен. " + tool_cache[key].get(
+                    "error", "Уточните данные."
+                )
+            if key not in tool_cache:
+                tool_cache[key] = await self._call_tool(tool_call.function.name, raw, user)
+                tool_cache[self._cache_key(tool_call.function.name, normalized, user)] = tool_cache[key]
+            result = tool_cache[key]
+            if result.get("confirmation_required") and user.id in self._pending:
+                return self._offer(user.id, self._pending[user.id])
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": _compact_json(result)})
+            if result.get("ok"):
+                sent_fields.update(
+                    {
+                        "calculate_price": ("selection", "quote"),
+                        "get_free_slots": ("availability",),
+                        "get_price_list": ("catalog",),
+                    }.get(tool_call.function.name, ())
+                )
+
+    async def _run(self, messages: list[dict], user: ChatUser) -> str:
+        tool_cache, tool_count, sent_fields = {}, 0, set()
+        for iteration in range(self.config.ai_max_tool_iterations):
+            self._update_context(messages, user, sent_fields, redact=bool(iteration))
+            response = await self._request(messages=messages, tools=self._tools(user), tool_choice="auto")
+            if not response.choices:
                 raise ValueError("empty_choices")
-            choice = resp.choices[0]
+            choice = response.choices[0]
             if getattr(choice, "finish_reason", None) in {"length", "content_filter"}:
                 raise ValueError("incomplete_response")
-            msg, calls = choice.message, choice.message.tool_calls or []
-            count += len(calls)
-            if count > self.cfg.ai_max_tool_calls:
+            message, calls = choice.message, choice.message.tool_calls or []
+            tool_count += len(calls)
+            if tool_count > self.config.ai_max_tool_calls:
                 return "Слишком много запросов к таблице. Уточните, пожалуйста, услугу или желаемую дату."
-            ids = [c.id for c in calls]
-            if any(not isinstance(i, str) or not i for i in ids) or len(set(ids)) != len(ids):
-                raise ValueError("invalid_tool_ids")
-            if any(not isinstance(c.function.name, str) or not isinstance(c.function.arguments, (str, type(None))) or
-                   len(c.function.arguments or "") > 16000 for c in calls):
+            if not self._valid_tool_calls(calls):
                 return "Некорректные аргументы инструмента. Уточните, пожалуйста, запрос."
             try:
-                replies = [c for c in calls if c.function.name == "respond"]
-                if len(replies) > 1:
-                    raise ValueError("multiple_memory_replies")
-                content = msg.content or ""
-                if calls and not content.lstrip().startswith(("{", "```")):
-                    content = ""  # внутренний текст при tools не является ответом клиенту
-                answer = await self._ingest(user, content, extra=replies[0].function.arguments if replies else None)
+                answer = await self._ingest_response(message, calls, user)
             except (ValueError, TypeError, RecursionError):
                 self._state[user.id].update(stage="needs_correction", confirmed=False)
                 return "Не удалось однозначно сохранить уточнение. Назовите исправленные данные или точное название из прайса."
-            if not calls or replies and len(calls) == 1:
+            if not calls or len(calls) == 1 and calls[0].function.name == "respond":
                 if not answer.strip():
                     raise ValueError("empty_content")
                 return answer.strip()
-            mutations = [c for c in calls if c.function.name in {"create_booking", "cancel_booking"}]
-            if len(mutations) > 1:
-                return "Уточните одну запись, которую нужно оформить или отменить."
-            phone = self._state[user.id].get("facts", {}).get("phone")
-            messages.append({"role": "assistant", "content": redact_phone(msg.content or "", phone),
-                             "tool_calls": [self._call_record(c, user) for c in calls]})
-            for c in calls:
-                if c.function.name == "respond":
-                    messages.append({"role": "tool", "tool_call_id": c.id, "content": '{"ok":true}'})
-                    continue
-                raw = c.function.arguments or "{}"
-                normalized = raw
-                try:
-                    args = strict_json(raw)
-                    if isinstance(args, dict):
-                        if c.function.name == "calculate_price":
-                            args = self._quote_args(args, user)
-                        normalized = dict(args)
-                        for field in ("size_class", "tariff"):
-                            if isinstance(args.get(field), str):
-                                normalized[field] = args[field].strip().lower()
-                        if isinstance(args.get("services"), list) and all(isinstance(v, str) for v in args["services"]):
-                            normalized["services"] = sorted({v.strip().lower() for v in args["services"]})
-                        normalized = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-                except (ValueError, TypeError, RecursionError):
-                    pass
-                key = self._cache_key(c.function.name, normalized, user)
-                if key in cache and not cache[key].get("ok"):
-                    return "Повторный запрос с теми же неверными данными остановлен. " + cache[key].get("error", "Уточните данные.")
-                if key not in cache:
-                    cache[key] = await self._call_tool(c.function.name, raw, user)
-                    cache[self._cache_key(c.function.name, normalized, user)] = cache[key]
-                result = cache[key]
-                if result.get("confirmation_required") and user.id in self._pending:
-                    return self._offer(user.id, self._pending[user.id])
-                messages.append({"role": "tool", "tool_call_id": c.id, "content": _json(result)})
-                if result.get("ok"):
-                    visible.update({"calculate_price": ("selection", "quote"), "get_free_slots": ("availability",),
-                                    "get_price_list": ("catalog",)}.get(c.function.name, ()))
+            answer = await self._run_tools(messages, message, calls, user, tool_cache, sent_fields)
+            if answer is not None:
+                return answer
         return "Не удалось завершить запрос за отведённое число шагов. Уточните услугу или дату."
 
     async def _call_tool(self, name: str, raw_args: str | None, user: ChatUser) -> dict:
@@ -527,11 +675,11 @@ STATE ниже — проверенные инструментами данны�
                 raise ValueError
             if name == "calculate_price":
                 args = self._quote_args(args, user)
-            if any(k not in args or not args[k] for k in schema["required"]):
+            if any(field_name not in args or not args[field_name] for field_name in schema["required"]):
                 raise ValueError
             for key, value in args.items():
                 if schema["properties"][key]["type"] == "array":
-                    if not isinstance(value, list) or len(value) > 30 or any(not isinstance(v, str) or not v.strip() or len(v) > 500 for v in value):
+                    if not isinstance(value, list) or len(value) > 30 or any(not isinstance(field_value, str) or not field_value.strip() or len(field_value) > 500 for field_value in value):
                         raise ValueError
                 elif not isinstance(value, str) or len(value) > 500:
                     raise ValueError
@@ -553,31 +701,31 @@ STATE ниже — проверенные инструментами данны�
                 self._remember_slots(user, result)
             if name == "get_price_list" and result.get("ok"):
                 state["catalog"] = {"size_classes": result["size_classes"],
-                    "tariffs": [t["name"] for t in result["tariffs"]],
-                    "services": [s["name"] for s in result["services"]],
+                    "tariffs": [tariff["name"] for tariff in result["tariffs"]],
+                    "services": [service["name"] for service in result["services"]],
                     "unavailable_services": result["unavailable_services"]}
-                result = dict(result, tariffs=[{k: v for k, v in t.items() if k != "note"} for t in result["tariffs"]])
+                result = dict(result, tariffs=[{field_name: field_value for field_name, field_value in tariff.items() if field_name != "note"} for tariff in result["tariffs"]])
             if not result.get("ok"):
                 self._failed_read(name, user)
             return result
-        except Exception as exc:
-            log.error("Ошибка инструмента %s (%s)", name, type(exc).__name__)
+        except Exception as error:
+            log.error("Ошибка инструмента %s (%s)", name, type(error).__name__)
             self._failed_read(name, user)
             return {"ok": False, "error": "Не удалось прочитать таблицу; повторите запрос позже. Запись не выполнялась."}
 
     async def _prepare(self, name, args, user):
         if name == "cancel_booking":
             mine = await asyncio.to_thread(self.store.my_bookings, user.id)
-            booking = next((b for b in mine.get("bookings", []) if str(b["booking_id"]) == args["booking_id"]), None)
+            booking = next((candidate_booking for candidate_booking in mine.get("bookings", []) if str(candidate_booking["booking_id"]) == args["booking_id"]), None)
             if not booking:
                 return {"ok": False, "error": "Предстоящая запись этого клиента не найдена"}
             pending = {"action": name, "args": args, "booking": booking}
         else:
             supplied = dict(args)
-            d, t = parse_date(args["date"]), parse_time(args["time"])
-            if not d or not t or not re.fullmatch(r"\d{1,2}[:.]\d{2}(?::00)?", args["time"].strip()) or not valid_phone(args["phone"]) or not args["car"].strip() or not args["client_name"].strip():
+            booking_date, booking_time = parse_date(args["date"]), parse_time(args["time"])
+            if not booking_date or not booking_time or not re.fullmatch(r"\d{1,2}[:.]\d{2}(?::00)?", args["time"].strip()) or not valid_phone(args["phone"]) or not args["car"].strip() or not args["client_name"].strip():
                 return {"ok": False, "error": "Проверьте дату, время, имя, автомобиль и телефон"}
-            args = dict(args, date=d.isoformat(), time=t)
+            args = dict(args, date=booking_date.isoformat(), time=booking_time)
             def preview():
                 with self.store.fresh_tables():
                     quote = self.store.calculate_price(args["size_class"], args.get("tariff"), args.get("services", []), fresh=True)
@@ -591,10 +739,10 @@ STATE ниже — проверенные инструментами данны�
                                         quote=self._quote_state(quote))
             self._remember_slots(user, slots, args)
             args.update(size_class=quote["size_class"], tariff=quote["tariff"] or "", services=quote["extras"])
-            names = {s.lower(): s for s in quote["extras"] + [s for line in quote["lines"] for s in line.get("includes", [])]}
-            supplied.update(date=d.isoformat(), time=t, size_class=quote["size_class"], tariff=quote["tariff"] or "",
-                            services=list(dict.fromkeys(names[s.strip().lower()] for s in supplied.get("services", []))))
-            if not any(t in day["free_times"] for day in slots.get("days", [])):
+            names = {service_name.lower(): service_name for service_name in quote["extras"] + [service_name for line in quote["lines"] for service_name in line.get("includes", [])]}
+            supplied.update(date=booking_date.isoformat(), time=booking_time, size_class=quote["size_class"], tariff=quote["tariff"] or "",
+                            services=list(dict.fromkeys(names[service_name.strip().lower()] for service_name in supplied.get("services", []))))
+            if not any(booking_time in day["free_times"] for day in slots.get("days", [])):
                 self._state[user.id].update(stage="choosing_time", confirmed=False)
                 return {"ok": False, "error": "Выбранное время недоступно", "availability": slots}
             pending = {"action": name, "args": args, "quote": quote}
@@ -603,29 +751,27 @@ STATE ниже — проверенные инструментами данны�
         self._state[user.id].update(stage="awaiting_confirmation", confirmed=False,
                                     outstanding=["explicit_confirmation"])
         if name == "create_booking":
-            self._state[user.id].setdefault("facts", {}).update({k: v for k, v in supplied.items() if k in FIELDS})
-            self._state[user.id].update(selection={"size_class": quote["size_class"], "tariff": quote["tariff"], "services": quote["extras"]},
-                quote=self._quote_state(quote))
+            self._state[user.id].setdefault("facts", {}).update({field_name: field_value for field_name, field_value in supplied.items() if field_name in FIELDS})
         return {"ok": True, "confirmation_required": True}
 
     @staticmethod
     def _proposal_text(pending):
         if pending["action"] == "cancel_booking":
-            b = pending["booking"]
-            return f"Отменить запись #{b['booking_id']}: {b['date']} в {b['time']}, {b['car']}? Ответьте «Да, отменяйте» или напишите исправления."
-        a, q = pending["args"], pending["quote"]
+            booking = pending["booking"]
+            return f"Отменить запись #{booking['booking_id']}: {booking['date']} в {booking['time']}, {booking['car']}? Ответьте «Да, отменяйте» или напишите исправления."
+        arguments, quote = pending["args"], pending["quote"]
         lines = []
-        for line in q["lines"]:
+        for line in quote["lines"]:
             value = line["item"]
             if "includes" in line:
                 value += ": " + ", ".join(line["includes"])
             if line.get("not_included_now"):
                 value += " (сейчас без: " + ", ".join(line["not_included_now"]) + ")"
             lines.append(value)
-        comment = f" Пожелания: {a['comment']}." if a.get("comment") else ""
-        return (f"Предлагаю запись: {a['date']} в {a['time']}; {a['car']}, класс «{q['size_class']}». "
-                f"{'; '.join(lines)}. Итого {q['total']} {q['currency']}. "
-                f"Имя: {a['client_name']}, телефон: {a['phone']}.{comment} "
+        comment = f" Пожелания: {arguments['comment']}." if arguments.get("comment") else ""
+        return (f"Предлагаю запись: {arguments['date']} в {arguments['time']}; {arguments['car']}, класс «{quote['size_class']}». "
+                f"{'; '.join(lines)}. Итого {quote['total']} {quote['currency']}. "
+                f"Имя: {arguments['client_name']}, телефон: {arguments['phone']}.{comment} "
                 "Подтверждаете? Ответьте «Да, подтверждаю запись» или напишите исправления.")
 
     async def _confirm(self, user, pending):
@@ -637,8 +783,8 @@ STATE ниже — проверенные инструментами данны�
         state.update(stage="writing", confirmed=True, outstanding=[])
         try:
             if pending["action"] == "create_booking":
-                a = pending["args"]
-                result = await self._execute("create_booking", a, user, expected=pending["quote"])
+                arguments = pending["args"]
+                result = await self._execute("create_booking", arguments, user, expected=pending["quote"])
                 if result.get("quote_changed"):
                     pending.update(quote=result["quote"], created=time.monotonic())
                     state.update(stage="awaiting_confirmation", confirmed=False, outstanding=["explicit_confirmation"],
@@ -647,7 +793,7 @@ STATE ниже — проверенные инструментами данны�
                 if result.get("ok"):
                     facts = state.get("facts", {})
                     state.clear()
-                    state.update(facts=facts, stage="booked", confirmed=True, booking={k: result[k] for k in ("booking_id", "date", "time", "car", "total", "currency")})
+                    state.update(facts=facts, stage="booked", confirmed=True, booking={field_name: result[field_name] for field_name in ("booking_id", "date", "time", "car", "total", "currency")})
                     return f"Записала вас! Запись #{result['booking_id']}: {result['date']} в {result['time']}, {result['car']}. Итого {result['total']} {result['currency']}. Ждём вас!"
             else:
                 result = await self._execute("cancel_booking", pending["args"], user, expected=pending["booking"])
@@ -655,15 +801,15 @@ STATE ниже — проверенные инструментами данны�
                     facts = state.get("facts", {})
                     state.clear()
                     state.update(facts=facts, stage="cancelled", confirmed=True,
-                                 cancelled={k: result[k] for k in ("booking_id", "date", "time")})
+                                 cancelled={field_name: result[field_name] for field_name in ("booking_id", "date", "time")})
                     return f"Запись #{result['booking_id']} на {result['date']} в {result['time']} отменена."
             state.update(stage="needs_correction", confirmed=False)
             return result.get("error", "Операция отклонена. Проверьте свои записи и уточните детали.")
         except asyncio.CancelledError:
             state.update(stage="uncertain", confirmed=False, outstanding=[])
             raise
-        except Exception as exc:
-            log.error("Ошибка подтверждённой операции (%s)", type(exc).__name__)
+        except Exception as error:
+            log.error("Ошибка подтверждённой операции (%s)", type(error).__name__)
             facts = state.get("facts", {})
             state.clear()
             state["facts"] = facts
@@ -674,82 +820,82 @@ STATE ниже — проверенные инструментами данны�
         if self.reporter:
             try:
                 await self.reporter.send(text, username=user.username)
-            except Exception as exc:
-                log.error("Ошибка уведомления (%s)", type(exc).__name__)
+            except Exception as error:
+                log.error("Ошибка уведомления (%s)", type(error).__name__)
 
-    async def _execute(self, name: str, a: dict, user: ChatUser, *, expected: dict | None = None) -> dict:
-        s = self.store
+    async def _execute(self, name: str, arguments: dict, user: ChatUser, *, expected: dict | None = None) -> dict:
+        store = self.store
         if name == "get_price_list":
             def prices():
-                if not a.get("size_class"):
-                    return s.price_list()
-                catalog = s.get_catalog()
-                result = dict(catalog.price_list(), currency=self.cfg.currency)
-                cls = catalog.match_class(a["size_class"])
-                if not cls:
+                if not arguments.get("size_class"):
+                    return store.price_list()
+                catalog = store.get_catalog()
+                result = dict(catalog.price_list(), currency=self.config.currency)
+                matched_class = catalog.match_class(arguments["size_class"])
+                if not matched_class:
                     return {"ok": False, "error": "Неизвестный класс автомобиля", "size_classes": result["size_classes"]}
-                result["selected_class"] = cls
+                result["selected_class"] = matched_class
                 for kind in ("services", "tariffs"):
-                    result[kind] = [dict(item, prices={cls: item["prices"][cls]})
-                                    for item in result[kind] if cls in item["prices"]]
+                    result[kind] = [dict(item, prices={matched_class: item["prices"][matched_class]})
+                                    for item in result[kind] if matched_class in item["prices"]]
                     for item in result[kind]:
                         if isinstance(item.get("not_included_now"), dict):
-                            item["not_included_now"] = item["not_included_now"].get(cls, [])
+                            item["not_included_now"] = item["not_included_now"].get(matched_class, [])
                 return result
             return await asyncio.to_thread(prices)
 
         if name == "calculate_price":
             return await asyncio.to_thread(
-                s.calculate_price, a.get("size_class", ""), a.get("tariff"), _as_list(a.get("services"))
+                store.calculate_price, arguments.get("size_class", ""), arguments.get("tariff"), _service_names(arguments.get("services"))
             )
 
         if name == "get_free_slots":
-            return await asyncio.to_thread(s.free_slots, a.get("date") or None)
+            return await asyncio.to_thread(store.free_slots, arguments.get("date") or None)
 
         if name == "create_booking":
-            res = await asyncio.to_thread(
-                s.create_booking,
-                date_str=a.get("date", ""),
-                time_str=a.get("time", ""),
-                name=a.get("client_name", ""),
-                phone=a.get("phone", ""),
-                car=a.get("car", ""),
-                size_class=a.get("size_class", ""),
-                tariff=a.get("tariff"),
-                services=_as_list(a.get("services")),
-                comment=a.get("comment", ""),
-                tg_id=user.id,
+            result = await asyncio.to_thread(
+                store.create_booking,
+                date_str=arguments.get("date", ""),
+                time_str=arguments.get("time", ""),
+                name=arguments.get("client_name", ""),
+                phone=arguments.get("phone", ""),
+                car=arguments.get("car", ""),
+                size_class=arguments.get("size_class", ""),
+                tariff=arguments.get("tariff"),
+                services=_service_names(arguments.get("services")),
+                comment=arguments.get("comment", ""),
+                telegram_id=user.id,
                 username=user.username,
                 expected_quote=expected,
             )
-            if res.get("ok") and self.reporter:
-                await self._notify(self._admin_text(res, a, user), user)
-            return res
+            if result.get("ok") and self.reporter:
+                await self._notify(self._admin_text(result, arguments, user), user)
+            return result
 
         if name == "get_my_bookings":
-            return await asyncio.to_thread(s.my_bookings, user.id)
+            return await asyncio.to_thread(store.my_bookings, user.id)
 
         if name == "cancel_booking":
-            res = await asyncio.to_thread(s.cancel_booking, a.get("booking_id", ""), user.id,
+            result = await asyncio.to_thread(store.cancel_booking, arguments.get("booking_id", ""), user.id,
                                           expected_booking=expected)
-            if res.get("ok") and self.reporter:
+            if result.get("ok") and self.reporter:
                 await self._notify(
-                    f"Клиент отменил запись #{res['booking_id']} ({res['date']} {res['time']}), "
+                    f"Клиент отменил запись #{result['booking_id']} ({result['date']} {result['time']}), "
                     f"{user.full_name} {'@' + user.username if user.username else ''}",
                     user,
                 )
-            return res
+            return result
 
         return {"ok": False, "error": f"Неизвестный инструмент: {name}"}
 
-    def _admin_text(self, res: dict, a: dict, user: ChatUser) -> str:
-        items = "\n".join(f"  • {ln['item']} — {ln['price']} {res['currency']}" for ln in res["lines"])
-        tg = f"@{user.username}" if user.username else f"id {user.id}"
+    def _admin_text(self, result: dict, arguments: dict, user: ChatUser) -> str:
+        items = "\n".join(f"  • {line['item']} — {line['price']} {result['currency']}" for line in result["lines"])
+        telegram_profile = f"@{user.username}" if user.username else f"id {user.id}"
         return (
-            f"🆕 Новая запись #{res['booking_id']}\n"
-            f"📅 {res['date']} ({res['weekday']}) в {res['time']}\n"
-            f"👤 {a.get('client_name')}, {a.get('phone')} ({tg})\n"
-            f"🚗 {res['car']} — класс «{res['size_class']}»\n"
+            f"🆕 Новая запись #{result['booking_id']}\n"
+            f"📅 {result['date']} ({result['weekday']}) в {result['time']}\n"
+            f"👤 {arguments.get('client_name')}, {arguments.get('phone')} ({telegram_profile})\n"
+            f"🚗 {result['car']} — класс «{result['size_class']}»\n"
             f"{items}\n"
-            f"💰 Итого: {res['total']} {res['currency']}"
+            f"💰 Итого: {result['total']} {result['currency']}"
         )

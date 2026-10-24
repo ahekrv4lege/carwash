@@ -12,7 +12,7 @@ class AuditSecurityTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp:
             store, _ = fixture(temp)
             with patch("ai.AsyncOpenAI"):
-                agent = Agent(store.cfg, store)
+                agent = Agent(store.config, store)
             user = ChatUser(111, None, "SYNTHETIC_PRIVATE_NAME")
             args = json.dumps({"size_class": "SYNTHETIC_PRIVATE_CLASS"})
             with patch.object(agent, "_execute", new=AsyncMock(side_effect=RuntimeError("SYNTHETIC_PROVIDER_SECRET"))), \
@@ -26,7 +26,7 @@ class AuditSecurityTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp:
             store, _ = fixture(temp)
             with patch("ai.AsyncOpenAI"):
-                agent = Agent(store.cfg, store)
+                agent = Agent(store.config, store)
             with patch.object(agent, "_run", new=AsyncMock(side_effect=RuntimeError("PRIVATE_SENTINEL"))), \
                  self.assertLogs("ai", level="ERROR") as captured:
                 await agent.reply(ChatUser(111, None, "Synthetic"), "synthetic")

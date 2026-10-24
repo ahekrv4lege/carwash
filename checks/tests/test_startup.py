@@ -1,6 +1,4 @@
-from contextlib import contextmanager
 from dataclasses import replace
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -16,7 +14,7 @@ import run
 from config import load_config
 from tests.fakes import config
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class StartupTests(unittest.TestCase):
@@ -24,18 +22,24 @@ class StartupTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.cfg = config(self.root)
+        self.config = config(self.root)
 
     def credentials(self):
         path = self.root / "credentials.json"
         path.write_text(json.dumps({"type": "service_account", "client_email": "synthetic@example.invalid",
                                     "private_key": "synthetic-unused", "token_uri": "https://example.invalid/token"}))
         (self.root / ".env").write_text("")
-        return replace(self.cfg, google_credentials_file=str(path))
+        return replace(self.config, google_credentials_file=str(path))
 
-    def test_missing_env_error(self):
-        with patch.object(run, "ROOT", self.root), self.assertRaisesRegex(run.StartupError, "Нет .env"):
-            run.validate_config()
+    def test_environment_is_sufficient_without_env_file(self):
+        credentials = self.credentials()
+        (self.root / ".env").unlink()
+        values = {"BOT_TOKEN": self.config.bot_token, "SPREADSHEET_ID": "synthetic",
+                  "LLM_API_KEY": "synthetic", "LLM_MODEL": "chosen-model",
+                  "GOOGLE_CREDENTIALS_FILE": credentials.google_credentials_file}
+        with patch.object(run, "ROOT", self.root), patch.dict(os.environ, values, clear=True):
+            self.assertEqual(run.validate_config().bot_token, self.config.bot_token)
+        self.assertFalse((self.root / ".env").exists())
 
     def test_missing_required_value_names_variable_without_token(self):
         (self.root / ".env").write_text("")
@@ -45,7 +49,7 @@ class StartupTests(unittest.TestCase):
 
     def test_missing_credentials(self):
         (self.root / ".env").write_text("")
-        with patch.object(run, "ROOT", self.root), patch("config.load_config", return_value=self.cfg):
+        with patch.object(run, "ROOT", self.root), patch("config.load_config", return_value=self.config):
             with self.assertRaisesRegex(run.StartupError, "GOOGLE_CREDENTIALS_FILE"):
                 run.validate_config()
 
@@ -67,13 +71,12 @@ class StartupTests(unittest.TestCase):
             with self.assertRaisesRegex(run.StartupError, "TIMEZONE"):
                 run.validate_config()
 
-    def test_bot_guard_requires_matching_id_and_confirmation(self):
-        with self.assertRaisesRegex(run.StartupError, "LOCAL_BOT_ID"):
-            run.validate_local_bot(self.cfg)
-        cfg = replace(self.cfg, local_bot_id="123456")
-        with self.assertRaisesRegex(run.StartupError, "BOT_START_CONFIRMED"):
-            run.validate_local_bot(cfg)
-        run.validate_local_bot(replace(cfg, bot_start_confirmed=True))
+    def test_invalid_telegram_token_is_rejected_before_polling(self):
+        credentials = replace(self.credentials(), bot_token="synthetic-invalid-token")
+        with patch.object(run, "ROOT", self.root), patch("config.load_config", return_value=credentials):
+            with self.assertRaisesRegex(run.StartupError, "BOT_TOKEN") as raised:
+                run.validate_config()
+        self.assertNotIn(credentials.bot_token, str(raised.exception))
 
     def test_invalid_flags_and_intervals(self):
         for var, value in [("SHEETS_ADAPTIVE_ENABLED", "perhaps"), ("SHEETS_SCHEMA_CHECK_INTERVAL_HOURS", "nan"),
@@ -147,7 +150,7 @@ class StartupTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "Linux signal handling")
     def test_real_aiogram_polling_graceful_sigterm_without_network(self):
         # Настоящий Dispatcher и Bot; заменён только сетевой транспорт Telegram.
-        script = ROOT / "tests/polling_fixture.py"
+        script = Path(__file__).with_name("polling_fixture.py")
         marker = self.root / "closed"
         proc = subprocess.Popen([sys.executable, str(script), str(marker)], cwd=self.root,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -159,6 +162,40 @@ class StartupTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, err)
             self.assertTrue(marker.exists())
             self.assertIn("SIGTERM", err)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+            proc.stdout.close()
+            proc.stderr.close()
+
+    def test_main_style_supervisor_restarts_failed_worker_and_stops_after_success(self):
+        worker = self.root / "bot.py"
+        marker = self.root / "attempts"
+        worker.write_text("from pathlib import Path\np=Path('attempts')\n"
+                          "n=int(p.read_text())+1 if p.exists() else 1\np.write_text(str(n))\n"
+                          "raise SystemExit(1 if n==1 else 0)\n")
+        with patch.object(run, "ROOT", self.root), patch.object(run, "RESTART_DELAY_SEC", 0):
+            run.run_forever()
+        self.assertEqual(marker.read_text(), "2")
+
+    @unittest.skipUnless(os.name == "posix", "Linux signal forwarding")
+    def test_supervisor_sigterm_stops_worker_without_restart(self):
+        worker = self.root / "bot.py"
+        worker.write_text("import signal,time\nfrom pathlib import Path\n"
+                          "def stop(signum, frame):\n Path('stopped').write_text('yes')\n raise SystemExit(0)\n"
+                          "signal.signal(signal.SIGTERM,stop)\nprint('worker-ready',flush=True)\ntime.sleep(30)\n")
+        code = "from pathlib import Path; import run,sys; run.ROOT=Path(sys.argv[1]); run.run_forever()"
+        proc = subprocess.Popen([sys.executable, "-c", code, str(self.root)], cwd=ROOT,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertIn("Запускаю", proc.stdout.readline())
+            self.assertEqual(proc.stdout.readline().strip(), "worker-ready")
+            proc.send_signal(signal.SIGTERM)
+            output, error = proc.communicate(timeout=5)
+            self.assertEqual(proc.returncode, 0, error)
+            self.assertTrue((self.root / "stopped").exists())
+            self.assertNotIn("Перезапуск", output)
         finally:
             if proc.poll() is None:
                 proc.kill()

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from openai import RateLimitError, APIConnectionError, APITimeoutError
 
 from adaptive import AdaptiveSheets, MappingError, atomic_json
-from mapping_ai import suggest_mappings
+from tests.fakes import suggest_mappings
 from tests.fakes import fixture
 
 
@@ -16,10 +16,10 @@ class AuditAITests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.store, self.ss = fixture(self.temp.name, sheets_ai_mapping_enabled=True)
+        self.store, self.spreadsheet = fixture(self.temp.name, sheets_ai_mapping_enabled=True)
         self.a = self.store._adaptive
         self.a.refresh()
-        self.ss.worksheet("Записи").values[0][3] = "Arrival window"
+        self.spreadsheet.worksheet("Записи").values[0][3] = "Arrival window"
         self.a.refresh(force=True)
         self.client = MagicMock()
         self.key = "4:bookings:1"
@@ -37,10 +37,10 @@ class AuditAITests(unittest.TestCase):
         saved = suggest_mappings(self.a, self.client)
         self.assertEqual(saved["suggestions"][0]["field"], "Время")
         self.assertEqual(self.a.path.read_bytes(), before)
-        self.assertFalse(any(ws.writes for ws in self.ss.sheets))
+        self.assertFalse(any(worksheet.writes for worksheet in self.spreadsheet.sheets))
         request = self.client.chat.completions.create.call_args.kwargs
         self.assertNotIn("tools", request)
-        self.assertEqual(request["model"], self.store.cfg.openrouter_model)
+        self.assertEqual(request["model"], self.store.config.ai_model)
 
     def test_invalid_structured_results_are_rejected(self):
         values = [None, [], {}, {"suggestions": {}}, {"suggestions": [None]},
@@ -116,7 +116,7 @@ class AuditAITests(unittest.TestCase):
 
     def test_restart_uses_validated_mapping_without_any_ai_requests(self):
         # Независимые экземпляры, включая включённый флаг AI.
-        self.ss.worksheet("Записи").values[0][3] = "Время"
+        self.spreadsheet.worksheet("Записи").values[0][3] = "Время"
         self.a.refresh(force=True)
         rule = next(r for r in self.a.document["regions"] if r["role"] == "bookings")
         rule["columns"]["Время"] = 4
@@ -124,7 +124,7 @@ class AuditAITests(unittest.TestCase):
         self.a.refresh(validate=True)
         with patch("openai.OpenAI", side_effect=AssertionError("No AI during startup")):
             for _ in range(3):
-                restored = AdaptiveSheets(self.store.cfg, lambda: self.ss)
+                restored = AdaptiveSheets(self.store.config, lambda: self.spreadsheet)
                 self.assertEqual(restored.table("bookings")[1], [])
 
     def test_owned_ai_client_is_closed_after_provider_failure(self):

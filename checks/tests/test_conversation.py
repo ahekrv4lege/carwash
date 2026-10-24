@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from openai import APIConnectionError, APITimeoutError, BadRequestError, RateLimitError
 
-from ai import Agent, ChatUser, TOOLS
+from ai import Agent, ChatUser
 from tests.fakes import booking, fixture
 
 
@@ -32,9 +32,9 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.store, self.ss = fixture(self.temp.name)
+        self.store, self.spreadsheet = fixture(self.temp.name)
         with patch("ai.AsyncOpenAI"):
-            self.agent = Agent(self.store.cfg, self.store)
+            self.agent = Agent(self.store.config, self.store)
         self.transport = AsyncMock()
         self.agent.client.chat.completions.create = self.transport
         self.user = ChatUser(111, None, "Synthetic")
@@ -52,7 +52,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
                               response(calls=[("create_booking", details)]))
 
     def writes(self):
-        return sum(len(s.writes) for s in self.ss.sheets)
+        return sum(len(s.writes) for s in self.spreadsheet.sheets)
 
     async def test_russian_booking_requires_delivered_explicit_confirmation(self):
         answer = await self.offer()
@@ -116,7 +116,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_price_change_requires_another_confirmation(self):
         await self.offer()
-        self.ss.worksheet("Услуги").values[1][2] = "900"
+        self.spreadsheet.worksheet("Услуги").values[1][2] = "900"
         answer = await self.say("Да")
         self.assertIn("810", answer)
         self.assertIn("изменились", answer)
@@ -127,22 +127,22 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
     async def test_same_total_but_changed_tariff_composition_requires_confirmation(self):
         await self.offer()
         # Воск включён бесплатно: сумма прежняя, состав иной.
-        self.ss.worksheet("Услуги").values[2][2] = "0"
-        self.ss.worksheet("Услуги").values[2][4] = "да"
+        self.spreadsheet.worksheet("Услуги").values[2][2] = "0"
+        self.spreadsheet.worksheet("Услуги").values[2][4] = "да"
         answer = await self.say("Да")
         self.assertIn("изменились", answer)
         self.assertEqual(self.writes(), 0)
 
     async def test_tariff_disabled_between_offer_and_confirmation(self):
         await self.offer()
-        self.ss.worksheet("Тарифы").values[1][3] = "нет"
+        self.spreadsheet.worksheet("Тарифы").values[1][3] = "нет"
         answer = await self.say("Да")
         self.assertIn("недоступен", answer)
         self.assertEqual(self.writes(), 0)
 
     async def test_capacity_change_before_confirmation_is_not_cached(self):
         await self.offer()
-        self.ss.worksheet("Слоты").values[1][2] = "0"
+        self.spreadsheet.worksheet("Слоты").values[1][2] = "0"
         answer = await self.say("Да")
         self.assertIn("недоступно", answer)
         self.assertEqual(self.writes(), 0)
@@ -187,7 +187,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_uncertain_write_never_retries_or_claims_success(self):
         await self.offer()
-        self.ss.worksheet("Записи").fail_write = True
+        self.spreadsheet.worksheet("Записи").fail_write = True
         with patch.object(self.store, "create_booking", wraps=self.store.create_booking) as write:
             answer = await self.say("Да")
             self.assertEqual(write.call_count, 1)
@@ -213,15 +213,15 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_does_not_act_on_changed_booking_details(self):
         b = self.store.create_booking(**booking())
         await self.say("Отмена", response(calls=[("cancel_booking", {"booking_id": str(b["booking_id"])})]))
-        ws = self.ss.worksheet("Записи")
-        ws.values[1][ws.values[0].index("Автомобиль")] = "Other car"
+        worksheet = self.spreadsheet.worksheet("Записи")
+        worksheet.values[1][worksheet.values[0].index("Автомобиль")] = "Other car"
         answer = await self.say("Да")
         self.assertIn("изменились", answer)
         self.assertEqual(len(self.store.my_bookings(111)["bookings"]), 1)
 
     async def test_unknown_or_foreign_cancellation_does_not_prepare(self):
-        b = self.store.create_booking(**booking(tg_id=222))
-        answer = await self.say("Отмена", response(calls=[("cancel_booking", {"booking_id": str(b["booking_id"])})]), response("Запись не найдена."))
+        b = self.store.create_booking(**booking(telegram_id=222))
+        await self.say("Отмена", response(calls=[("cancel_booking", {"booking_id": str(b["booking_id"])})]), response("Запись не найдена."))
         self.assertFalse(self.agent._pending)
         self.assertEqual(len(self.store.my_bookings(222)["bookings"]), 1)
 
@@ -265,10 +265,10 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.writes(), 0)
 
     async def test_tool_batch_and_iteration_limits(self):
-        self.agent.cfg = replace(self.agent.cfg, ai_max_tool_calls=1)
+        self.agent.config = replace(self.agent.config, ai_max_tool_calls=1)
         await self.say("Цены", response(calls=[("get_price_list", {}), ("get_price_list", {})]))
-        self.assertEqual(sum(s.reads for s in self.ss.sheets), 0)
-        self.agent.cfg = replace(self.agent.cfg, ai_max_tool_iterations=1, ai_max_tool_calls=12)
+        self.assertEqual(sum(s.reads for s in self.spreadsheet.sheets), 0)
+        self.agent.config = replace(self.agent.config, ai_max_tool_iterations=1, ai_max_tool_calls=12)
         answer = await self.say("Цена", response(calls=[("get_price_list", {})]))
         self.assertIn("число шагов", answer)
 
@@ -319,7 +319,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
     async def test_proofreading_is_opt_in_and_skips_proposals_and_receipts(self):
         await self.say("Привет", response("Здравствуйте!"))
         self.assertEqual(self.transport.call_count, 1)
-        self.agent.cfg = replace(self.agent.cfg, ai_proofread_enabled=True)
+        self.agent.config = replace(self.agent.config, ai_proofread_enabled=True)
         await self.offer()
         before = self.transport.call_count
         await self.say("Да")
@@ -332,7 +332,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
             await self.say(f"Вопрос {i} " + "сведения " * 30, response("Подскажу по услугам."))
         history = self.agent._history[111]
         self.assertLessEqual(len(history), 8)
-        self.assertLessEqual(sum(len(m["content"]) for m in history), self.agent.cfg.ai_history_chars)
+        self.assertLessEqual(sum(len(m["content"]) for m in history), self.agent.config.ai_history_chars)
         self.assertEqual([m["role"] for m in history], ["user", "assistant"] * (len(history)//2))
         self.assertIn("Вопрос 34", history[-2]["content"])
         self.assertFalse(any(m["role"] == "tool" for m in history))
@@ -353,7 +353,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ai_disabled_does_not_construct_or_call_provider(self):
         with patch("ai.AsyncOpenAI") as factory:
-            agent = Agent(replace(self.store.cfg, ai_enabled=False), self.store)
+            agent = Agent(replace(self.store.config, ai_enabled=False), self.store)
         self.assertIsNone(agent.client)
         factory.assert_not_called()
         self.assertIn("отключён", await agent.reply(self.user, "Запишите"))
@@ -507,8 +507,8 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_repricing_does_not_offer_slot_that_became_unavailable(self):
         await self.offer()
-        self.ss.worksheet("Услуги").values[1][2] = "900"
-        self.ss.worksheet("Слоты").values[1][2] = "0"
+        self.spreadsheet.worksheet("Услуги").values[1][2] = "900"
+        self.spreadsheet.worksheet("Слоты").values[1][2] = "0"
         answer = await self.say("Да")
         self.assertIn("недоступно", answer)
         self.assertNotIn("Подтверждаете", answer)
@@ -516,14 +516,14 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.writes(), 0)
 
     async def test_filtered_prices_load_catalog_once_even_with_cache_disabled(self):
-        self.store.cfg = replace(self.store.cfg, catalog_cache_sec=0)
+        self.store.config = replace(self.store.config, catalog_cache_sec=0)
         with patch.object(self.store, "get_catalog", wraps=self.store.get_catalog) as read:
             result = await self.agent._call_tool("get_price_list", '{"size_class":"Легковой"}', self.user)
         self.assertTrue(result["ok"])
         self.assertEqual(read.call_count, 1)
 
     async def test_proposal_loads_fresh_catalog_once_with_cache_disabled(self):
-        self.store.cfg = replace(self.store.cfg, catalog_cache_sec=0)
+        self.store.config = replace(self.store.config, catalog_cache_sec=0)
         with patch.object(self.store, "get_catalog", wraps=self.store.get_catalog) as read:
             await self.offer()
         self.assertEqual(read.call_count, 1)

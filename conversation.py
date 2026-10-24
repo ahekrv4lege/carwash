@@ -76,7 +76,7 @@ def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
             result[field] = None
             continue
         if field == "services":
-            if not isinstance(value, list) or len(value) > 30 or any(not isinstance(v, str) for v in value):
+            if not isinstance(value, list) or len(value) > 30 or any(not isinstance(field_value, str) for field_value in value):
                 raise ValueError("invalid_services")
         elif not isinstance(value, str) or not value.strip() or len(value) > 500:
             raise ValueError("invalid_fact_value")
@@ -86,14 +86,14 @@ def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
             if catalog is None:
                 raise ValueError("catalog_required")
             names = (catalog.size_classes if field == "size_class" else
-                     [s.name for s in catalog.services.values()] if field == "services" else
-                     [t.name for t in catalog.tariffs.values()])
+                     [service.name for service in catalog.services.values()] if field == "services" else
+                     [tariff.name for tariff in catalog.tariffs.values()])
             values = value if field == "services" else [value]
             canonical = []
             for raw in values:
                 matches = [name for name in names if folded(name) == folded(raw)]
                 previous = known.get(field, []) if field == "services" else [known.get(field, "")]
-                carried = any(folded(raw) == folded(v) for v in previous)
+                carried = any(folded(raw) == folded(field_value) for field_value in previous)
                 if len(matches) != 1 or not tentative and not carried and folded(matches[0]) not in folded(source):
                     raise ValueError("unverified_catalog_value")
                 canonical.append(matches[0])
@@ -102,20 +102,20 @@ def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
             if not valid_phone(value) or digits(value) != digits(source):
                 raise ValueError("invalid_phone_source")
         elif field == "date":
-            d, origin = parse_date(value), parse_date(source)
+            parsed_date, origin = parse_date(value), parse_date(source)
             relative = {"сегодня": 0, "завтра": 1, "послезавтра": 2}
             if folded(source) in relative:
                 origin = now.date() + timedelta(days=relative[folded(source)])
-            if not d or not tentative and d != origin:
+            if not parsed_date or not tentative and parsed_date != origin:
                 raise ValueError("invalid_date_source")
-            value = d.isoformat()
+            value = parsed_date.isoformat()
         elif field == "time":
             if tentative:
                 if not re.fullmatch(r"\d{2}:\d{2}", value) or not parse_time(value):
                     raise ValueError("invalid_tentative_time")
                 result[field] = value
                 continue
-            if any(not re.fullmatch(r"\s*\d{1,2}[:.]\d{2}(?::00)?\s*", v) for v in (source, value)):
+            if any(not re.fullmatch(r"\s*\d{1,2}[:.]\d{2}(?::00)?\s*", field_value) for field_value in (source, value)):
                 raise ValueError("invalid_time_source")
             value = parse_time(value)
             if not value or value != parse_time(source):
@@ -130,7 +130,7 @@ def apply_patch(state, changes, tentative):
     facts = state.setdefault("facts", {})
     guesses = state.setdefault("tentative", {})
     invalidated = set(state.get("invalidated", []))
-    changed = {k for k, v in changes.items() if not same(k, facts.get(k), v)}
+    changed = {field_name for field_name, field_value in changes.items() if not same(field_name, facts.get(field_name), field_value)}
     if "requested_service" in changed and not ({"tariff", "services"} & changes.keys()):
         changes = dict(changes, tariff=None, services=None)
         changed.update({"tariff", "services"})
@@ -185,8 +185,8 @@ def redact_phone(text, known=None):
     number = digits(known or "")
     def hide(match):
         value = match[0]
-        positions = [i for i, c in enumerate(value) if c.isdecimal()]
-        dense = "".join(value[i] for i in positions)
+        positions = [index for index, character in enumerate(value) if character.isdecimal()]
+        dense = "".join(value[index] for index in positions)
         start = dense.find(number) if number else -1
         if start >= 0:
             first, last = positions[start], positions[start + len(number) - 1] + 1
@@ -200,23 +200,23 @@ def redact_phone(text, known=None):
 
 
 def model_state(state):
-    result = {k: v for k, v in state.items() if k not in {"details", "facts", "tentative", "outstanding"}}
+    result = {field_name: field_value for field_name, field_value in state.items() if field_name not in {"details", "facts", "tentative", "outstanding"}}
     for key in ("facts", "tentative"):
-        values = {k: v for k, v in state.get(key, {}).items() if k != "phone"}
+        values = {field_name: field_value for field_name, field_value in state.get(key, {}).items() if field_name != "phone"}
         if state.get(key, {}).get("phone"):
             values["phone_known"] = True
         if values:
             result[key] = values
     selection = result.get("selection")
-    if selection and all(same(k, v, state.get("facts", {}).get(k)) for k, v in selection.items()):
+    if selection and all(same(field_name, field_value, state.get("facts", {}).get(field_name)) for field_name, field_value in selection.items()):
         result.pop("selection")
     facts = state.get("facts", {})
     guesses = state.get("tentative", {})
-    result["missing"] = [k for k in ("client_name", "phone", "car", "size_class", "date", "time")
-                         if not facts.get(k) or k in guesses or k in {"date", "time"} and "requested_datetime" in guesses]
+    result["missing"] = [field_name for field_name in ("client_name", "phone", "car", "size_class", "date", "time")
+                         if not facts.get(field_name) or field_name in guesses or field_name in {"date", "time"} and "requested_datetime" in guesses]
     if not facts.get("tariff") and not facts.get("services") or "requested_service" in guesses:
         result["missing"].append("tariff_or_services")
-    if state.get("unavailable_time") == {k: facts.get(k) for k in ("date", "time")}:
+    if state.get("unavailable_time") == {field_name: facts.get(field_name) for field_name in ("date", "time")}:
         result["missing"].append("available_time")
     return result
 

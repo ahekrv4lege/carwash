@@ -1,15 +1,11 @@
 """Telegram-бот «администратор автомойки» на aiogram 3. Запуск: python bot.py"""
 from __future__ import annotations
 
-if __name__ == "__main__":
-    from run import main as launch
-    raise SystemExit(launch())
-
 import asyncio
 import logging
 from contextlib import suppress
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, F as Filter, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 from aiogram.utils.chat_action import ChatActionSender
@@ -21,7 +17,7 @@ from sheets import Store
 
 log = logging.getLogger(__name__)
 router = Router()
-router.message.filter(F.chat.type == "private")  # работаем только в личных чатах
+router.message.filter(Filter.chat.type == "private")  # работаем только в личных чатах
 
 TG_LIMIT = 4000  # лимит Telegram — 4096 символов
 
@@ -39,22 +35,22 @@ def split_text(text: str, limit: int = TG_LIMIT) -> list[str]:
 
 
 async def ask_agent(message: Message, agent: Agent, reporter: AdminReporter, text: str) -> None:
-    u = message.from_user
-    user = ChatUser(id=u.id, username=u.username, full_name=u.full_name)
+    telegram_user = message.from_user
+    user = ChatUser(id=telegram_user.id, username=telegram_user.username, full_name=telegram_user.full_name)
     async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
         answer = await agent.reply(user, text)
-    delivery_token = agent.delivery_token(u.id)
+    delivery_token = agent.delivery_token(telegram_user.id, answer)
     for chunk in split_text(answer):
         await message.answer(chunk)
-    agent.mark_delivered(u.id, delivery_token)
-    await reporter.dialog(u.id, u.full_name, u.username, text, answer)
+    agent.mark_delivered(telegram_user.id, delivery_token)
+    await reporter.dialog(telegram_user.id, telegram_user.full_name, telegram_user.username, text, answer)
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, agent: Agent, cfg: Config) -> None:
+async def cmd_start(message: Message, agent: Agent, config: Config) -> None:
     agent.reset(message.from_user.id)
     await message.answer(
-        f"Здравствуйте! Меня зовут Светлана, я администратор автомойки «{cfg.carwash_name}» 🙂\n\n"
+        f"Здравствуйте! Меня зовут Светлана, я администратор автомойки «{config.carwash_name}» 🙂\n\n"
         "Подскажу услуги и цены, подберу свободное время и запишу вас.\n"
         "Как вас зовут?",
     )
@@ -66,12 +62,12 @@ async def cmd_reset(message: Message, agent: Agent) -> None:
     await message.answer("Диалог сброшен. Чем могу помочь?")
 
 
-@router.message(F.contact)
+@router.message(Filter.contact)
 async def on_contact(message: Message, agent: Agent, reporter: AdminReporter) -> None:
     await ask_agent(message, agent, reporter, f"Мой номер телефона: {message.contact.phone_number}")
 
 
-@router.message(F.text)
+@router.message(Filter.text)
 async def on_text(message: Message, agent: Agent, reporter: AdminReporter) -> None:
     await ask_agent(message, agent, reporter, message.text)
 
@@ -89,28 +85,33 @@ async def maintain_sessions(agent: Agent) -> None:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    cfg = load_config()
-    bot = Bot(cfg.bot_token)
-    store = Store(cfg)
-    reporter = AdminReporter(bot, cfg.admin_chat_id)
-    agent = Agent(cfg, store, reporter)
-
-    dp = Dispatcher(agent=agent, cfg=cfg, reporter=reporter)  # попадут в хэндлеры по имени параметров
-    dp.include_router(router)
-    maintenance = asyncio.create_task(maintain_sessions(agent))
-
+    config = load_config()
+    bot = Bot(config.bot_token)
+    agent = None
+    maintenance = None
     try:
-        if cfg.sheets_adaptive_enabled and cfg.sheets_discover_on_start:
-            await asyncio.to_thread(store.refresh_schema, force=cfg.sheets_force_schema_refresh)
+        store = Store(config)
+        reporter = AdminReporter(bot, config.admin_chat_id)
+        agent = Agent(config, store, reporter)
+        dispatcher = Dispatcher(agent=agent, config=config, reporter=reporter)
+        dispatcher.include_router(router)
+        maintenance = asyncio.create_task(maintain_sessions(agent))
+        if config.sheets_adaptive_enabled and config.sheets_discover_on_start:
+            await asyncio.to_thread(store.refresh_schema, force=config.sheets_force_schema_refresh)
         await bot.delete_webhook(drop_pending_updates=False)
-        log.info("Бот запущен. Модель: %s", cfg.conversation_model if cfg.ai_enabled else "AI отключён")
-        await dp.start_polling(bot, close_bot_session=False)
+        log.info("Бот запущен. Модель: %s", config.ai_model if config.ai_enabled else "AI отключён")
+        await dispatcher.start_polling(bot, close_bot_session=False)
     finally:
-        maintenance.cancel()
-        with suppress(asyncio.CancelledError):
-            await maintenance
+        if maintenance is not None:
+            maintenance.cancel()
+            with suppress(asyncio.CancelledError):
+                await maintenance
         try:
-            if agent.client is not None:
-                await agent.client.close()
+            if agent is not None:
+                await agent.close()
         finally:
             await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

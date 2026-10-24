@@ -8,13 +8,17 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
+import time
 import venv
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(__file__).resolve().parent
 REQUIRED_PACKAGES = ("aiogram", "gspread", "google.auth", "openai", "dotenv", "tzdata")
+RESTART_DELAY_SEC = 5
+WIN_CTRL_C_EXIT_CODE = 0xC000013A
 
 
 class StartupError(RuntimeError):
@@ -67,25 +71,25 @@ def prepare_environment(no_install: bool = False) -> None:
     for name in ("bot.py", "config.py", "requirements.txt"):
         if not (ROOT / name).is_file():
             raise StartupError(f"Не найден обязательный файл: {name}")
-    env = ROOT / ".venv"
-    python = env / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    if Path(sys.prefix).resolve() != env.resolve():
-        if not python.is_file():
+    environment_path = ROOT / ".venv"
+    python_path = environment_path / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if Path(sys.prefix).resolve() != environment_path.resolve():
+        if not python_path.is_file():
             if no_install:
                 raise StartupError("Нет .venv; запустите без --no-install")
             print("Создаю .venv...", flush=True)
             try:
                 with InstanceLock(ROOT / ".runtime/bootstrap.lock"):
-                    if not python.is_file():
-                        venv.EnvBuilder(with_pip=True).create(env)
-            except (OSError, subprocess.SubprocessError) as exc:
-                raise StartupError("Не удалось создать .venv. Проверьте поддержку Python venv/ensurepip") from exc
+                    if not python_path.is_file():
+                        venv.EnvBuilder(with_pip=True).create(environment_path)
+            except (OSError, subprocess.SubprocessError) as error:
+                raise StartupError("Не удалось создать .venv. Проверьте поддержку Python venv/ensurepip") from error
         try:
-            os.execv(str(python), [str(python), str(ROOT / "run.py"), *sys.argv[1:]])
+            os.execv(str(python_path), [str(python_path), str(ROOT / "run.py"), *sys.argv[1:]])
         except OSError:
             raise StartupError("Не удалось запустить Python из .venv; проверьте совместимость и права окружения") from None
     signature = hashlib.sha256((ROOT / "requirements.txt").read_bytes() + sys.version.encode()).hexdigest()
-    stamp = env / ".requirements.sha256"
+    stamp = environment_path / ".requirements.sha256"
     missing = [name for name in REQUIRED_PACKAGES if not has_module(name)]
     if missing or not stamp.is_file() or stamp.read_text().strip() != signature:
         if no_install:
@@ -102,40 +106,67 @@ def prepare_environment(no_install: bool = False) -> None:
 
 def validate_config(sheets_only: bool = False):
     from config import load_config
-    if not (ROOT / ".env").is_file():
-        raise StartupError("Нет .env. Скопируйте .env.example в .env и заполните настройки")
     try:
-        cfg = load_config(sheets_only=sheets_only)
-    except (RuntimeError, ValueError) as exc:
-        raise StartupError(str(exc)) from None
+        config = load_config(sheets_only=sheets_only)
+    except (RuntimeError, ValueError) as error:
+        prefix = "Нет .env; настройте переменные окружения. " if not (ROOT / ".env").is_file() else ""
+        raise StartupError(prefix + str(error)) from None
     try:
-        ZoneInfo(cfg.timezone)
+        ZoneInfo(config.timezone)
     except (ZoneInfoNotFoundError, ValueError):
         raise StartupError("TIMEZONE: неизвестный часовой пояс") from None
-    if not sheets_only and not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", cfg.bot_token):
+    if not sheets_only and not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", config.bot_token):
         raise StartupError("BOT_TOKEN имеет неверный формат; значение скрыто")
-    path = Path(cfg.google_credentials_file)
+    path = Path(config.google_credentials_file)
     if not path.is_file():
         raise StartupError("Не найден GOOGLE_CREDENTIALS_FILE; настройте ключ сервисного аккаунта")
     try:
         credentials = json.loads(path.read_text(encoding="utf-8"))
         required = ("client_email", "private_key", "token_uri")
-        if not isinstance(credentials, dict) or credentials.get("type") != "service_account" or not all(credentials.get(k) for k in required):
+        if not isinstance(credentials, dict) or credentials.get("type") != "service_account" or not all(credentials.get(field_name) for field_name in required):
             raise ValueError
     except (ValueError, OSError):
         raise StartupError("GOOGLE_CREDENTIALS_FILE: нужен корректный JSON ключ сервисного аккаунта") from None
-    if not sheets_only and cfg.ai_enabled and not cfg.conversation_model:
-        raise StartupError("Не задан AI_MODEL, LLM_MODEL или OPENROUTER_MODEL")
-    return cfg
+    if not sheets_only and config.ai_enabled and not config.ai_model:
+        raise StartupError("Не задан LLM_MODEL или AI_MODEL")
+    return config
 
 
-def validate_local_bot(cfg) -> None:
-    if not cfg.local_bot_id or cfg.local_bot_id != cfg.bot_token.split(":", 1)[0]:
-        raise StartupError("Для локального запуска создайте отдельного бота и задайте LOCAL_BOT_ID, "
-                           "равный числовой части его BOT_TOKEN")
-    if not cfg.bot_start_confirmed:
-        raise StartupError("Подтвердите отдельный локальный токен: BOT_START_CONFIRMED=true. "
-                           "Не используйте общий токен команды")
+def run_forever() -> None:
+    print("Запускаю бота. Остановка — Ctrl+C.", flush=True)
+    process = None
+    stopping = False
+
+    def stop(signum, frame):
+        nonlocal stopping
+        stopping = True
+        if process is not None and process.poll() is None:
+            try:
+                # Ctrl+C уже доставлен общей Windows-консоли; Popen не принимает SIGINT.
+                if os.name == "nt" and signum == signal.SIGINT:
+                    return
+                process.send_signal(signum)
+            except ProcessLookupError:
+                pass
+
+    previous = signal.signal(signal.SIGTERM, stop)
+    try:
+        while not stopping:
+            process = subprocess.Popen([sys.executable, str(ROOT / "bot.py")], cwd=ROOT)
+            try:
+                code = process.wait()
+            except KeyboardInterrupt:
+                stop(signal.SIGINT, None)
+                process.wait()
+                return
+            if stopping or code in (0, WIN_CTRL_C_EXIT_CODE):
+                return
+            print(f"Бот завершился с кодом {code}. Перезапуск через {RESTART_DELAY_SEC} с.", flush=True)
+            time.sleep(RESTART_DELAY_SEC)
+    except KeyboardInterrupt:
+        return
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def main() -> int:
@@ -155,17 +186,15 @@ def main() -> int:
             print("Виртуальное окружение и зависимости готовы")
             return 0
         sheets_only = args.refresh_schema or args.validate_mappings or args.suggest_mappings
-        cfg = validate_config(sheets_only=sheets_only)
-        if not sheets_only:
-            validate_local_bot(cfg)
+        config = validate_config(sheets_only=sheets_only)
         # Общая блокировка по bot id защищает также копии проекта на этом компьютере.
-        lock_key = cfg.bot_token.split(":", 1)[0] if not sheets_only else hashlib.sha256(cfg.spreadsheet_id.encode()).hexdigest()[:24]
+        lock_key = config.bot_token.split(":", 1)[0] if not sheets_only else hashlib.sha256(config.spreadsheet_id.encode()).hexdigest()[:24]
         import tempfile
         lock_path = Path(tempfile.gettempdir()) / "carwash-locks" / f"{lock_key}.lock"
         with InstanceLock(lock_path):
             if sheets_only:
                 from sheets import Store
-                store = Store(cfg)
+                store = Store(config)
                 document = store.refresh_schema(force=args.refresh_schema, validate=args.validate_mappings)
                 if args.suggest_mappings:
                     from mapping_ai import suggest_mappings
@@ -180,17 +209,15 @@ def main() -> int:
             if args.check:
                 print("Локальная конфигурация корректна; сетевые подключения не выполнялись")
                 return 0
-            import asyncio
-            from bot import main as bot_main
-            asyncio.run(bot_main())
+            run_forever()
         return 0
     except KeyboardInterrupt:
         print("Остановлено пользователем")
         return 0
-    except Exception as exc:
+    except Exception as error:
         # Не печатаем содержимое исключений поставщиков: они могут содержать секреты.
         from adaptive import MappingError
-        text = str(exc) if isinstance(exc, (StartupError, MappingError)) else f"{type(exc).__name__}: проверьте настройки, зависимости и доступ к сервисам"
+        text = str(error) if isinstance(error, (StartupError, MappingError)) else f"{type(error).__name__}: проверьте настройки, зависимости и доступ к сервисам"
         print(f"Ошибка запуска: {text}", file=sys.stderr)
         return 1
 

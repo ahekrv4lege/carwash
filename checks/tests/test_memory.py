@@ -21,9 +21,9 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.store, self.ss = fixture(self.temp.name)
+        self.store, self.spreadsheet = fixture(self.temp.name)
         with patch("ai.AsyncOpenAI"):
-            self.agent = Agent(self.store.cfg, self.store)
+            self.agent = Agent(self.store.config, self.store)
         self.transport = AsyncMock()
         self.agent.client.chat.completions.create = self.transport
         self.user = ChatUser(111, None, "Имя из Telegram не является именем клиента")
@@ -43,11 +43,11 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         return self.agent._state[111].get("facts", {})
 
     async def test_thirty_two_turn_russian_booking_with_corrections_and_failures(self):
-        services = self.ss.worksheet("Услуги").values
+        services = self.spreadsheet.worksheet("Услуги").values
         services.extend([["Полировка", "Не выполняется", "3000", "4000", "нет"],
                          ["Пылесос", "Салон", "200", "250", "да"]])
-        self.ss.worksheet("Слоты").values[1][2] = "0"
-        self.ss.worksheet("Слоты").values.extend([
+        self.spreadsheet.worksheet("Слоты").values[1][2] = "0"
+        self.spreadsheet.worksheet("Слоты").values.extend([
             ["01.01.2099", "11:00", "1"], ["02.01.2099", "12:00", "1"]])
         await self.say("сам мо бой вы же там че эта мастерстая ну короче у меня есть камрюха 3.5 че там по полировке",
             {"car": ["камрюха 3.5", "камрюха 3.5"], "requested_service": ["полировке", "полировке"]})
@@ -98,7 +98,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(value, proposal)
         self.assertNotIn("Пылесос", proposal)
         self.assertNotIn("Базовый", proposal)
-        self.assertEqual(sum(len(s.writes) for s in self.ss.sheets), 0)
+        self.assertEqual(sum(len(s.writes) for s in self.spreadsheet.sheets), 0)
         with patch.object(self.store, "create_booking", wraps=self.store.create_booking) as write:
             result = await self.say("Да, подтверждаю запись")
             self.assertEqual(write.call_count, 1)
@@ -144,10 +144,10 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_model_booking_cannot_replace_corrected_facts(self):
         await self.say("Антон", {"client_name": ["Антон", "Антон"]})
-        answer = await self.say("Готово", calls=[("create_booking", ARGS)], follow="Уточним данные.")
+        await self.say("Готово", calls=[("create_booking", ARGS)], follow="Уточним данные.")
         self.assertNotIn(111, self.agent._pending)
         self.assertEqual(self.facts()["client_name"], "Антон")
-        self.assertEqual(sum(len(s.writes) for s in self.ss.sheets), 0)
+        self.assertEqual(sum(len(s.writes) for s in self.spreadsheet.sheets), 0)
 
     async def test_unknown_details_cannot_be_invented_from_telegram_profile_or_tool_call(self):
         await self.say("Хочу записаться", calls=[("create_booking", ARGS)], follow="Нужны данные.")
@@ -203,11 +203,11 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         for text in claims:
             answer = await self.say("Оформить?", reply=text)
             self.assertIn("не подтверждён", answer, text)
-        self.agent.cfg = replace(self.agent.cfg, ai_proofread_enabled=True)
+        self.agent.config = replace(self.agent.config, ai_proofread_enabled=True)
         self.transport.side_effect = [response(envelope("Проверим данные.")), response("Вы записаны.", raw=True)]
         answer = await self.agent.reply(self.user, "Проверить?")
         self.assertIn("не подтверждён", answer)
-        self.assertEqual(sum(len(s.writes) for s in self.ss.sheets), 0)
+        self.assertEqual(sum(len(s.writes) for s in self.spreadsheet.sheets), 0)
 
     async def test_plain_response_is_rejected_instead_of_silently_losing_memory(self):
         self.transport.side_effect = [response("Учту вашу Toyota.", raw=True)]
@@ -266,7 +266,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         stale = dict(ARGS, client_name="Антон", phone="70001112233", car="Toyota Camry 3.5")
         await self.say("Да", calls=[("create_booking", stale)], follow="Нужен новый выбор услуги.")
         self.assertNotIn(111, self.agent._pending)
-        self.assertEqual(sum(len(s.writes) for s in self.ss.sheets), 0)
+        self.assertEqual(sum(len(s.writes) for s in self.spreadsheet.sheets), 0)
 
     async def test_car_correction_cannot_resurrect_class_from_recent_history(self):
         await self.say("Toyota Camry Легковой", {"car": ["Toyota Camry", "Toyota Camry"], "size_class": ["Легковой", "Легковой"]})
@@ -290,13 +290,13 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_idle_cleanup_removes_personal_data_histories_proposals_and_locks(self):
         await self.say("Антон", {"client_name": ["Антон", "Антон"]})
         self.agent._pending[111] = {"action": "create_booking", "phone": "70001112233"}
-        self.agent.cleanup_sessions(now=time.monotonic() + self.agent.cfg.ai_session_ttl_sec + 1)
+        self.agent.cleanup_sessions(now=time.monotonic() + self.agent.config.ai_session_ttl_sec + 1)
         for sessions in (self.agent._history, self.agent._state, self.agent._pending, self.agent._locks,
                          self.agent._generation, self.agent._last_seen, self.agent._active, self.agent._turn_text):
             self.assertNotIn(111, sessions)
 
     async def test_session_cap_does_not_erase_reused_or_active_customer(self):
-        self.agent.cfg = replace(self.agent.cfg, ai_max_sessions=2)
+        self.agent.config = replace(self.agent.config, ai_max_sessions=2)
         await self.say("Антон", {"client_name": ["Антон", "Антон"]})
         self.transport.side_effect = [response(envelope("Учту."))]
         await self.agent.reply(ChatUser(222, None, ""), "Привет")
@@ -305,9 +305,9 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         async with self.agent._session(111):
             self.agent.cleanup_sessions(now=time.monotonic() + 100000)
             self.assertIn(111, self.agent._state)
-        for uid in (333, 444, 555):
+        for user_id in (333, 444, 555):
             self.transport.side_effect = [response(envelope("Учту."))]
-            await self.agent.reply(ChatUser(uid, None, ""), "Привет")
+            await self.agent.reply(ChatUser(user_id, None, ""), "Привет")
         self.assertLessEqual(len(self.agent._state), 2)
         self.assertLessEqual(len(self.agent._history), 2)
         self.assertLessEqual(len(self.agent._locks), 2)
@@ -322,7 +322,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(111, self.agent._turn_text)
 
     async def test_class_before_initial_car_and_additional_service_do_not_lose_known_facts(self):
-        self.ss.worksheet("Услуги").values.append(["Пылесос", "Салон", "200", "250", "да"])
+        self.spreadsheet.worksheet("Услуги").values.append(["Пылесос", "Салон", "200", "250", "да"])
         await self.say("Легковой", {"size_class": ["Легковой", "Легковой"]})
         await self.say("Toyota Camry", {"car": ["Toyota Camry", "Toyota Camry"]})
         self.assertEqual(self.facts()["size_class"], "Легковой")
