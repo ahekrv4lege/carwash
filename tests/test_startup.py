@@ -8,7 +8,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from unittest.mock import patch
 
@@ -116,18 +115,8 @@ class StartupTests(unittest.TestCase):
                     pass
             proc.terminate()
             proc.wait(timeout=5)
-            # В venv на Windows python.exe — транпмолин: terminate() убивает его,
-            # а процесс-наследник, держащий блокировку, завершается чуть позже.
-            # Даём блокировке освободиться, но не дольше 5 секунд.
-            deadline = time.monotonic() + 5
-            while True:
-                try:
-                    with run.InstanceLock(path):
-                        break
-                except run.StartupError:
-                    if time.monotonic() >= deadline:
-                        raise
-                    time.sleep(0.1)
+            with run.InstanceLock(path):
+                pass
         finally:
             if proc.poll() is None:
                 proc.kill()

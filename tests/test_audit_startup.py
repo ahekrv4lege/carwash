@@ -44,11 +44,8 @@ class AuditStartupTests(unittest.TestCase):
                 load_config(sheets_only=True)
 
     def test_relative_absolute_and_home_paths(self):
-        # Домашние переменные сохраняем: на Windows без USERPROFILE/HOMEDRIVE
-        # expanduser('~') не работает, и тест падает не по своей вине.
-        home = {k: os.environ[k] for k in ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH") if k in os.environ}
         for name in ("relative.json", str(self.root / "absolute.json"), "~/synthetic.json"):
-            with self.subTest(name=name), patch.dict(os.environ, {**home, "SPREADSHEET_ID": "synthetic",
+            with self.subTest(name=name), patch.dict(os.environ, {"SPREADSHEET_ID": "synthetic",
                     "GOOGLE_CREDENTIALS_FILE": name, "SHEETS_MAPPING_FILE": name}, clear=True):
                 cfg = load_config(sheets_only=True)
                 expected = Path(name).expanduser()
