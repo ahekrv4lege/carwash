@@ -6,11 +6,14 @@ from dataclasses import dataclass
 from pathlib import Path
 import math
 import re
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / ".env", override=False)
+# .env — единственный источник настроек: значения из файла сильнее
+# любых переменных окружения (системных, заданных в терминале и т.п.).
+load_dotenv(ROOT / ".env", override=True)
 
 
 def _bool(name: str, default: bool = False) -> bool:
@@ -61,9 +64,6 @@ class Config:
     # Telegram / LLM-провайдер (OpenAI-совместимый API).
     # LLM_* — схема команды (по умолчанию xKiro); AI_*/OPENROUTER_* — совместимость.
     bot_token: str
-    llm_api_key: str
-    llm_model: str
-    llm_base_url: str
     openrouter_api_key: str
     openrouter_model: str
     # Google Sheets
@@ -95,6 +95,9 @@ class Config:
     sheets_mapping_file: str = str(ROOT / ".runtime/sheets-mapping.json")
     local_bot_id: str = ""
     bot_start_confirmed: bool = False
+    llm_api_key: str = ""
+    llm_model: str = ""
+    llm_base_url: str = ""
     ai_enabled: bool = True
     ai_base_url: str = "https://openrouter.ai/api/v1"
     ai_api_key: str = ""
@@ -137,15 +140,19 @@ def load_config(sheets_only: bool = False) -> Config:
     enabled = _bool("AI_ENABLED", True)
     legacy_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     legacy_model = os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free").strip()
+    ai_key_explicit = os.getenv("AI_API_KEY", "").strip()
     llm_key = os.getenv("LLM_API_KEY", "").strip()
-    llm_model = os.getenv("LLM_MODEL", "qwen/qwen3.8-max:free").strip()
     llm_base_explicit = os.getenv("LLM_BASE_URL", "").strip()
     llm_base = (llm_base_explicit or "https://api.xkiro.com/v1").rstrip("/") or "https://api.xkiro.com/v1"
-    api_key = os.getenv("AI_API_KEY", "").strip() or llm_key or legacy_key
-    ai_model_raw = os.getenv("AI_MODEL", "").strip()
     llm_model_explicit = os.getenv("LLM_MODEL", "").strip()
+    # Схема LLM_* активна, если явно задан хотя бы один её параметр.
+    llm_scheme = bool(llm_key or llm_base_explicit or llm_model_explicit)
+    # Дефолт модели xKiro применяется только внутри схемы LLM_* и не должен
+    # затенять явный OPENROUTER_MODEL (легаси-контракт команды).
+    llm_model = (llm_model_explicit or "qwen/qwen3.8-max:free") if llm_scheme else ""
+    ai_model_raw = os.getenv("AI_MODEL", "").strip()
     ai_model = ai_model_raw or llm_model_explicit
-    if enabled and not sheets_only and not (api_key or legacy_key or llm_key):
+    if enabled and not sheets_only and not (ai_key_explicit or llm_key or legacy_key):
         raise RuntimeError("Не задан AI_API_KEY, LLM_API_KEY или OPENROUTER_API_KEY; заполните .env")
     effort = os.getenv("AI_REASONING_EFFORT", "").strip()
     if effort not in {"", "none", "minimal", "low", "medium", "high", "xhigh", "max"}:
@@ -161,15 +168,26 @@ def load_config(sheets_only: bool = False) -> Config:
     temperature = None if not os.getenv("AI_TEMPERATURE", "0.3").strip() else _number("AI_TEMPERATURE", "0.3")
     if temperature is not None and temperature > 2:
         raise RuntimeError("AI_TEMPERATURE: допустимо от 0 до 2 или пустое значение")
-    base_url_explicit = os.getenv("AI_BASE_URL", "").strip()
+    ai_base_raw = os.getenv("AI_BASE_URL")
+    base_url_explicit = (ai_base_raw or "").strip()
+    if ai_base_raw is not None and not base_url_explicit:
+        raise RuntimeError("AI_BASE_URL: пустое значение — удалите строку или укажите URL")
     if base_url_explicit:
         base_url = base_url_explicit
-    elif llm_base_explicit:
-        base_url = llm_base_explicit.rstrip("/") or llm_base
+    elif llm_base_explicit or llm_key:
+        # Активна схема LLM_* (адрес указан или задан её ключ): дефолт этой
+        # схемы — xKiro. Раньше при заданном LLM_API_KEY без LLM_BASE_URL
+        # запросы молча уходили на openrouter.ai с чужим для него ключом.
+        base_url = llm_base
     else:
         base_url = "https://openrouter.ai/api/v1"
+    # Ключ OPENROUTER_* подставляется только для адреса openrouter.ai:
+    # кастомный провайдер не должен получать чужой для него легаси-ключ.
+    if urlsplit(base_url).hostname == "openrouter.ai":
+        api_key = ai_key_explicit or llm_key or legacy_key
+    else:
+        api_key = ai_key_explicit or llm_key
     mapping_url = os.getenv("SHEETS_AI_BASE_URL", "").strip()
-    from urllib.parse import urlsplit
     for name, url in (("AI_BASE_URL", base_url), ("SHEETS_AI_BASE_URL", mapping_url)):
         if name == "SHEETS_AI_BASE_URL" and not url:
             continue

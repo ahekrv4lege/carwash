@@ -125,7 +125,7 @@ def validate_config(sheets_only: bool = False):
     except (ValueError, OSError):
         raise StartupError("GOOGLE_CREDENTIALS_FILE: нужен корректный JSON ключ сервисного аккаунта") from None
     if not sheets_only and cfg.ai_enabled and not cfg.conversation_model:
-        raise StartupError("Не задан AI_MODEL или OPENROUTER_MODEL")
+        raise StartupError("Не задан AI_MODEL, LLM_MODEL или OPENROUTER_MODEL")
     return cfg
 
 

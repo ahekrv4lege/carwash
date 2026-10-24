@@ -220,7 +220,7 @@ class AdaptiveTests(unittest.TestCase):
     def test_mappings_store_no_customer_rows(self):
         self.store.create_booking(**booking())
         self.a.refresh(force=True)
-        text = self.a.path.read_text()
+        text = self.a.path.read_text(encoding="utf-8")
         self.assertNotIn("Synthetic", text)
         self.assertNotIn("00000000000", text)
         self.assertNotIn("Fixture car", text)
