@@ -8,7 +8,7 @@ from datetime import timedelta
 from sheets import digits, parse_date, parse_time, valid_phone
 
 
-FIELDS = {"client_name", "phone", "car", "size_class", "requested_service", "tariff",
+FIELDS = {"client_name", "phone", "car", "car_model", "size_class", "requested_service", "tariff",
           "services", "date", "time", "comment", "requested_datetime"}
 CATALOG_FIELDS = {"size_class", "tariff", "services"}
 QUOTE_FIELDS = {"car", "size_class", "tariff", "services", "requested_service"}
@@ -60,12 +60,44 @@ def unpack(content):
     return reply, data.get("facts", {}), data.get("tentative", {})
 
 
+def source_date(source, now, embedded=False):
+    text = folded(source)
+    relative = {"сегодня": 0, "завтра": 1, "послезавтра": 2}
+    if text in relative:
+        return now.date() + timedelta(days=relative[text])
+    pattern = r"понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресенье"
+    if embedded:
+        dates = re.findall(rf"\b(?:сегодня|завтра|послезавтра|{pattern}|\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}\.\d{{1,2}}\.\d{{4}})\b", text)
+        return source_date(dates[0], now) if len(dates) == 1 else None
+    weekday = re.fullmatch(rf"(?:в |во )?({pattern})", text)
+    if weekday:
+        names = ("понедельник", "вторник", "сред", "четверг", "пятниц", "суббот", "воскресенье")
+        day = next(index for index, name in enumerate(names) if weekday[1].startswith(name))
+        return now.date() + timedelta(days=(day - now.weekday()) % 7)
+    return parse_date(source)
+
+
+def source_time(source, embedded=False):
+    text = folded(source)
+    if embedded:
+        clocks = re.findall(r"\b(?:в|к)\s*(\d{1,2}(?:[:.]\d{2})?)(?!\d)", text)
+        return source_time(clocks[0]) if len(clocks) == 1 else source_time(text)
+    clock = re.fullmatch(r"(?:в\s*|к\s*)?(\d{1,2})(?:[:.](\d{2})(?::00)?)?(?:\s*(?:час(?:а|ов)?|ч))?", text)
+    return parse_time(f"{clock[1]}:{clock[2] or '00'}") if clock else None
+
+
 def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
     if not isinstance(patch, dict) or set(patch) - FIELDS:
         raise ValueError("invalid_fact_fields")
     result = {}
     known = known or {}
     text_value = folded(text) if patch else ""
+    grounded = dict(known)
+    for field in ("car", "requested_service"):
+        entry = patch.get(field)
+        if (isinstance(entry, list) and len(entry) == 2 and all(isinstance(value, str) and value.strip() for value in entry)
+                and folded(entry[0]) in folded(entry[1]) and folded(entry[1]) in text_value):
+            grounded[field] = entry[0]
     for field, entry in patch.items():
         if not isinstance(entry, list) or len(entry) != 2:
             raise ValueError("invalid_fact_entry")
@@ -87,7 +119,10 @@ def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
         if tentative:
             result[field] = value
             continue
-        if field in CATALOG_FIELDS:
+        if field == "car_model":
+            if not grounded.get("car") or folded(grounded["car"]) not in folded(source):
+                raise ValueError("missing_car_source")
+        elif field in CATALOG_FIELDS:
             if catalog is None:
                 raise ValueError("catalog_required")
             names = (catalog.size_classes if field == "size_class" else
@@ -99,7 +134,9 @@ def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
                 matches = [name for name in names if folded(name) == folded(raw)]
                 previous = known.get(field, []) if field == "services" else [known.get(field, "")]
                 carried = any(folded(raw) == folded(field_value) for field_value in previous)
-                if len(matches) != 1 or not carried and folded(matches[0]) not in folded(source):
+                origin = grounded.get("car" if field == "size_class" else "requested_service", "")
+                inferred = origin and folded(origin) in folded(source)
+                if len(matches) != 1 or not (carried or inferred) and folded(matches[0]) not in folded(source):
                     raise ValueError("unverified_catalog_value")
                 canonical.append(matches[0])
             value = list(dict.fromkeys(canonical)) if field == "services" else canonical[0]
@@ -107,22 +144,32 @@ def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
             if not valid_phone(value) or digits(value) != digits(source):
                 raise ValueError("invalid_phone_source")
         elif field == "date":
-            parsed_date, origin = parse_date(value), parse_date(source)
-            relative = {"сегодня": 0, "завтра": 1, "послезавтра": 2}
-            if folded(source) in relative:
-                origin = now.date() + timedelta(days=relative[folded(source)])
+            parsed_date, origin = parse_date(value), source_date(source, now)
             if not parsed_date or parsed_date != origin:
                 raise ValueError("invalid_date_source")
             value = parsed_date.isoformat()
         elif field == "time":
-            if any(not re.fullmatch(r"\s*\d{1,2}[:.]\d{2}(?::00)?\s*", field_value) for field_value in (source, value)):
+            if not re.fullmatch(r"\s*\d{1,2}[:.]\d{2}(?::00)?\s*", value):
                 raise ValueError("invalid_time_source")
             value = parse_time(value)
-            if not value or value != parse_time(source):
+            if not value or value != source_time(source):
                 raise ValueError("invalid_time_source")
         elif folded(value) not in folded(source):
             raise ValueError("invented_customer_fact")
         result[field] = value
+    return result
+
+
+def salvage_patch(patch, text, now, catalog=None, tentative=False, known=None):
+    if not isinstance(patch, dict):
+        raise ValueError("invalid_fact_fields")
+    result = {}
+    for field in sorted(patch, key=lambda name: name not in {"car", "requested_service"}):
+        try:
+            result.update(validate_patch({field: patch[field]}, text, now, catalog, tentative,
+                                         {**(known or {}), **result}))
+        except (ValueError, TypeError):
+            continue
     return result
 
 
@@ -140,6 +187,8 @@ def apply_patch(state, changes, tentative):
     if "car" in changed and facts.get("car") and "size_class" not in changes:
         changes = dict(changes, size_class=None)
         changed.add("size_class")
+    if "car" in changed and facts.get("car_model") and "car_model" not in changes:
+        changes = dict(changes, car_model=None)
     if "date" in changed and facts.get("date") and "time" not in changes:
         changes = dict(changes, time=None)
         changed.add("time")

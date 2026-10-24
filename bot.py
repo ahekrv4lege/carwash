@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import suppress
 
 from aiogram import Bot, Dispatcher, F as Filter, Router
@@ -37,8 +38,10 @@ def split_text(text: str, limit: int = TG_LIMIT) -> list[str]:
 async def ask_agent(message: Message, agent: Agent, reporter: AdminReporter, text: str) -> None:
     telegram_user = message.from_user
     user = ChatUser(id=telegram_user.id, username=telegram_user.username, full_name=telegram_user.full_name)
+    started = time.monotonic()
     async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
         answer = await agent.reply(user, text)
+        await asyncio.sleep(max(0, agent.config.reply_min_delay_sec - (time.monotonic() - started)))
     delivery_token = agent.delivery_token(telegram_user.id, answer)
     for chunk in split_text(answer):
         await message.answer(chunk)
@@ -55,9 +58,7 @@ async def cmd_start(message: Message, agent: Agent, config: Config) -> None:
         one_time_keyboard=True,
     )
     await message.answer(
-        f"Здравствуйте! Меня зовут Светлана, я администратор автомойки «{config.carwash_name}» 🙂\n\n"
-        "Подскажу услуги и цены, подберу свободное время и запишу вас.\n"
-        "Как вас зовут?",
+        f"Здравствуйте! Автомойка «{config.carwash_name}». Подскажу цены и помогу записаться. Чем помочь?",
         reply_markup=keyboard,
     )
 

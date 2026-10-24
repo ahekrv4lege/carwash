@@ -44,3 +44,21 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
             dispatcher.start_polling.assert_awaited_once_with(transport, close_bot_session=False)
             transport.session.close.assert_awaited_once()
             agent.close.assert_awaited_once()
+
+    async def test_minimum_reply_delay_includes_model_time_without_extra_ai_calls(self):
+        import bot
+        from types import SimpleNamespace as N
+        for minimum, elapsed, expected in ((1.5, 0.2, 1.3), (1.5, 3, 0), (0, 0.2, 0)):
+            with self.subTest(minimum=minimum, elapsed=elapsed):
+                agent = Mock(config=N(reply_min_delay_sec=minimum), reply=AsyncMock(return_value="Подскажу цены."))
+                message = Mock(from_user=N(id=111, username=None, full_name="Тест"), chat=N(id=111), answer=AsyncMock())
+                reporter = Mock(dialog=AsyncMock())
+                sender = Mock(__aenter__=AsyncMock(), __aexit__=AsyncMock())
+                timer = N(monotonic=Mock(side_effect=[100, 100 + elapsed]))
+                with patch("bot.time", timer), patch("bot.ChatActionSender.typing", return_value=sender), \
+                     patch("bot.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                    await bot.ask_agent(message, agent, reporter, "Прайс?")
+                self.assertAlmostEqual(sleep.await_args.args[0], expected)
+                agent.reply.assert_awaited_once()
+                message.answer.assert_awaited_once_with("Подскажу цены.")
+                agent.mark_delivered.assert_called_once()

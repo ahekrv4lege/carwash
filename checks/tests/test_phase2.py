@@ -202,11 +202,13 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(r['ok'])
         self.assertNotIn(111,self.agent._pending)
 
-    async def test_memory_tool_batch_is_atomic_if_content_is_invalid(self):
+    async def test_invalid_phone_does_not_discard_an_independent_valid_car(self):
         output=response('{"reply":"Учту", "facts":{"car":["Toyota","Toyota"]}}',
                         calls=[('respond',{'reply':'Учту.','facts':{'phone':['70009990000','not present']}})])
         await self.say('Toyota',output)
-        self.assertFalse(self.agent._state[111].get('facts'))
+        self.assertEqual(self.agent._state[111]['facts'], {'car': 'Toyota'})
+        self.assertNotIn(111, self.agent._pending)
+        self.assertFalse(self.spreadsheet.worksheet('Записи').writes)
 
     async def test_concurrent_customers_compete_for_one_slot_without_overbooking(self):
         from tests.fakes import booking

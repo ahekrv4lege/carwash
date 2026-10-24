@@ -3,12 +3,13 @@ import json
 import asyncio
 import time
 import tempfile
+from datetime import datetime
 import unittest
 from dataclasses import replace
 from unittest.mock import AsyncMock, patch
 
 from ai import Agent, ChatUser
-from conversation import model_state
+from conversation import model_state, validate_patch
 from tests.fakes import fixture
 from tests.test_conversation import ARGS, response
 
@@ -124,13 +125,14 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("Как вас зовут", answer)
         self.assertEqual(self.transport.call_count, 32)
 
-    async def test_fabricated_facts_and_model_text_sources_are_rejected_atomically(self):
+    async def test_fabricated_fields_are_rejected_without_discarding_independent_valid_facts(self):
         for facts in ({"car": ["Toyota Camry", "привет"]}, {"phone": ["70009990000", "привет"]},
                       {"confirmed": [True, "привет"]}, {"client_name": ["Антон", "Антон"]}):
             await self.say("привет", facts)
             self.assertFalse(self.facts())
         await self.say("Антон", {"client_name": ["Антон", "Антон"], "car": ["Toyota", "не было"]})
-        self.assertFalse(self.facts())
+        self.assertEqual(self.facts(), {"client_name": "Антон"})
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
 
     async def test_unconfigured_aliases_and_wrong_catalog_kinds_are_not_guessed(self):
         await self.say("sedan", {"size_class": ["Легковой", "sedan"]})
@@ -209,28 +211,31 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("не подтверждён", answer)
         self.assertEqual(sum(len(s.writes) for s in self.spreadsheet.sheets), 0)
 
-    async def test_plain_response_is_rejected_instead_of_silently_losing_memory(self):
-        self.transport.side_effect = [response("Учту вашу Toyota.", raw=True)] * 2
+    async def test_plain_response_needs_one_request_and_keeps_customer_words(self):
+        self.transport.side_effect = [response("Учту вашу Toyota.", raw=True)]
         answer = await self.agent.reply(self.user, "Toyota Camry 3.5")
-        self.assertIn("Не удалось", answer)
+        self.assertEqual(answer, "Учту вашу Toyota.")
         self.assertFalse(self.facts())
-        self.assertEqual(self.transport.call_count, 2)
+        self.assertEqual(self.transport.call_count, 1)
+        for _ in range(5):
+            await self.say("Адрес?", reply="Подскажу адрес.")
+        self.assertIn("Toyota Camry 3.5", self.agent._state[self.user.id]["context"])
+        self.assertEqual(self.transport.call_count, 6)
 
-    async def test_plain_answer_is_repaired_only_with_valid_sourced_memory(self):
-        self.transport.side_effect = [response("Какой автомобиль?", raw=True),
-            response(calls=[("respond", {"reply": "Никита, какой автомобиль?", "facts": {
-                "client_name": ["Никита", "Никита"]}})])]
+    async def test_plain_answer_does_not_start_an_extra_memory_request(self):
+        self.transport.side_effect = [response("Какой автомобиль?", raw=True)]
         answer = await self.agent.reply(self.user, "Никита")
-        self.assertEqual(answer, "Никита, какой автомобиль?")
-        self.assertEqual(self.facts(), {"client_name": "Никита"})
-        self.assertEqual(self.transport.call_args_list[1].kwargs["tool_choice"],
-                         {"type": "function", "function": {"name": "respond"}})
+        self.assertEqual(answer, "Какой автомобиль?")
+        self.assertFalse(self.facts())
+        self.assertEqual(self.transport.call_count, 1)
+        self.assertEqual(self.agent._history[self.user.id][0]["content"], "Никита")
 
-    async def test_production_requests_explain_the_required_memory_protocol(self):
+    async def test_production_requests_allow_plain_text_and_explain_optional_memory(self):
         async def reply_from_contract(**payload):
-            self.assertEqual(payload["tool_choice"], "required")
+            self.assertEqual(payload["tool_choice"], "auto")
             prompt = payload["messages"][0]["content"]
-            self.assertIn("заверши ответ вызовом respond", prompt)
+            self.assertIn("Обычный ответ пиши текстом", prompt)
+            self.assertIn("сохрани их через respond", prompt)
             self.assertIn("точная цитата из текущего сообщения", prompt)
             example = prompt.split("Пример на сообщение «Никита»: ", 1)[1].splitlines()[0]
             memory = json.loads(example.removesuffix("."))
@@ -263,14 +268,14 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(feedback), 2)
         self.assertTrue(all(json.loads(message["content"])["executed"] is False for message in feedback))
 
-    async def test_catalog_memory_repair_is_limited_and_keeps_validation(self):
+    async def test_invalid_catalog_memory_does_not_drop_the_valid_car_or_repeat_ai(self):
         invalid = response(calls=[("respond", {"reply": "Класс D.", "facts": {
             "car": ["Toyota Camry", "Toyota Camry"], "size_class": ["D", "Toyota Camry"]}})])
         self.transport.side_effect = [invalid, invalid]
         answer = await self.agent.reply(self.user, "Toyota Camry")
-        self.assertIn("Не удалось", answer)
-        self.assertFalse(self.facts())
-        self.assertEqual(self.transport.call_count, 2)
+        self.assertTrue(answer)
+        self.assertEqual(self.facts(), {"car": "Toyota Camry"})
+        self.assertEqual(self.transport.call_count, 1)
 
     async def test_repeated_successful_read_requests_a_final_memory_reply(self):
         self.transport.side_effect = [response(calls=[("get_price_list", {})]),
@@ -393,36 +398,35 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         arguments = self.agent._booking_args({"services": ["Мойка"], "comment": "Салон не мочить"}, self.user)
         self.assertEqual(arguments["comment"], "Салон не мочить")
 
-    async def test_repair_cannot_accept_a_fabricated_customer_quote(self):
-        self.transport.side_effect = [response("Учту.", raw=True), response(calls=[
+    async def test_invalid_readonly_memory_does_not_accept_a_fabricated_customer_quote(self):
+        self.transport.side_effect = [response(envelope(facts={"car": ["Toyota", "привет"]})), response(calls=[
             ("respond", {"reply": "Учту Toyota.", "facts": {"car": ["Toyota", "Toyota"]}})])]
         answer = await self.agent.reply(self.user, "привет")
-        self.assertIn("Не удалось", answer)
+        self.assertTrue(answer)
         self.assertFalse(self.facts())
-        self.assertEqual(self.transport.call_count, 2)
+        self.assertEqual(self.transport.call_count, 1)
 
-    async def test_expanded_car_name_is_repaired_using_the_literal_customer_spelling(self):
+    async def test_recognized_car_is_separate_from_the_literal_customer_spelling(self):
         for spelling in ("лансер девятый", "лансер 9", "lancer 9"):
             with self.subTest(spelling=spelling):
                 self.agent.reset(self.user.id)
-                self.transport.side_effect = [response(calls=[("respond", {"reply": "Какой класс?", "facts": {
-                    "car": ["Mitsubishi Lancer IX", spelling]}})]),
-                    response(calls=[("respond", {"reply": "Какой класс?", "facts": {
-                        "car": [spelling, spelling]}})])]
+                self.transport.side_effect = [response(calls=[("respond", {"reply": "Посмотрю цены.", "facts": {
+                    "car": [spelling, spelling], "car_model": ["Mitsubishi Lancer IX", spelling]}})])]
                 answer = await self.agent.reply(self.user, spelling)
-                self.assertEqual(answer, "Какой класс?")
-                self.assertEqual(self.facts(), {"car": spelling})
+                self.assertEqual(answer, "Посмотрю цены.")
+                self.assertEqual(self.facts(), {"car": spelling, "car_model": "Mitsubishi Lancer IX"})
                 self.assertNotIn(self.user.id, self.agent._pending)
+        self.assertEqual(self.transport.call_count, 3)
         self.assertFalse(sum(len(sheet.writes) for sheet in self.spreadsheet.sheets))
 
-    async def test_expanded_car_name_cannot_bypass_validation_after_repair(self):
+    async def test_expanded_car_name_cannot_replace_the_literal_fact_or_force_an_ai_retry(self):
         invalid = response(calls=[("respond", {"reply": "Учту.", "facts": {
             "car": ["Mitsubishi Lancer IX", "лансер девятый"]}})])
         self.transport.side_effect = [invalid, invalid]
         answer = await self.agent.reply(self.user, "лансер девятый")
-        self.assertIn("Не удалось", answer)
+        self.assertTrue(answer)
         self.assertFalse(self.facts())
-        self.assertEqual(self.transport.call_count, 2)
+        self.assertEqual(self.transport.call_count, 1)
 
     async def test_date_and_time_evidence_rejects_stale_or_trailing_values(self):
         await self.say("завтра", {"date": ["2099-01-01", "завтра"]})
@@ -561,3 +565,150 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         payload = json.dumps(self.transport.call_args.kwargs, ensure_ascii=False)
         self.assertNotIn("70001112233", payload)
         self.assertIn("phone_known", payload)
+
+
+class NaturalDialogue(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.store, self.spreadsheet = fixture(folder.name)
+        with patch("ai.AsyncOpenAI"):
+            self.agent = Agent(self.store.config, self.store)
+        self.transport = AsyncMock()
+        self.agent.client.chat.completions.create = self.transport
+        self.user = ChatUser(111, None, "Тестовый клиент")
+
+    async def test_car_and_automatic_catalog_class_are_saved_in_one_request(self):
+        self.transport.side_effect = [response(calls=[("respond", {
+            "reply": "Для легкового посмотрю цены. Нужна мойка кузова?",
+            "facts": {"size_class": ["Легковой", "лансер девять"],
+                      "car": ["лансер девять", "лансер девять"]}})])]
+        answer = await self.agent.reply(self.user, "лансер девять")
+        self.assertNotIn("Не удалось", answer)
+        self.assertEqual(self.agent._state[111]["facts"], {"car": "лансер девять", "size_class": "Легковой"})
+        self.assertEqual(self.transport.call_count, 1)
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    def test_inferred_class_requires_a_customer_car_and_an_existing_catalog_label(self):
+        catalog = self.store.get_catalog()
+        for value, source in (("Неизвестный", "лансер девять"), ("Легковой", "синий")):
+            with self.subTest(value=value, source=source), self.assertRaises(ValueError):
+                validate_patch({"size_class": [value, source]}, source, self.store.now(), catalog,
+                               known={"car": "лансер девять"})
+
+    def test_service_interpretation_uses_sourced_request_and_the_actual_catalog(self):
+        catalog = self.store.get_catalog()
+        text = "помойте кузов"
+        result = validate_patch({"requested_service": [text, text], "services": [["Мойка"], text]},
+                                text, self.store.now(), catalog)
+        self.assertEqual(result["services"], ["Мойка"])
+        for services in (["Выдуманная"], ["Мойка"]):
+            with self.subTest(services=services), self.assertRaises(ValueError):
+                validate_patch({"services": [services, "привет"]}, "привет", self.store.now(), catalog)
+
+    def test_weekdays_and_hour_only_times_are_checked_without_ai(self):
+        now = datetime(2026, 10, 25, 12)
+        for text, expected in (("в понедельник", "2026-10-26"), ("во вторник", "2026-10-27"),
+                               ("в среду", "2026-10-28"), ("в пятницу", "2026-10-30")):
+            with self.subTest(text=text):
+                self.assertEqual(validate_patch({"date": [expected, text]}, text, now)["date"], expected)
+        for text in ("в 11", "к 11", "11 часов", "11:00", "11.00"):
+            with self.subTest(text=text):
+                self.assertEqual(validate_patch({"time": ["11:00", text]}, text, now)["time"], "11:00")
+
+    def test_normalization_does_not_accept_wrong_dates_times_or_trailing_text(self):
+        now = datetime(2026, 10, 25, 12)
+        for field, value, text in (("date", "2026-10-27", "в понедельник"),
+                                   ("time", "18:00", "в 6"), ("time", "25:00", "в 25"),
+                                   ("time", "11:00", "11:00 garbage")):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                validate_patch({field: [value, text]}, text, now)
+
+    async def test_plain_dialogue_keeps_old_customer_words_in_the_same_context_budget(self):
+        for text in ("Никита", "лансер девять", *[f"Вопрос {index}" for index in range(8)]):
+            self.transport.side_effect = [response("Подскажу по услугам.", raw=True)]
+            await self.agent.reply(self.user, text)
+            history = self.agent._history[111]
+            context = self.agent._state[111]["context"]
+            self.assertLessEqual(len(history), 8)
+            self.assertLessEqual(len(context), 6)
+            self.assertLessEqual(sum(map(len, context)), 1500)
+            self.assertLessEqual(sum(len(message["content"]) for message in history) + sum(map(len, context)), 6000)
+        payload = json.dumps(self.transport.call_args.kwargs, ensure_ascii=False)
+        self.assertIn("Никита", payload)
+        self.assertIn("лансер девять", payload)
+        self.assertEqual(self.transport.call_count, 10)
+        self.assertFalse(self.agent._state[111].get("facts"))
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_recognized_model_is_cleared_when_customer_changes_the_car(self):
+        self.transport.side_effect = [response(calls=[("respond", {"reply": "Учту.", "facts": {
+            "car": ["лансер девять", "лансер девять"],
+            "car_model": ["Mitsubishi Lancer IX", "лансер девять"]}})])]
+        await self.agent.reply(self.user, "лансер девять")
+        self.transport.side_effect = [response(calls=[("respond", {"reply": "Поменяю автомобиль.", "facts": {
+            "car": ["Toyota Camry", "Toyota Camry"]}})])]
+        await self.agent.reply(self.user, "Теперь Toyota Camry")
+        facts = self.agent._state[111]["facts"]
+        self.assertEqual(facts["car"], "Toyota Camry")
+        self.assertNotIn("car_model", facts)
+        self.assertNotIn("size_class", facts)
+
+    async def test_valid_price_resolves_an_automotive_segment_instead_of_asking_customer_for_class(self):
+        self.agent._state[111] = {"facts": {"car": "лансер девять"}, "tentative": {"size_class": "C"},
+                                  "catalog": {"size_classes": ["Легковой", "Кроссовер"]}}
+        result = await self.agent._call_tool("calculate_price", '{"size_class":"Легковой","services":["Мойка"]}', self.user)
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.agent._state[111]["facts"]["size_class"], "Легковой")
+        self.assertNotIn("size_class", self.agent._state[111].get("tentative", {}))
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_quote_does_not_override_a_valid_ambiguous_price_class(self):
+        self.agent._state[111] = {"facts": {"car": "BMW"}, "tentative": {"size_class": "Кроссовер"},
+                                  "catalog": {"size_classes": ["Легковой", "Кроссовер"]}}
+        result = await self.agent._call_tool("calculate_price", '{"size_class":"Легковой","services":["Мойка"]}', self.user)
+        self.assertTrue(result["ok"])
+        self.assertNotIn("size_class", self.agent._state[111]["facts"])
+        self.assertEqual(self.agent._state[111]["tentative"]["size_class"], "Кроссовер")
+
+    def test_normalized_booking_datetime_uses_latest_customer_words_not_a_suggested_slot(self):
+        from tests.test_conversation import ARGS
+        self.agent._state[111] = {"facts": {name: value for name, value in ARGS.items() if name not in {"date", "time"}}}
+        self.agent._turn_text[111] = "Хочу в понедельник в 11"
+        with patch.object(self.store, "now", return_value=datetime(2026, 10, 25, 12)):
+            result = self.agent._booking_args(dict(ARGS, date="2026-10-26", time="11:00"), self.user)
+            self.assertEqual(result["time"], "11:00")
+            with self.assertRaises(ValueError):
+                self.agent._booking_args(dict(ARGS, date="2026-10-27", time="12:00"), self.user)
+
+    def test_model_gets_price_categories_from_sheets_instead_of_automotive_segments(self):
+        before = self.agent._tools(self.user)
+        price = next(tool for tool in before if tool["function"]["name"] == "get_price_list")
+        self.assertFalse(price["function"]["parameters"]["properties"])
+        self.agent._state[111]["catalog"] = {"size_classes": ["Легковой", "Кроссовер"]}
+        for tool in self.agent._tools(self.user):
+            field = tool["function"]["parameters"]["properties"].get("size_class")
+            if field:
+                self.assertEqual(field["enum"], ["Легковой", "Кроссовер"])
+                self.assertNotIn("D", field["enum"])
+
+    async def test_repeated_name_prefix_is_removed_without_changing_facts_or_asking_ai_again(self):
+        self.agent._state[111] = {"facts": {"client_name": "Иван"}}
+        for text, reply in (("Привет", "Иван, какой у вас автомобиль?"),
+                            ("синий", "Иван, уточните модель BMW.")):
+            self.transport.side_effect = [response(reply, raw=True)]
+            answer = await self.agent.reply(self.user, text)
+        self.assertEqual(answer, "Уточните модель BMW.")
+        self.assertEqual(self.agent._state[111]["facts"], {"client_name": "Иван"})
+        self.assertEqual(self.transport.call_count, 2)
+        self.assertEqual(self.agent._history[111][-1]["content"], answer)
+
+    async def test_long_current_message_does_not_add_old_context_beyond_the_existing_budget(self):
+        previous = "Старые сведения " * 20
+        self.agent._state[111] = {"context": [previous]}
+        self.transport.side_effect = [response("Уточним детали.", raw=True)]
+        await self.agent.reply(self.user, "x" * 5990)
+        payload = json.dumps(self.transport.call_args.kwargs, ensure_ascii=False)
+        self.assertNotIn(previous, payload)
+        self.assertEqual(self.transport.call_count, 1)
+        self.assertIn(previous, self.agent._state[111]["context"])
