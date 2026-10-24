@@ -284,20 +284,63 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
                          {"type": "function", "function": {"name": "respond"}})
         self.assertFalse(sum(len(sheet.writes) for sheet in self.spreadsheet.sheets))
 
-    async def test_old_customer_source_can_be_repaired_without_reapplying_old_facts(self):
+    async def test_unchanged_facts_need_no_new_quote_or_repair_request(self):
         await self.say("Никита", {"client_name": ["Никита", "Никита"]})
         self.transport.side_effect = [response(calls=[("respond", {"reply": "Учту.", "facts": {
             "client_name": ["Никита", "Никита"], "car": ["Toyota Camry", "Toyota Camry"]}})]),
             response(calls=[("respond", {"reply": "Какой класс?", "facts": {
                 "car": ["Toyota Camry", "Toyota Camry"]}})])]
         answer = await self.agent.reply(self.user, "у меня Toyota Camry")
-        self.assertEqual(answer, "Какой класс?")
+        self.assertEqual(answer, "Учту.")
         self.assertEqual(self.facts(), {"client_name": "Никита", "car": "Toyota Camry"})
+        self.assertEqual(self.transport.call_count, 2)  # имя и автомобиль, без дополнительного запроса
+
+    async def test_unchanged_tentative_fields_do_not_block_a_price_reply(self):
+        await self.say("lancer 9", {"car": ["lancer 9", "lancer 9"]},
+                       {"size_class": ["Легковой", "lancer 9"]})
+        self.transport.side_effect = [response(calls=[("respond", {"reply": "Какая услуга нужна?", "facts": {
+            "car": ["lancer 9", "lancer 9"]}, "tentative": {"size_class": ["Легковой", "lancer 9"]}})])]
+        answer = await self.agent.reply(self.user, "какие услуги есть?")
+        self.assertEqual(answer, "Какая услуга нужна?")
+        self.assertEqual(self.facts(), {"car": "lancer 9"})
+        self.assertEqual(self.agent._state[self.user.id]["tentative"]["size_class"], "Легковой")
+
+    async def test_unchanged_fresh_fact_still_blocks_an_earlier_conflicting_quote(self):
+        await self.say("Новая машина", {"car": ["Новая машина", "Новая машина"]})
+        self.transport.side_effect = [response(calls=[
+            ("respond", {"reply": "", "facts": {"car": ["Новая машина", "оставляю Новая машина"]}}),
+            ("get_price_list", {})]), response(calls=[
+                ("respond", {"reply": "Учту.", "facts": {"car": ["Старая машина", "Старая машина"]}})])]
+        await self.agent.reply(self.user, "Старая машина, но оставляю Новая машина")
+        self.assertEqual(self.facts()["car"], "Новая машина")
 
     async def test_repair_cannot_accept_a_fabricated_customer_quote(self):
         self.transport.side_effect = [response("Учту.", raw=True), response(calls=[
             ("respond", {"reply": "Учту Toyota.", "facts": {"car": ["Toyota", "Toyota"]}})])]
         answer = await self.agent.reply(self.user, "привет")
+        self.assertIn("Не удалось", answer)
+        self.assertFalse(self.facts())
+        self.assertEqual(self.transport.call_count, 2)
+
+    async def test_expanded_car_name_is_repaired_using_the_literal_customer_spelling(self):
+        for spelling in ("лансер девятый", "лансер 9", "lancer 9"):
+            with self.subTest(spelling=spelling):
+                self.agent.reset(self.user.id)
+                self.transport.side_effect = [response(calls=[("respond", {"reply": "Какой класс?", "facts": {
+                    "car": ["Mitsubishi Lancer IX", spelling]}})]),
+                    response(calls=[("respond", {"reply": "Какой класс?", "facts": {
+                        "car": [spelling, spelling]}})])]
+                answer = await self.agent.reply(self.user, spelling)
+                self.assertEqual(answer, "Какой класс?")
+                self.assertEqual(self.facts(), {"car": spelling})
+                self.assertNotIn(self.user.id, self.agent._pending)
+        self.assertFalse(sum(len(sheet.writes) for sheet in self.spreadsheet.sheets))
+
+    async def test_expanded_car_name_cannot_bypass_validation_after_repair(self):
+        invalid = response(calls=[("respond", {"reply": "Учту.", "facts": {
+            "car": ["Mitsubishi Lancer IX", "лансер девятый"]}})])
+        self.transport.side_effect = [invalid, invalid]
+        answer = await self.agent.reply(self.user, "лансер девятый")
         self.assertIn("Не удалось", answer)
         self.assertFalse(self.facts())
         self.assertEqual(self.transport.call_count, 2)

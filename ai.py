@@ -172,6 +172,7 @@ class Agent:
 Пиши естественно по-русски, коротко, 1–3 предложения и один вопрос. Обычный текст без Markdown.
 Помогай выбрать услугу и записаться. Нужны имя, автомобиль/класс, тариф или услуги, дата/время и телефон.
 Не переспрашивай известное; исправления клиента важнее прежних данных. Не угадывай неизвестный класс авто.
+Здоровайся один раз. Не зацикливайся на имени: оно нужно для записи, но не для обсуждения услуг и цен.
 Цены в {config.currency}, состав тарифов и свободное время — только из инструментов. calculate_price считает итог.
 Если класс и услуга уже известны, сразу calculate_price; полный прайс нужен для выбора.
 Показывай недоступные позиции тарифа и изменение цены. При вопросе о времени сначала get_free_slots, затем варианты.
@@ -187,9 +188,11 @@ facts содержит только новые или исправленные �
 Каждое значение — пара [значение, точная цитата из текущего сообщения]; null внутри пары удаляет факт.
 Пример на сообщение «Никита»: {{"reply":"Никита, какой у вас автомобиль?","facts":{{"client_name":["Никита","Никита"]}},"tentative":{{}}}}.
 На сообщение «у меня Toyota Camry» сохрани только car=["Toyota Camry","Toyota Camry"], без size_class.
+car копируй буквально из цитаты: «лансер девятый» остаётся «лансер девятый», без перевода и добавления марки.
 Для сохранения имени или автомобиля таблица не нужна: сразу вызови respond и спроси недостающее.
 Не копируй прежние факты из CUSTOMER в facts: цитаты проверяются только по текущему сообщению.
 Неуверенные предположения помещай в tentative; класс не угадывай. Без новых фактов facts={{}}, tentative={{}}.
+Одно поле передавай либо в facts, либо в tentative, не в обоих сразу.
 Для данных таблицы сначала вызови инструмент, дождись результата и ответь через respond.
 Изменения памяти можно передать через respond рядом с инструментом."""
 
@@ -316,11 +319,17 @@ facts содержит только новые или исправленные �
             changes, tentative = {**changes, **other_changes}, {**tentative, **other_tentative}
         if not isinstance(changes, dict) or not isinstance(tentative, dict) or changes.keys() & tentative.keys():
             raise ValueError("contradictory_fact_status")
+        source = self._turn_text.get(user.id, "")
+        for updates, key in ((changes, "facts"), (tentative, "tentative")):
+            known = self._state[user.id].get(key, {})
+            for field, entry in list(updates.items()):
+                if (field in known and isinstance(entry, list) and len(entry) == 2 and entry[0] == known[field]
+                        and isinstance(entry[1], str) and folded(entry[1]) not in folded(source)):
+                    del updates[field]
         sources = (changes, tentative)
         catalog = None
         if (set(changes) | set(tentative)) & CATALOG_FIELDS:
             catalog = await asyncio.to_thread(self.store.get_catalog)
-        source = self._turn_text.get(user.id, "")
         changes = validate_patch(changes, source, self.store.now(), catalog, known=self._state[user.id].get("facts"))
         tentative = validate_patch(tentative, source, self.store.now(), catalog, tentative=True)
         positions = {}
@@ -658,6 +667,7 @@ facts содержит только новые или исправленные �
         messages.append({"role": "system", "content": (
             f"Ответ и память отклонены целиком ({reason}); инструменты не выполнялись. Исправь через respond: "
             "reply, facts, tentative. Факт — [значение, цитата последнего сообщения клиента]. "
+            "Значение car скопируй из цитаты без перевода, расширения марки и замены слов числами. "
             "Не копируй CUSTOMER и не угадывай size_class по автомобилю. Значения каталога должны быть "
             "названы клиентом; иначе не добавляй их ни в facts, ни в tentative и спроси недостающее."
         )})
@@ -696,9 +706,7 @@ facts содержит только новые или исправленные �
             except (ValueError, TypeError, RecursionError) as error:
                 reason = str(error) if re.fullmatch(r"[a-z_]{1,80}", str(error)) else type(error).__name__
                 log.warning("Отклонён формат памяти AI: %s", reason)
-                if (reason in {"unverified_catalog_value", "missing_memory_envelope", "missing_customer_source"}
-                        and not memory_repair_used
-                        and iteration + 1 < self.config.ai_max_tool_iterations):
+                if not memory_repair_used and iteration + 1 < self.config.ai_max_tool_iterations:
                     memory_repair_used = True
                     force_reply = True
                     self._repair_memory(messages, message, calls, user, reason)

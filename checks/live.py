@@ -13,6 +13,7 @@ from openai import AsyncOpenAI
 
 from ai import Agent, ChatUser, TOOLS
 from config import ProviderConfig
+from conversation import folded
 from providers import client_options, completion_options
 from run import validate_config
 from sheets import Store, SheetsHTTPClient
@@ -98,6 +99,12 @@ class AIProvider(unittest.IsolatedAsyncioTestCase):
                         self.assertNotIn("Не удалось", answer)
                         self.assertEqual(agent._state[user.id].get("facts", {}).get(field), expected)
                 self.assertEqual(agent._state[user.id]["facts"]["client_name"], "Никита")
+                customer_spellings = set()
+                for spelling in ("лансер девятый", "лансер 9", "lancer 9"):
+                    customer_spellings.add(folded(spelling))
+                    answer = await agent.reply(user, spelling)
+                    self.assertNotIn("Не удалось", answer)
+                    self.assertIn(folded(agent._state[user.id]["facts"].get("car", "")), customer_spellings)
                 answer = await agent.reply(user, "Какие услуги есть?")
                 self.assertNotIn("Не удалось", answer)
                 self.assertIn("catalog", agent._state[user.id])
