@@ -92,7 +92,7 @@ async def main() -> None:
     dp.include_router(router)
 
     await bot.delete_webhook(drop_pending_updates=True)
-    log.info("Бот запущен. Модель: %s", cfg.openrouter_model)
+    log.info("Бот запущен. Провайдер: %s, модель: %s", cfg.llm_base_url, cfg.llm_model)
     await dp.start_polling(bot)
 
 

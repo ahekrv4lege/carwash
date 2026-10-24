@@ -20,10 +20,11 @@ def _required(name: str) -> str:
 
 @dataclass(frozen=True)
 class Config:
-    # Telegram / OpenRouter
+    # Telegram / LLM-провайдер (OpenAI-совместимый API, по умолчанию xKiro)
     bot_token: str
-    openrouter_api_key: str
-    openrouter_model: str
+    llm_api_key: str
+    llm_model: str
+    llm_base_url: str
     # Google Sheets
     spreadsheet_id: str
     google_credentials_file: str
@@ -47,14 +48,15 @@ class Config:
 
 
 def load_config(sheets_only: bool = False) -> Config:
-    """sheets_only=True — для setup_sheet.py, когда токены бота и OpenRouter ещё не нужны."""
+    """sheets_only=True — для setup_sheet.py, когда токены бота и LLM ещё не нужны."""
     need = (lambda name: os.getenv(name, "").strip()) if sheets_only else _required
     admin = os.getenv("ADMIN_CHAT_ID", "").strip()
 
     return Config(
         bot_token=need("BOT_TOKEN"),
-        openrouter_api_key=need("OPENROUTER_API_KEY"),
-        openrouter_model=os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free").strip(),
+        llm_api_key=need("LLM_API_KEY"),
+        llm_model=os.getenv("LLM_MODEL", "qwen/qwen3.8-max:free").strip(),
+        llm_base_url=os.getenv("LLM_BASE_URL", "https://api.xkiro.com/v1").strip().rstrip("/"),
         spreadsheet_id=_required("SPREADSHEET_ID"),
         google_credentials_file=os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json").strip(),
         timezone=os.getenv("TIMEZONE", "Europe/Moscow").strip(),
