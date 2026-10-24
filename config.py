@@ -58,8 +58,12 @@ def _required(name: str) -> str:
 
 @dataclass(frozen=True)
 class Config:
-    # Telegram / OpenRouter
+    # Telegram / LLM-провайдер (OpenAI-совместимый API).
+    # LLM_* — схема команды (по умолчанию xKiro); AI_*/OPENROUTER_* — совместимость.
     bot_token: str
+    llm_api_key: str
+    llm_model: str
+    llm_base_url: str
     openrouter_api_key: str
     openrouter_model: str
     # Google Sheets
@@ -115,11 +119,11 @@ class Config:
 
     @property
     def conversation_model(self) -> str:
-        return self.ai_model or self.openrouter_model
+        return self.ai_model or self.llm_model or self.openrouter_model
 
 
 def load_config(sheets_only: bool = False) -> Config:
-    """sheets_only=True — для setup_sheet.py, когда токены бота и OpenRouter ещё не нужны."""
+    """sheets_only=True — для setup_sheet.py, когда токены бота и LLM ещё не нужны."""
     need = (lambda name: os.getenv(name, "").strip()) if sheets_only else _required
     bot_token = need("BOT_TOKEN")
     admin = os.getenv("ADMIN_CHAT_ID", "").strip()
@@ -131,10 +135,18 @@ def load_config(sheets_only: bool = False) -> Config:
     if any(not name for name in sheet_names) or len(set(sheet_names)) != len(sheet_names):
         raise RuntimeError("SHEET_*: нужны непустые разные имена ролей")
     enabled = _bool("AI_ENABLED", True)
-    api_key = os.getenv("AI_API_KEY", "").strip()
     legacy_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if enabled and not sheets_only and not (api_key or legacy_key):
-        raise RuntimeError("Не задан AI_API_KEY или OPENROUTER_API_KEY; заполните .env")
+    legacy_model = os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free").strip()
+    llm_key = os.getenv("LLM_API_KEY", "").strip()
+    llm_model = os.getenv("LLM_MODEL", "qwen/qwen3.8-max:free").strip()
+    llm_base_explicit = os.getenv("LLM_BASE_URL", "").strip()
+    llm_base = (llm_base_explicit or "https://api.xkiro.com/v1").rstrip("/") or "https://api.xkiro.com/v1"
+    api_key = os.getenv("AI_API_KEY", "").strip() or llm_key or legacy_key
+    ai_model_raw = os.getenv("AI_MODEL", "").strip()
+    llm_model_explicit = os.getenv("LLM_MODEL", "").strip()
+    ai_model = ai_model_raw or llm_model_explicit
+    if enabled and not sheets_only and not (api_key or legacy_key or llm_key):
+        raise RuntimeError("Не задан AI_API_KEY, LLM_API_KEY или OPENROUTER_API_KEY; заполните .env")
     effort = os.getenv("AI_REASONING_EFFORT", "").strip()
     if effort not in {"", "none", "minimal", "low", "medium", "high", "xhigh", "max"}:
         raise RuntimeError("AI_REASONING_EFFORT: неизвестный уровень")
@@ -149,7 +161,13 @@ def load_config(sheets_only: bool = False) -> Config:
     temperature = None if not os.getenv("AI_TEMPERATURE", "0.3").strip() else _number("AI_TEMPERATURE", "0.3")
     if temperature is not None and temperature > 2:
         raise RuntimeError("AI_TEMPERATURE: допустимо от 0 до 2 или пустое значение")
-    base_url = os.getenv("AI_BASE_URL", "https://openrouter.ai/api/v1").strip()
+    base_url_explicit = os.getenv("AI_BASE_URL", "").strip()
+    if base_url_explicit:
+        base_url = base_url_explicit
+    elif llm_base_explicit:
+        base_url = llm_base_explicit.rstrip("/") or llm_base
+    else:
+        base_url = "https://openrouter.ai/api/v1"
     mapping_url = os.getenv("SHEETS_AI_BASE_URL", "").strip()
     from urllib.parse import urlsplit
     for name, url in (("AI_BASE_URL", base_url), ("SHEETS_AI_BASE_URL", mapping_url)):
@@ -161,12 +179,15 @@ def load_config(sheets_only: bool = False) -> Config:
         if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
             raise RuntimeError(f"{name}: для удалённого сервиса нужен HTTPS")
     if enabled and not sheets_only and urlsplit(base_url).hostname != "openrouter.ai":
-        if not api_key or not os.getenv("AI_MODEL", "").strip():
-            raise RuntimeError("Для другого адреса AI явно задайте AI_API_KEY и AI_MODEL")
+        if not api_key or not (ai_model or llm_model):
+            raise RuntimeError("Для другого адреса AI явно задайте AI_API_KEY (или LLM_API_KEY) и AI_MODEL (или LLM_MODEL)")
     return Config(
         bot_token=bot_token,
+        llm_api_key=llm_key,
+        llm_model=llm_model,
+        llm_base_url=llm_base,
         openrouter_api_key=legacy_key,
-        openrouter_model=os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free").strip(),
+        openrouter_model=legacy_model,
         spreadsheet_id=_required("SPREADSHEET_ID"),
         google_credentials_file=_path("GOOGLE_CREDENTIALS_FILE", "credentials.json"),
         timezone=os.getenv("TIMEZONE", "Europe/Moscow").strip(),
@@ -194,7 +215,7 @@ def load_config(sheets_only: bool = False) -> Config:
         ai_enabled=enabled,
         ai_base_url=base_url,
         ai_api_key=api_key,
-        ai_model=os.getenv("AI_MODEL", "").strip(),
+        ai_model=ai_model_raw,
         ai_timeout_sec=_number("AI_TIMEOUT_SEC", "60", 0.1),
         ai_reasoning_effort=effort,
         ai_temperature=temperature,
