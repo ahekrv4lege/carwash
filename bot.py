@@ -11,7 +11,7 @@ from contextlib import suppress
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import Message
 from aiogram.utils.chat_action import ChatActionSender
 
 from admin import AdminReporter
@@ -53,16 +53,10 @@ async def ask_agent(message: Message, agent: Agent, reporter: AdminReporter, tex
 @router.message(CommandStart())
 async def cmd_start(message: Message, agent: Agent, cfg: Config) -> None:
     agent.reset(message.from_user.id)
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📞 Отправить номер телефона", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
     await message.answer(
         f"Здравствуйте! Меня зовут Светлана, я администратор автомойки «{cfg.carwash_name}» 🙂\n\n"
         "Подскажу услуги и цены, подберу свободное время и запишу вас.\n"
         "Как вас зовут?",
-        reply_markup=kb,
     )
 
 
