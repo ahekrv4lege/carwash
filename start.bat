@@ -3,6 +3,7 @@ rem Запуск бота-администратора автомойки на W
 rem создаёт виртуальное окружение .venv, ставит зависимости и запускает run.py.
 
 chcp 65001 >nul
+title Автомойка — бот-администратор
 cd /d "%~dp0"
 
 set "PY=py -3"
@@ -21,7 +22,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 echo Проверяю зависимости...
-".venv\Scripts\python.exe" -m pip install --quiet --disable-pip-version-warning -r requirements.txt
+".venv\Scripts\python.exe" -m pip install --quiet --disable-pip-version-check -r requirements.txt
 if errorlevel 1 echo ВНИМАНИЕ: не удалось обновить зависимости, пробую запустить с уже установленными.
 
 ".venv\Scripts\python.exe" run.py
