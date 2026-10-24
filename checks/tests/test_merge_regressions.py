@@ -102,7 +102,7 @@ class MergeConfigTests(unittest.TestCase):
             self.assertFalse((root / ".env").exists())
             self.assertFalse((root / ".env.example").exists())
 
-    def test_existing_env_is_loaded_without_template_and_keeps_dev_precedence(self):
+    def test_existing_env_is_loaded_without_template_and_environment_has_precedence(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "config.py").write_bytes((ROOT / "config.py").read_bytes())
@@ -110,7 +110,7 @@ class MergeConfigTests(unittest.TestCase):
             content = "\n".join(f"{key}={value}" for key, value in dict(ENV,
                 LLM_API_KEY="synthetic-file-key", LLM_MODEL="file-model").items()) + "\n"
             env_file.write_text(content)
-            code = "from config import load_config; c=load_config(); assert c.ai_api_key=='synthetic-file-key'; assert c.ai_model=='file-model'"
+            code = "from config import load_config; c=load_config(); assert c.ai_api_key=='synthetic-file-key'; assert c.ai_model=='env-model'"
             env = dict(os.environ, LLM_MODEL="env-model")
             env.pop("PYTHON_DOTENV_DISABLED", None)
             proc = subprocess.run([sys.executable, "-c", code], cwd=root,

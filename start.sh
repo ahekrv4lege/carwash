@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Запуск бота на Linux/macOS. Подготовкой окружения управляет run.py.
 set -eu
 cd -- "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-
-PY=python3
-command -v "$PY" >/dev/null 2>&1 || PY=python
-if [ -x ".venv/bin/python" ]; then
-    PY=.venv/bin/python
+if [ -x .venv/bin/python ]; then
+    exec .venv/bin/python run.py "$@"
 fi
-exec "$PY" run.py "$@"
+if command -v python3 >/dev/null 2>&1; then
+    exec python3 run.py "$@"
+elif command -v python >/dev/null 2>&1; then
+    exec python run.py "$@"
+fi
+printf '%s\n' 'Python 3.10+ не найден. Установите Python средствами своего дистрибутива.' >&2
+exit 1

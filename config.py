@@ -11,8 +11,8 @@ from dotenv import load_dotenv
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
-# Сохраняем приоритет .env из актуальной dev; без файла читается окружение.
-load_dotenv(ROOT / ".env", override=True)
+# Явные переменные окружения сервера важнее .env, как в актуальной dev.
+load_dotenv(ROOT / ".env", override=False)
 
 
 def _bool(name: str, default: bool = False) -> bool:
