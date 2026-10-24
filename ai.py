@@ -433,7 +433,7 @@ STATE ниже — проверенные инструментами данны�
             return text
 
     async def _run(self, messages: list[dict], user: ChatUser) -> str:
-        cache, count, visible = {}, 0, set()
+        cache, count, visible, memory_retry_used = {}, 0, set(), False
         for iteration in range(self.cfg.ai_max_tool_iterations):
             projected = model_state(self._state[user.id])
             for field in visible:
@@ -473,9 +473,34 @@ STATE ниже — проверенные инструментами данны�
                 if calls and not content.lstrip().startswith(("{", "```")):
                     content = ""  # внутренний текст при tools не является ответом клиенту
                 answer = await self._ingest(user, content, extra=replies[0].function.arguments if replies else None)
-            except (ValueError, TypeError, RecursionError):
+            except (ValueError, TypeError, RecursionError) as exc:
+                # Слабые модели ломают строгий протокол respond — даём один шанс
+                # переответить, вместо того чтобы сразу показывать клиенту ошибку.
+                if not memory_retry_used and calls:
+                    memory_retry_used = True
+                    log.warning("Некорректный ответ памяти модели (%s), повторяю запрос", exc)
+                    records = []
+                    for c in calls:
+                        try:
+                            records.append(self._call_record(c, user))
+                        except (ValueError, TypeError):
+                            records.append({"id": c.id, "type": "function",
+                                            "function": {"name": c.function.name,
+                                                         "arguments": c.function.arguments or "{}"}})
+                    messages.append({"role": "assistant", "content": redact_phone(msg.content or "", phone),
+                                     "tool_calls": records})
+                    hint = json.dumps(
+                        {"ok": False, "error": "invalid_memory_envelope",
+                         "hint": ("Ответь заново инструментом respond со строгим JSON без дубликатов ключей: "
+                                  '{"reply": "текст клиенту", "facts": {}, "tentative": {}}. '
+                                  "В facts/tentative каждый source — дословная цитата из сообщения клиента.")},
+                        ensure_ascii=False)
+                    for c in calls:
+                        messages.append({"role": "tool", "tool_call_id": c.id, "content": hint})
+                    continue
                 self._state[user.id].update(stage="needs_correction", confirmed=False)
-                return "Не удалось однозначно сохранить уточнение. Назовите исправленные данные или точное название из прайса."
+                return ("Простите, я вас не совсем поняла 🙂 Напишите, пожалуйста, ещё раз, "
+                        "что именно вы хотите изменить или какую услугу выбрать.")
             if not calls or replies and len(calls) == 1:
                 if not answer.strip():
                     raise ValueError("empty_content")
