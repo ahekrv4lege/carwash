@@ -4,13 +4,14 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 import json
+import tempfile
 import unittest
 
 from aiogram import Bot
 import gspread
 from openai import AsyncOpenAI
 
-from ai import TOOLS
+from ai import Agent, ChatUser, TOOLS
 from config import ProviderConfig
 from providers import client_options, completion_options
 from run import validate_config
@@ -78,6 +79,37 @@ class GoogleSheets(unittest.TestCase):
 
 
 class AIProvider(unittest.IsolatedAsyncioTestCase):
+    async def test_real_dialog_preserves_name_and_car(self):
+        from tests.fakes import fixture
+
+        config = replace(self.config, ai_base_url=self.provider.base_url,
+                         ai_api_key=self.provider.api_key, ai_model=self.provider.model,
+                         llm_fallbacks=(), ai_request_retries=0, ai_max_output_tokens=512)
+        with tempfile.TemporaryDirectory() as folder:
+            store, spreadsheet = fixture(folder)
+            agent = Agent(config, store)
+            user = ChatUser(910001, None, "Synthetic")
+            try:
+                for text, field, expected in (("Никита", "client_name", "Никита"),
+                                              ("у меня Toyota Camry", "car", "Toyota Camry")):
+                    with self.subTest(field=field):
+                        answer = await agent.reply(user, text)
+                        self.assertTrue(answer.strip())
+                        self.assertNotIn("Не удалось", answer)
+                        self.assertEqual(agent._state[user.id].get("facts", {}).get(field), expected)
+                self.assertEqual(agent._state[user.id]["facts"]["client_name"], "Никита")
+                answer = await agent.reply(user, "Какие услуги есть?")
+                self.assertNotIn("Не удалось", answer)
+                self.assertIn("catalog", agent._state[user.id])
+                self.assertIn("700", answer)
+                self.assertFalse(sum(len(sheet.writes) for sheet in spreadsheet.sheets))
+            except AssertionError:
+                raise
+            except Exception as error:
+                raise failure(error) from None
+            finally:
+                await agent.close()
+
     async def test_real_model_can_call_production_price_tool(self):
         config = replace(self.config, ai_base_url=self.provider.base_url,
                          ai_api_key=self.provider.api_key, ai_model=self.provider.model)

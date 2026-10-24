@@ -73,7 +73,7 @@ def main():
                 suite = live.suite()
             except (RuntimeError, ValueError, OSError) as error:
                 parser.exit(2, f"Ошибка настроек live: {error}\n")
-            print("LIVE: реальные Telegram/Sheets; один AI-запрос на каждый настроенный ключ. Без сообщений и записи в Sheets.", flush=True)
+            print("LIVE: реальные Telegram/Sheets; AI-инструмент и диалог с памятью на каждом ключе. Расходует квоту. Без сообщений и записи в Sheets.", flush=True)
         else:
             safe = {name: value for name, value in os.environ.items() if name in {
                 "PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "LANG", "LC_ALL",

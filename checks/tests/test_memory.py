@@ -210,10 +210,97 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(len(s.writes) for s in self.spreadsheet.sheets), 0)
 
     async def test_plain_response_is_rejected_instead_of_silently_losing_memory(self):
-        self.transport.side_effect = [response("Учту вашу Toyota.", raw=True)]
+        self.transport.side_effect = [response("Учту вашу Toyota.", raw=True)] * 2
         answer = await self.agent.reply(self.user, "Toyota Camry 3.5")
         self.assertIn("Не удалось", answer)
         self.assertFalse(self.facts())
+        self.assertEqual(self.transport.call_count, 2)
+
+    async def test_plain_answer_is_repaired_only_with_valid_sourced_memory(self):
+        self.transport.side_effect = [response("Какой автомобиль?", raw=True),
+            response(calls=[("respond", {"reply": "Никита, какой автомобиль?", "facts": {
+                "client_name": ["Никита", "Никита"]}})])]
+        answer = await self.agent.reply(self.user, "Никита")
+        self.assertEqual(answer, "Никита, какой автомобиль?")
+        self.assertEqual(self.facts(), {"client_name": "Никита"})
+        self.assertEqual(self.transport.call_args_list[1].kwargs["tool_choice"],
+                         {"type": "function", "function": {"name": "respond"}})
+
+    async def test_production_requests_explain_the_required_memory_protocol(self):
+        async def reply_from_contract(**payload):
+            self.assertEqual(payload["tool_choice"], "required")
+            prompt = payload["messages"][0]["content"]
+            self.assertIn("заверши ответ вызовом respond", prompt)
+            self.assertIn("точная цитата из текущего сообщения", prompt)
+            example = prompt.split("Пример на сообщение «Никита»: ", 1)[1].splitlines()[0]
+            memory = json.loads(example.removesuffix("."))
+            self.assertEqual(memory["facts"]["client_name"], ["Никита", "Никита"])
+            self.assertIn("respond", [tool["function"]["name"] for tool in payload["tools"]])
+            return response(calls=[("respond", memory)])
+
+        self.transport.side_effect = reply_from_contract
+        answer = await self.agent.reply(self.user, "Никита")
+        self.assertEqual(answer, "Никита, какой у вас автомобиль?")
+        self.assertEqual(self.facts()["client_name"], "Никита")
+        self.assertFalse(sum(len(sheet.writes) for sheet in self.spreadsheet.sheets))
+
+    async def test_inferred_catalog_class_is_repaired_before_any_booking_tool(self):
+        self.transport.side_effect = [response(calls=[
+            ("respond", {"reply": "Класс D.", "facts": {
+                "car": ["Toyota Camry", "Toyota Camry"],
+                "size_class": ["D", "Toyota Camry"]}}),
+            ("create_booking", ARGS)]), response(calls=[
+                ("respond", {"reply": "Какой класс автомобиля?", "facts": {
+                    "car": ["Toyota Camry", "Toyota Camry"]}})])]
+        answer = await self.agent.reply(self.user, "Toyota Camry")
+        self.assertEqual(answer, "Какой класс автомобиля?")
+        self.assertEqual(self.facts(), {"car": "Toyota Camry"})
+        self.assertEqual(self.transport.call_count, 2)
+        self.assertNotIn(111, self.agent._pending)
+        self.assertFalse(sum(len(sheet.writes) for sheet in self.spreadsheet.sheets))
+        feedback = [message for message in self.transport.call_args.kwargs["messages"]
+                    if message["role"] == "tool"]
+        self.assertEqual(len(feedback), 2)
+        self.assertTrue(all(json.loads(message["content"])["executed"] is False for message in feedback))
+
+    async def test_catalog_memory_repair_is_limited_and_keeps_validation(self):
+        invalid = response(calls=[("respond", {"reply": "Класс D.", "facts": {
+            "car": ["Toyota Camry", "Toyota Camry"], "size_class": ["D", "Toyota Camry"]}})])
+        self.transport.side_effect = [invalid, invalid]
+        answer = await self.agent.reply(self.user, "Toyota Camry")
+        self.assertIn("Не удалось", answer)
+        self.assertFalse(self.facts())
+        self.assertEqual(self.transport.call_count, 2)
+
+    async def test_repeated_successful_read_requests_a_final_memory_reply(self):
+        self.transport.side_effect = [response(calls=[("get_price_list", {})]),
+            response(calls=[("get_price_list", {})]),
+            response(calls=[("respond", {"reply": "Есть мойка кузова."})])]
+        with patch.object(self.agent, "_call_tool", wraps=self.agent._call_tool) as tool:
+            answer = await self.agent.reply(self.user, "Какие услуги есть?")
+        self.assertEqual(answer, "Есть мойка кузова.")
+        self.assertEqual(tool.call_count, 1)
+        self.assertEqual(self.transport.call_args_list[2].kwargs["tool_choice"],
+                         {"type": "function", "function": {"name": "respond"}})
+        self.assertFalse(sum(len(sheet.writes) for sheet in self.spreadsheet.sheets))
+
+    async def test_old_customer_source_can_be_repaired_without_reapplying_old_facts(self):
+        await self.say("Никита", {"client_name": ["Никита", "Никита"]})
+        self.transport.side_effect = [response(calls=[("respond", {"reply": "Учту.", "facts": {
+            "client_name": ["Никита", "Никита"], "car": ["Toyota Camry", "Toyota Camry"]}})]),
+            response(calls=[("respond", {"reply": "Какой класс?", "facts": {
+                "car": ["Toyota Camry", "Toyota Camry"]}})])]
+        answer = await self.agent.reply(self.user, "у меня Toyota Camry")
+        self.assertEqual(answer, "Какой класс?")
+        self.assertEqual(self.facts(), {"client_name": "Никита", "car": "Toyota Camry"})
+
+    async def test_repair_cannot_accept_a_fabricated_customer_quote(self):
+        self.transport.side_effect = [response("Учту.", raw=True), response(calls=[
+            ("respond", {"reply": "Учту Toyota.", "facts": {"car": ["Toyota", "Toyota"]}})])]
+        answer = await self.agent.reply(self.user, "привет")
+        self.assertIn("Не удалось", answer)
+        self.assertFalse(self.facts())
+        self.assertEqual(self.transport.call_count, 2)
 
     async def test_date_and_time_evidence_rejects_stale_or_trailing_values(self):
         await self.say("завтра", {"date": ["2099-01-01", "завтра"]})
