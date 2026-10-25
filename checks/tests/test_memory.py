@@ -19,6 +19,224 @@ def envelope(reply="Учту.", facts=None, tentative=None):
 
 
 class MemoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invented_class_without_catalog_routes_repair_to_catalog(self):
+        self.agent._state[111] = {"facts": {key: value for key, value in ARGS.items() if key != "size_class"}}
+        self.transport.side_effect = [response(calls=[("create_booking", {"size_class": "compact"})]),
+            response(calls=[("get_price_list", {})]), response(calls=[("create_booking", {"size_class": "Легковой"})])]
+        answer = await self.agent.reply(self.user, "Подготовьте запись")
+        self.assertIn("Предлагаю запись:", answer)
+        repair = self.transport.await_args_list[1].kwargs
+        self.assertEqual(repair["tool_choice"]["function"]["name"], "get_price_list")
+        self.assertEqual([tool["function"]["name"] for tool in repair["tools"]], ["get_price_list"])
+        self.assertTrue(any("Выберите size_class" in message.get("content", "") for message in repair["messages"]))
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_first_price_question_requires_real_catalog_with_one_schema(self):
+        self.transport.side_effect = [response(calls=[("get_price_list", {})]), response("Есть мойка.", raw=True)]
+        await self.agent.reply(self.user, "Что у вас есть и сколько стоит?")
+        first, following = [call.kwargs for call in self.transport.await_args_list]
+        self.assertEqual(first["tool_choice"]["function"]["name"], "get_price_list")
+        self.assertEqual([tool["function"]["name"] for tool in first["tools"]], ["get_price_list"])
+        self.assertEqual(following["tool_choice"], "auto")
+        self.assertTrue(self.agent._state[111]["catalog"])
+
+    async def test_provider_cannot_bypass_required_catalog_with_invented_services(self):
+        self.transport.side_effect = [response("У нас есть химчистка за 100 рублей.", raw=True)]
+        answer = await self.agent.reply(self.user, "Какие услуги есть?")
+        self.assertNotIn("химчистка", answer)
+        self.assertNotIn("100 рублей", answer)
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_missing_phone_forces_question_instead_of_repeated_booking_calls(self):
+        self.agent._state[111] = {"facts": {key: value for key, value in ARGS.items() if key != "phone"}}
+        self.transport.side_effect = [response(calls=[("create_booking", {})]),
+                                     response(calls=[("respond", {"reply": "Подскажите телефон."})])]
+        answer = await self.agent.reply(self.user, "Подготовьте запись")
+        self.assertEqual(answer, "Подскажите телефон.")
+        self.assertEqual(self.transport.await_count, 2)
+        self.assertEqual(self.transport.call_args.kwargs["tool_choice"]["function"]["name"], "respond")
+        self.assertNotIn(111, self.agent._pending)
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_phone_repair_can_complete_proposal_without_another_ai_request(self):
+        self.agent._state[111] = {"facts": {key: value for key, value in ARGS.items() if key != "phone"}}
+        self.transport.side_effect = [response(calls=[("create_booking", {})]), response(calls=[("respond", {
+            "reply": "Проверим запись.", "facts": {"phone": [ARGS["phone"], ARGS["phone"]]}})])]
+        answer = await self.agent.reply(self.user, "Телефон " + ARGS["phone"])
+        self.assertIn("Предлагаю запись:", answer)
+        self.assertEqual(self.transport.await_count, 2)
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_confirmed_booking_history_keeps_time_and_price_not_internal_instructions(self):
+        self.agent._state[111] = {"facts": dict(ARGS)}
+        await self.say("Подготовьте запись", calls=[("create_booking", {})])
+        answer = await self.agent.reply(self.user, "Да, подтверждаю запись")
+        saved = self.agent._history[111][-1]["content"]
+        self.assertEqual(saved, answer)
+        self.assertIn("10:00", saved)
+        self.assertIn("630", saved)
+        self.assertNotIn("STATE", saved)
+        self.assertNotIn("Python", saved)
+
+    def test_booking_schema_requires_only_details_not_already_saved(self):
+        from ai import SCHEMAS
+        def schema():
+            return next(tool["function"]["parameters"] for tool in self.agent._tools(self.user)
+                        if tool["function"]["name"] == "create_booking")
+        self.agent._state[111] = {"facts": {key: value for key, value in ARGS.items() if key != "phone"}}
+        self.assertEqual(schema()["required"], ["phone"])
+        self.assertIn("phone", schema()["properties"])
+        self.assertNotIn("car", schema()["properties"])
+        self.agent._state[111]["facts"]["phone"] = ARGS["phone"]
+        self.assertEqual(schema()["required"], [])
+        self.agent._state[111]["facts"].clear()
+        self.assertEqual(set(schema()["required"]), {"date", "time", "client_name", "phone", "car", "size_class"})
+        self.assertEqual(SCHEMAS["create_booking"]["required"], [])
+
+    async def test_memory_repair_sends_only_the_forced_tool_schema(self):
+        self.transport.side_effect = [response(calls=[("respond", "{broken")]),
+            response(calls=[("respond", {"reply": "Какой автомобиль?", "facts": {
+                "client_name": ["Никита", "Никита"]}})])]
+        answer = await self.agent.reply(self.user, "Никита")
+        self.assertEqual(answer, "Какой автомобиль?")
+        self.assertEqual(self.facts()["client_name"], "Никита")
+        first, repaired = [call.kwargs for call in self.transport.await_args_list]
+        self.assertEqual(len(first["tools"]), 7)
+        self.assertEqual([tool["function"]["name"] for tool in repaired["tools"]], ["respond"])
+        self.assertEqual(repaired["tool_choice"]["function"]["name"], "respond")
+
+    async def test_booking_reports_schema_fields_and_literal_source_without_writing(self):
+        self.agent._state[111] = {"facts": {key: value for key, value in ARGS.items() if key != "car"}}
+        self.agent._turn_text[111] = "Для лансера девять"
+        result = await self.agent._call_tool("create_booking", '{"car":"Mitsubishi Lancer IX"}', self.user)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["field"], "car")
+        result = await self.agent._call_tool("create_booking", '{"requested_datetime":"завтра"}', self.user)
+        self.assertFalse(result["ok"])
+        self.assertIn("Разрешены только:", result["error"])
+        self.assertNotIn(111, self.agent._pending)
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_date_and_time_keep_an_unambiguous_sentence_as_source(self):
+        now = datetime(2026, 10, 25, 12)
+        with patch.object(self.store, "now", return_value=now):
+            await self.say("Можно завтра в 11?", facts={
+                "date": ["2026-10-26", "Можно завтра в 11?"],
+                "time": ["11:00", "Можно завтра в 11?"],
+            })
+        self.assertEqual(self.facts()["date"], "2026-10-26")
+        self.assertEqual(self.facts()["time"], "11:00")
+
+    def test_compound_datetime_quote_does_not_choose_between_two_options(self):
+        for field, value, text in [("date", "2026-10-26", "завтра или послезавтра"),
+                                   ("time", "11:00", "в 11 или в 12")]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                validate_patch({field: [value, text]}, text, datetime(2026, 10, 25, 12))
+
+    def test_booking_accepts_catalog_class_for_grounded_car_without_memory_echo(self):
+        facts = {name: value for name, value in ARGS.items() if name != "size_class"}
+        self.agent._state[111] = {"facts": facts, "catalog": {"size_classes": ["Легковой", "Кроссовер"]}}
+        self.agent._turn_text[111] = "Подготовьте запись"
+        self.assertEqual(self.agent._booking_args({"size_class": "Легковой"}, self.user)["size_class"], "Легковой")
+        with self.assertRaises(ValueError):
+            self.agent._booking_args({"size_class": "Компакт"}, self.user)
+
+    async def test_booking_ignores_redundant_tariff_components_from_verified_quote(self):
+        facts = dict(ARGS, tariff="Базовый", services=[])
+        self.agent._state[111] = {"facts": facts}
+        quote = await self.agent._call_tool("calculate_price", '{"size_class":"Легковой","tariff":"Базовый"}', self.user)
+        self.assertTrue(quote["ok"])
+        arguments = self.agent._booking_args({"services": ["Мойка"]}, self.user)
+        self.assertEqual(arguments["services"], [])
+        self.assertEqual(arguments["tariff"], "Базовый")
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+        with self.assertRaises(ValueError):
+            self.agent._booking_args({"services": ["Выдуманная"]}, self.user)
+
+    async def test_recognized_car_metadata_never_replaces_booking_car(self):
+        self.agent._state[111] = {"facts": dict(ARGS)}
+        result = await self.agent._call_tool("create_booking", json.dumps({"car_model": "Other model"}), self.user)
+        self.assertTrue(result.get("confirmation_required"), result)
+        self.assertEqual(self.agent._pending[111]["args"]["car"], ARGS["car"])
+        self.assertNotIn("car_model", self.agent._pending[111]["args"])
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+        self.agent._state[111]["facts"].pop("car")
+        rejected = await self.agent._call_tool("create_booking", json.dumps({"car_model": "Toyota Camry"}), self.user)
+        self.assertFalse(rejected["ok"])
+        rejected = await self.agent._call_tool("create_booking", '{"requested_datetime":"tomorrow"}', self.user)
+        self.assertFalse(rejected["ok"])
+
+    async def test_repaired_class_completes_existing_proposal_without_another_ai_call(self):
+        self.agent._state[111] = {"facts": {key: value for key, value in ARGS.items() if key != "size_class"},
+                                  "tentative": {"size_class": "Легковой"}}
+        self.transport.side_effect = [response(calls=[("create_booking", {"size_class": "Легковой"})]),
+            response(calls=[("respond", {"reply": "Всё верно?", "facts": {
+                "size_class": ["Легковой", ARGS["car"]]}})])]
+        answer = await self.agent.reply(self.user, "Подготовьте запись, телефон " + ARGS["phone"])
+        self.assertIn("Предлагаю запись:", answer)
+        self.assertEqual(self.transport.await_count, 2)
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+        self.agent.mark_delivered(111, self.agent.delivery_token(111))
+        await self.agent.reply(self.user, "Да, подтверждаю запись")
+        self.assertEqual(len(self.store.my_bookings(111)["bookings"]), 1)
+        await self.agent.reply(self.user, "Да, подтверждаю запись")
+        self.assertEqual(len(self.store.my_bookings(111)["bookings"]), 1)
+
+    def test_inferred_class_requires_current_known_car_and_real_catalog(self):
+        catalog = self.store.get_catalog()
+        for value, quote in (("Легковой", "Previous car"), ("Выдуманный класс", ARGS["car"])):
+            with self.subTest(value=value, quote=quote), self.assertRaises(ValueError):
+                validate_patch({"size_class": [value, quote]}, "Мой телефон", self.store.now(),
+                               catalog, known={"car": ARGS["car"]})
+        with self.assertRaises(ValueError):
+            validate_patch({"date": ["2099-01-01", "2099-01-01"]}, "Мой телефон", self.store.now(),
+                           catalog, known={"car": ARGS["car"]})
+
+    async def test_proposal_retry_keeps_uncertain_class_blocked(self):
+        self.agent._state[111] = {"facts": dict(ARGS), "tentative": {"size_class": "Легковой"}}
+        phone = "00011122333"
+        self.transport.side_effect = [response(calls=[("create_booking", {})]),
+            response(calls=[("respond", {"reply": "Уточним автомобиль.", "facts": {"phone": [phone, phone]}})])]
+        await self.agent.reply(self.user, phone)
+        self.assertNotIn(111, self.agent._pending)
+        self.assertEqual(self.transport.await_count, 2)
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_booking_does_not_drop_explicit_services_or_use_stale_tariff(self):
+        facts = dict(ARGS, tariff="Базовый", services=["Мойка"])
+        self.agent._state[111] = {"facts": facts}
+        await self.agent._call_tool("calculate_price", '{"size_class":"Легковой","tariff":"Базовый"}', self.user)
+        self.assertEqual(self.agent._booking_args({"services": ["Мойка"]}, self.user)["services"], ["Мойка"])
+        facts["services"] = []
+        self.agent._state[111]["quote"]["stale"] = True
+        with self.assertRaises(ValueError):
+            self.agent._booking_args({"services": ["Мойка"]}, self.user)
+
+    async def test_inflected_vehicle_quote_keeps_customer_spelling(self):
+        await self.say("Что есть для лансера девять?", facts={
+            "car": ["лансер девять", "лансер девять"],
+            "car_model": ["Mitsubishi Lancer IX", "лансер девять"],
+        })
+        self.assertEqual(self.facts()["car"], "лансера девять")
+        self.assertEqual(self.facts()["car_model"], "Mitsubishi Lancer IX")
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_ambiguous_inflected_vehicle_quote_is_not_guessed(self):
+        await self.say("Для лансера девять или лансеру девять?", facts={
+            "car": ["лансер девять", "лансер девять"],
+            "car_model": ["Mitsubishi Lancer IX", "лансер девять"],
+        })
+        self.assertNotIn("car", self.facts())
+        self.assertNotIn("car_model", self.facts())
+
+    async def test_vehicle_quote_repair_does_not_accept_unrelated_phone(self):
+        await self.say("Для лансера девять", facts={
+            "car": ["лансер девять", "лансер девять"],
+            "phone": ["+79991234567", "лансер девять"],
+        })
+        self.assertEqual(self.facts()["car"], "лансера девять")
+        self.assertNotIn("phone", self.facts())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

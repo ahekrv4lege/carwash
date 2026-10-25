@@ -757,12 +757,12 @@ class AdaptiveSheets:
             records.append(record)
         return records
 
-    def observe(self, force: bool = False) -> dict:
-        """Свежие данные четырёх ролей одним пакетом; не кэш между операциями."""
+    def observe(self, force: bool = False, roles=ROLE_FIELDS) -> dict:
+        """Свежий пакет выбранных ролей; по умолчанию все четыре, без кэша между операциями."""
         with self.lock:
             observed = {}
             self.refresh(force=force, _observed=observed)
-            rules = [rule for role in ROLE_FIELDS for rule in self._rules(role)]
+            rules = [rule for role in roles for rule in self._rules(role)]
             missing = {rule["sheet_id"] for rule in rules} - observed.keys()
             identifiers = sorted(missing)
             for offset in range(0, len(identifiers), 50):
@@ -774,7 +774,7 @@ class AdaptiveSheets:
                     status = getattr(getattr(error, "response", None), "status_code", None)
                     if force or (status not in {400, 404} and type(error).__name__ != "WorksheetNotFound"):
                         raise
-                    return self.observe(force=True)
+                    return self.observe(force=True, roles=roles)
                 if len(values) != len(group):
                     raise MappingError("Google вернул неполный снимок таблиц")
                 observed.update({sheet_id: {"values": value.get("values", [])} for sheet_id, value in zip(group, values)})
@@ -784,7 +784,7 @@ class AdaptiveSheets:
                 if headers != rule["structure"]["headers"] or self._worksheet(rule["sheet_id"]).title != rule["sheet_title"]:
                     if force:
                         raise MappingError("Структура продолжает меняться; повторите запрос")
-                    return self.observe(force=True)
+                    return self.observe(force=True, roles=roles)
             return observed
 
     def table(self, role: str, _attempt: int = 0, _observed: dict | None = None) -> tuple[list[str], list[dict]]:

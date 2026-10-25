@@ -323,12 +323,12 @@ class Store:
             self._spreadsheet = google_client.open_by_key(self.config.spreadsheet_id)
         return self._spreadsheet
 
-    def _table(self, title: str) -> tuple[list[str], list[dict[str, Any]]]:
+    def _table(self, title: str, observed=None) -> tuple[list[str], list[dict[str, Any]]]:
         """Лист -> (заголовки, список строк-словарей). Пустые строки пропускаются."""
         if self._adaptive:
             roles = {self.config.sheet_services: "services", self.config.sheet_tariffs: "tariffs",
                      self.config.sheet_slots: "slots", self.config.sheet_bookings: "bookings"}
-            return self._adaptive.table(roles[title], _observed=self._observed)
+            return self._adaptive.table(roles[title], _observed=self._observed if observed is None else observed)
         values = self._get_spreadsheet().worksheet(title).get_all_values()
         if not values:
             return [], []
@@ -392,7 +392,10 @@ class Store:
             return self._cached("catalog", self.config.catalog_cache_sec, self._load_catalog)
 
     def _load_catalog(self) -> Catalog:
-        headers, rows = self._table(self.config.sheet_services)
+        observed = self._observed
+        if self._adaptive and observed is None:
+            observed = self._adaptive.observe(roles=("services", "tariffs"))
+        headers, rows = self._table(self.config.sheet_services, observed)
         classes = [header for header in headers if header and header.lower() not in SERVICE_FIXED_COLS]
 
         services: dict[str, Service] = {}
@@ -412,7 +415,7 @@ class Store:
                 prices=prices,
             )
 
-        _, tariff_rows = self._table(self.config.sheet_tariffs)
+        _, tariff_rows = self._table(self.config.sheet_tariffs, observed)
         tariffs: dict[str, Tariff] = {}
         for record in tariff_rows:
             name = pick(record, "Тариф")
@@ -488,17 +491,16 @@ class Store:
         )
 
     def free_slots(self, date_str: str | None = None, days: int = 7) -> dict:
-        with self._lock:
-            slots = self._get_slots()
-            _, booking_rows = self._get_bookings()
-        busy = self._booked_capacity(booking_rows)
-
         if date_str:
             booking_date = parse_date(date_str)
             if not booking_date:
                 return _failure("Неверная дата, нужен формат ГГГГ-ММ-ДД")
             dates = [booking_date]
-        else:
+        with self._lock:
+            slots = self._get_slots()
+            _, booking_rows = self._get_bookings()
+        busy = self._booked_capacity(booking_rows)
+        if not date_str:
             today = self.now().date()
             dates = [today + timedelta(days=index) for index in range(days)]
 

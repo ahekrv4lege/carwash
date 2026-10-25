@@ -37,9 +37,26 @@ def client_options(config, *, mapping: bool = False) -> dict:
 
 def completion_options(config, *, mapping: bool = False) -> dict:
     model = (config.sheets_ai_model if mapping else "") or config.ai_model
+    url = (config.sheets_ai_base_url if mapping else "") or config.ai_base_url
     options = {"model": model, config.ai_token_limit_parameter: 1500 if mapping else config.ai_max_output_tokens}
     if config.ai_temperature is not None:
         options["temperature"] = 0 if mapping else config.ai_temperature
     if config.ai_reasoning_effort and not mapping:
         options["reasoning_effort"] = config.ai_reasoning_effort
+    if urlsplit(url).hostname == "api.cloudflare.com":
+        options["max_completion_tokens"] = options.pop(config.ai_token_limit_parameter)
+        if model in {"@cf/zai-org/glm-4.7-flash", "@cf/google/gemma-4-26b-a4b-it", "@cf/qwen/qwen3.8-27b"}:
+            effort = options.pop("reasoning_effort", "")
+            options["extra_body"] = {"chat_template_kwargs": {"enable_thinking": effort not in {"", "none"}}}
+            if effort and effort != "none" and model == "@cf/qwen/qwen3.8-27b":
+                options["reasoning_effort"] = effort
     return options
+
+
+def request_arguments(config, arguments) -> dict:
+    if urlsplit(config.ai_base_url).hostname != "api.cloudflare.com":
+        return arguments
+    messages = arguments.get("messages", [])
+    system = [message["content"] for message in messages if message["role"] == "system"]
+    return dict(arguments, messages=([{"role": "system", "content": "\n".join(system)}] if system else [])
+                + [message for message in messages if message["role"] != "system"])

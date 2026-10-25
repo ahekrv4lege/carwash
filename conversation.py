@@ -86,6 +86,28 @@ def source_time(source, embedded=False):
     return parse_time(f"{clock[1]}:{clock[2] or '00'}") if clock else None
 
 
+def literal_car_patch(patch, text):
+    entry = patch.get("car") if isinstance(patch, dict) else None
+    if (not isinstance(entry, list) or len(entry) != 2 or not all(isinstance(value, str) for value in entry)
+            or folded(entry[0]) != folded(entry[1]) or folded(entry[1]) in folded(text)):
+        return patch
+    words = re.findall(r"[^\W_]+", entry[1])
+    if not words:
+        return patch
+    pattern = r"\s+".join(re.escape(word) + (r"(?:а|я|у|ю|ом|ем|е|ы|и)?"
+        if re.fullmatch(r"[а-яё]{4,}", word, re.I) else "") for word in words)
+    matches = list(re.finditer(r"(?<!\w)" + pattern + r"(?!\w)", text, re.I))
+    if len(matches) != 1:
+        return patch
+    literal = matches[0].group()
+    result = dict(patch)
+    for field in ("car", "car_model", "size_class"):
+        value = patch.get(field)
+        if isinstance(value, list) and len(value) == 2 and isinstance(value[1], str) and folded(value[1]) == folded(entry[1]):
+            result[field] = [literal if field == "car" else value[0], literal]
+    return result
+
+
 def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
     if not isinstance(patch, dict) or set(patch) - FIELDS:
         raise ValueError("invalid_fact_fields")
@@ -102,7 +124,9 @@ def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
         if not isinstance(entry, list) or len(entry) != 2:
             raise ValueError("invalid_fact_entry")
         value, source = entry
-        if not tentative and (not isinstance(source, str) or not source.strip() or folded(source) not in text_value):
+        car_source = (field in {"car_model", "size_class"} and value is not None and known.get("car")
+                      and isinstance(source, str) and folded(source) == folded(known["car"]))
+        if not tentative and not car_source and (not isinstance(source, str) or not source.strip() or folded(source) not in text_value):
             raise ValueError("missing_customer_source")
         if value is None:
             result[field] = None
@@ -144,7 +168,7 @@ def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
             if not valid_phone(value) or digits(value) != digits(source):
                 raise ValueError("invalid_phone_source")
         elif field == "date":
-            parsed_date, origin = parse_date(value), source_date(source, now)
+            parsed_date, origin = parse_date(value), source_date(source, now, embedded=True)
             if not parsed_date or parsed_date != origin:
                 raise ValueError("invalid_date_source")
             value = parsed_date.isoformat()
@@ -152,7 +176,7 @@ def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
             if not re.fullmatch(r"\s*\d{1,2}[:.]\d{2}(?::00)?\s*", value):
                 raise ValueError("invalid_time_source")
             value = parse_time(value)
-            if not value or value != source_time(source):
+            if not value or value != source_time(source, embedded=True):
                 raise ValueError("invalid_time_source")
         elif folded(value) not in folded(source):
             raise ValueError("invented_customer_fact")

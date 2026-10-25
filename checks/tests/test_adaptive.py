@@ -2,7 +2,7 @@ from copy import deepcopy
 from dataclasses import replace
 import tempfile
 import unittest
-from unittest.mock import Mock, MagicMock
+from unittest.mock import Mock, MagicMock, patch
 
 from adaptive import AdaptiveSheets, MappingError, atomic_json
 from tests.fakes import suggest_mappings
@@ -11,6 +11,40 @@ from tests.fakes import Worksheet, fixture, booking
 
 
 class AdaptiveTests(unittest.TestCase):
+    def test_invalid_slot_date_needs_no_google_reads_in_either_mode(self):
+        legacy = Store(replace(self.store.config, sheets_adaptive_enabled=False))
+        legacy._spreadsheet = self.spreadsheet
+        for store in (self.store, legacy):
+            for text in ("not-a-date", "2026-02-30"):
+                self.assertFalse(store.free_slots(text)["ok"])
+        self.assertEqual(self.spreadsheet.metadata_reads, 0)
+        self.assertEqual(sum(sheet.reads for sheet in self.spreadsheet.sheets), 0)
+
+    def test_catalog_reuses_discovery_values_and_batches_only_price_roles(self):
+        self.assertEqual(self.store.calculate_price("Легковой", "Базовый", [])["total"], 630)
+        self.assertEqual(self.spreadsheet.batch_reads, 2)
+        self.assertEqual(sum(sheet.reads for sheet in self.spreadsheet.sheets), 8)
+        reads = {sheet.title: sheet.reads for sheet in self.spreadsheet.sheets}
+        before = self.spreadsheet.batch_reads
+        self.spreadsheet.worksheet("Услуги").values[1][2] = "900"
+        self.assertEqual(self.store.calculate_price("Легковой", "Базовый", [], fresh=True)["total"], 810)
+        self.assertEqual(self.spreadsheet.batch_reads - before, 1)
+        for sheet in self.spreadsheet.sheets:
+            self.assertEqual(sheet.reads - reads[sheet.title], int(sheet.title in {"Услуги", "Тарифы"}))
+        self.assertIsNone(self.store._observed)
+        before = self.spreadsheet.batch_reads
+        self.store.get_catalog()
+        self.assertEqual(self.spreadsheet.batch_reads, before)
+
+    def test_incomplete_price_batch_is_rejected_and_does_not_poison_cache(self):
+        self.a.refresh()
+        with patch.object(self.spreadsheet, "values_batch_get", return_value={"valueRanges": []}):
+            with self.assertRaises(MappingError):
+                self.store.get_catalog(fresh=True)
+        self.assertNotIn("catalog", self.store._cache)
+        self.assertIsNone(self.store._observed)
+        self.assertEqual(self.store.calculate_price("Легковой", "Базовый", [])["total"], 630)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

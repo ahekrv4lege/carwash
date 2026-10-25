@@ -14,7 +14,7 @@ from config import ProviderConfig, load_config
 from ai import Agent
 from openai import APIConnectionError, APIStatusError
 from tests.fakes import suggest_mappings
-from providers import client_options, completion_options, invalid_tool_output
+from providers import client_options, completion_options, invalid_tool_output, request_arguments
 from tests.fakes import config, fixture
 
 
@@ -23,6 +23,40 @@ ENV = {"BOT_TOKEN": "123456:synthetic_token_never_used_12345", "SPREADSHEET_ID":
 
 
 class ProviderTests(unittest.TestCase):
+    def test_cloudflare_combines_system_messages_without_mutating_history(self):
+        cfg = self.load(AI_BASE_URL="https://api.cloudflare.com/client/v4/accounts/synthetic/ai/v1",
+                        AI_API_KEY="synthetic", AI_MODEL="@cf/zai-org/glm-4.7-flash")
+        messages = [{"role": "system", "content": "rules"}, {"role": "user", "content": "hello"},
+                    {"role": "system", "content": "repair"},
+                    {"role": "assistant", "tool_calls": [{"id": "call-1"}]},
+                    {"role": "tool", "tool_call_id": "call-1", "content": "{}"}]
+        arguments = {"messages": messages, "tool_choice": "auto"}
+        converted = request_arguments(cfg, arguments)
+        self.assertEqual(converted["messages"], [{"role": "system", "content": "rules\nrepair"},
+                                               messages[1], *messages[3:]])
+        self.assertEqual(converted["tool_choice"], "auto")
+        self.assertEqual(len(arguments["messages"]), 5)
+        self.assertIs(request_arguments(self.load(), arguments), arguments)
+
+    def test_cloudflare_thinking_is_explicit_and_token_limit_is_singular(self):
+        cfg = self.load(AI_BASE_URL="https://api.cloudflare.com/client/v4/accounts/synthetic/ai/v1",
+                        AI_API_KEY="synthetic", AI_MODEL="@cf/zai-org/glm-4.7-flash")
+        options = completion_options(cfg)
+        self.assertEqual(options["extra_body"], {"chat_template_kwargs": {"enable_thinking": False}})
+        self.assertEqual(options["max_completion_tokens"], 1024)
+        self.assertNotIn("max_tokens", options)
+        self.assertNotIn("extra_body", completion_options(self.load()))
+        self.assertTrue(completion_options(replace(cfg, ai_reasoning_effort="low"))["extra_body"]["chat_template_kwargs"]["enable_thinking"])
+        self.assertFalse(completion_options(replace(cfg, ai_reasoning_effort="low"), mapping=True)["extra_body"]["chat_template_kwargs"]["enable_thinking"])
+
+    def test_cloudflare_thinking_controls_do_not_leak_to_other_endpoints_or_models(self):
+        cfg = self.load(AI_BASE_URL="https://api.cloudflare.com/client/v4/accounts/synthetic/ai/v1",
+                        AI_API_KEY="synthetic", AI_MODEL="@cf/qwen/qwen3.8-27b",
+                        AI_REASONING_SUPPORTED="true", AI_REASONING_EFFORT="low")
+        self.assertEqual(completion_options(cfg)["reasoning_effort"], "low")
+        self.assertNotIn("extra_body", completion_options(replace(cfg, ai_model="@cf/openai/gpt-oss-120b")))
+        self.assertNotIn("extra_body", completion_options(replace(cfg, ai_base_url="https://other.invalid/v1")))
+
     def test_only_cloudflare_invalid_generated_tool_json_is_recoverable(self):
         body = {"errors": [{"code": 3030, "message": "AiError: Invalid JSON: expected value"}]}
         self.assertTrue(invalid_tool_output(N(status_code=400, body=body)))
@@ -234,6 +268,22 @@ class Fallback(unittest.IsolatedAsyncioTestCase):
         await self.agent._request(messages=[])
         self.assertEqual(self.factory.call_count, 1)
 
+    async def test_cloudflare_fallback_prepares_its_own_request(self):
+        cfg = replace(self.agent._provider_configs[1],
+                      ai_base_url="https://api.cloudflare.com/client/v4/accounts/synthetic/ai/v1",
+                      ai_model="@cf/zai-org/glm-4.7-flash")
+        self.agent._provider_configs = (self.agent.config, cfg)
+        self.clients[0].chat.completions.create.side_effect = self.error(429)
+        messages = [{"role": "user", "content": "hello"}, {"role": "system", "content": "rules"}]
+        await self.agent._request(messages=messages)
+        primary = self.clients[0].chat.completions.create.call_args.kwargs
+        backup = self.clients[1].chat.completions.create.call_args.kwargs
+        self.assertEqual(primary["messages"], messages)
+        self.assertNotIn("extra_body", primary)
+        self.assertEqual(backup["messages"][0]["role"], "system")
+        self.assertEqual(backup["model"], cfg.ai_model)
+        self.assertEqual(backup["extra_body"]["chat_template_kwargs"]["enable_thinking"], False)
+
     async def test_cloudflare_tool_output_uses_one_named_response_retry(self):
         error = self.error(400)
         error.body = {"errors": [{"code": 3030, "message": "Invalid JSON: expected value"}]}
@@ -244,6 +294,17 @@ class Fallback(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.await_count, 2)
         self.assertEqual(client.call_args.kwargs["tool_choice"], {"type": "function", "function": {"name": "respond"}})
         self.assertEqual(self.factory.call_count, 1)
+
+    async def test_invalid_tool_json_retry_omits_unusable_tools(self):
+        error = self.error(400)
+        error.body = {"errors": [{"code": 3030, "message": "Invalid JSON"}]}
+        client = self.clients[0].chat.completions.create
+        client.side_effect = [error, "synthetic-result"]
+        tools = [{"function": {"name": name}} for name in ("respond", "get_price_list", "create_booking")]
+        await self.agent._request(messages=[], tools=tools)
+        self.assertEqual(client.call_args.kwargs["tools"], tools[:1])
+        self.assertEqual(len(tools), 3)
+        self.assertEqual(client.await_count, 2)
 
     async def test_cloudflare_output_recovery_is_not_repeated_or_used_for_input_errors(self):
         client = self.clients[0].chat.completions.create
