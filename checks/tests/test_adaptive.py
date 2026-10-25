@@ -11,6 +11,49 @@ from tests.fakes import Worksheet, fixture, booking
 
 
 class AdaptiveTests(unittest.TestCase):
+    def test_free_slots_reuses_discovery_and_batches_expired_availability(self):
+        self.assertEqual(self.store.free_slots("2099-01-01")["days"][0]["free_times"], ["10:00"])
+        self.assertEqual(sum(sheet.reads for sheet in self.spreadsheet.sheets), 8)
+        self.assertEqual(self.spreadsheet.batch_reads, 2)
+        self.assertIsNone(self.store._observed)
+        reads = {sheet.title: sheet.reads for sheet in self.spreadsheet.sheets}
+        before = self.spreadsheet.batch_reads
+        self.store._invalidate("slots", "bookings")
+        self.spreadsheet.worksheet("Слоты").values[1][2] = "0"
+        self.assertFalse(self.store.free_slots("2099-01-01")["days"][0]["free_times"])
+        self.assertEqual(self.spreadsheet.batch_reads - before, 1)
+        for sheet in self.spreadsheet.sheets:
+            self.assertEqual(sheet.reads - reads[sheet.title], int(sheet.title in {"Слоты", "Записи"}))
+        before = sum(sheet.reads for sheet in self.spreadsheet.sheets)
+        self.store.free_slots("2099-01-01")
+        self.assertEqual(sum(sheet.reads for sheet in self.spreadsheet.sheets), before)
+
+    def test_free_slots_does_not_refresh_a_still_valid_booking_cache(self):
+        self.store._get_bookings()
+        before = self.spreadsheet.worksheet("Записи").reads
+        self.store.free_slots("2099-01-01")
+        self.assertEqual(self.spreadsheet.worksheet("Записи").reads, before)
+        self.assertIsNone(self.store._observed)
+
+    def test_free_slots_reuses_outer_snapshot_and_restores_it(self):
+        with self.store.fresh_tables():
+            observed = self.store._observed
+            before = self.spreadsheet.batch_reads
+            self.store.free_slots("2099-01-01")
+            self.assertIs(self.store._observed, observed)
+            self.assertEqual(self.spreadsheet.batch_reads, before)
+        self.assertIsNone(self.store._observed)
+
+    def test_failed_availability_batch_does_not_leak_snapshot_or_cached_result(self):
+        self.a.refresh()
+        with patch.object(self.spreadsheet, "values_batch_get", return_value={"valueRanges": []}):
+            with self.assertRaises(MappingError):
+                self.store.free_slots("2099-01-01")
+        self.assertIsNone(self.store._observed)
+        self.assertNotIn("slots", self.store._cache)
+        self.assertNotIn("bookings", self.store._cache)
+        self.assertEqual(self.store.free_slots("2099-01-01")["days"][0]["free_times"], ["10:00"])
+
     def test_invalid_slot_date_needs_no_google_reads_in_either_mode(self):
         legacy = Store(replace(self.store.config, sheets_adaptive_enabled=False))
         legacy._spreadsheet = self.spreadsheet

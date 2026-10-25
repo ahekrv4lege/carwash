@@ -123,6 +123,7 @@ class Config:
     ai_recent_turns: int = 4
     ai_proofread_enabled: bool = False
     reply_min_delay_sec: float = 1.5
+    reply_batch_sec: float = 0.4
     ai_session_ttl_sec: int = 3600
     ai_max_sessions: int = 1000
     sheets_ai_base_url: str = ""
@@ -259,6 +260,7 @@ def load_config(sheets_only: bool = False) -> Config:
         slots_cache_sec=_integer("SLOTS_CACHE_SEC", "15"),
         max_history=_integer("MAX_HISTORY", "24", 1),
         reply_min_delay_sec=_number("REPLY_MIN_DELAY_SEC", "1.5", 0),
+        reply_batch_sec=_number("REPLY_BATCH_SEC", "0.4", 0),
         **_sheet_settings(),
         **_ai_settings(sheets_only),
     )

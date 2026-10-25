@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -7,6 +8,68 @@ from tests.fakes import fixture
 
 
 class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_batched_dialogue_through_confirmation_writes_once_and_keeps_delivery_order(self):
+        import bot
+        from dataclasses import replace
+        from tests.test_conversation import response
+        from aiogram.types import Message
+        with tempfile.TemporaryDirectory() as folder:
+            store, spreadsheet = fixture(folder)
+            transport = Mock(close=AsyncMock())
+            transport.chat.completions.create = AsyncMock(side_effect=[
+                response(calls=[("respond", {
+                    "reply": "Когда удобно?",
+                    "facts": {
+                        "client_name": ["Никита", "Никита"],
+                        "car": ["Lancer 9", "Lancer 9"],
+                        "size_class": ["Легковой", "Lancer 9"],
+                        "tariff": ["Базовый", "Базовый"],
+                    },
+                })]),
+                response(calls=[
+                    ("respond", {
+                        "reply": "Проверю данные.",
+                        "facts": {
+                            "date": ["2099-01-01", "01.01.2099"],
+                            "time": ["10:00", "в 10:00"],
+                            "phone": ["+7 000 111-22-33", "+7 000 111-22-33"],
+                        },
+                    }),
+                    ("create_booking", {}),
+                ]),
+            ])
+            with patch("ai.AsyncOpenAI", return_value=transport):
+                agent = Agent(replace(store.config, reply_min_delay_sec=0), store)
+            self.addAsyncCleanup(agent.close)
+            queue = bot.MessageBatcher(0.01)
+            reporter = Mock(dialog=AsyncMock())
+            sender = Mock(__aenter__=AsyncMock(), __aexit__=AsyncMock())
+            async def handler(message, data):
+                await bot.ask_agent(message, agent, reporter, message.text)
+            async def send(*texts):
+                messages = [Message.model_validate({
+                    "message_id": index + 1, "date": 0,
+                    "chat": {"id": 111, "type": "private"},
+                    "from": {"id": 111, "is_bot": False, "first_name": "Synthetic"},
+                    "text": text,
+                })
+                    for index, text in enumerate(texts)]
+                await asyncio.gather(*(queue(handler, message, {"agent": agent}) for message in messages))
+            with patch.object(Message, "answer", new_callable=AsyncMock) as answer, \
+                 patch("bot.ChatActionSender.typing", return_value=sender):
+                await send("Меня зовут Никита.", "Мой автомобиль Lancer 9.", "Нужен Базовый.")
+                await send("01.01.2099 в 10:00", "Телефон +7 000 111-22-33. Подготовьте запись.")
+                self.assertEqual(transport.chat.completions.create.await_count, 2)
+                self.assertTrue(agent._pending[111]["delivered"])
+                self.assertFalse(spreadsheet.worksheet("Записи").writes)
+                await send("Да, подтверждаю запись")
+                await send("Да, подтверждаю запись")
+                self.assertEqual(transport.chat.completions.create.await_count, 2)
+                self.assertEqual(len(spreadsheet.worksheet("Записи").writes), 1)
+                self.assertIn("Предлагаю запись:", answer.await_args_list[1].args[0])
+                self.assertIn("10:00", answer.await_args_list[-1].args[0])
+                self.assertFalse(queue.pending)
+
     async def test_existing_agent_tools_work_with_adaptive_store(self):
         with tempfile.TemporaryDirectory() as temp:
             store, _ = fixture(temp)
@@ -62,3 +125,150 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 agent.reply.assert_awaited_once()
                 message.answer.assert_awaited_once_with("Подскажу цены.")
                 agent.mark_delivered.assert_called_once()
+
+
+class MessageBatchingTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from bot import MessageBatcher
+        self.batcher = MessageBatcher(0.01)
+        self.agent = Mock()
+        self.agent.delivery_token.return_value = None
+        self.agent._pending = {}
+        self.data = {"agent": self.agent}
+
+    def message(self, text, user_id=111, contact=None):
+        from aiogram.types import Message
+        return Message.model_validate({"message_id": 1, "date": 0,
+            "chat": {"id": user_id, "type": "private"},
+            "from": {"id": user_id, "is_bot": False, "first_name": "Synthetic"},
+            "text": text, "contact": contact})
+
+    async def test_three_quick_messages_need_one_handler_call_in_order(self):
+        handler = AsyncMock(return_value="reply")
+        results = await asyncio.gather(*(self.batcher(handler, self.message(text), self.data)
+                                        for text in ("Лансер", "девятый", "завтра в 11")))
+        handler.assert_awaited_once()
+        self.assertEqual(handler.await_args.args[0].text, "Лансер\nдевятый\nзавтра в 11")
+        self.assertEqual(results, ["reply"] * 3)
+        self.assertFalse(self.batcher.pending)
+
+    async def test_commands_contacts_and_confirmation_are_separate_boundaries(self):
+        handler = AsyncMock()
+        messages = [self.message("Лансер"), self.message("/reset"), self.message("Иван"),
+                    self.message(None, contact={"phone_number": "00000000000", "first_name": "Synthetic"}),
+                    self.message("Да, подтверждаю запись"), self.message("в 11")]
+        await asyncio.gather(*(self.batcher(handler, message, self.data) for message in messages))
+        self.assertEqual([call.args[0].text for call in handler.await_args_list],
+                         ["Лансер", "/reset", "Иван", None, "Да, подтверждаю запись", "в 11"])
+
+    async def test_next_reply_waits_until_previous_delivery_finishes(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        steps = []
+        async def handler(message, data):
+            steps.append("start:" + message.text)
+            if message.text == "first":
+                entered.set()
+                await release.wait()
+            steps.append("sent:" + message.text)
+        first = asyncio.create_task(self.batcher(handler, self.message("first"), self.data))
+        await entered.wait()
+        second = asyncio.create_task(self.batcher(handler, self.message("second"), self.data))
+        await asyncio.sleep(0)
+        self.assertEqual(steps, ["start:first"])
+        release.set()
+        await asyncio.gather(first, second)
+        self.assertEqual(steps, ["start:first", "sent:first", "start:second", "sent:second"])
+
+    async def test_different_clients_are_not_blocked_by_one_slow_reply(self):
+        both, release = asyncio.Event(), asyncio.Event()
+        entered = set()
+        async def handler(message, data):
+            entered.add(message.from_user.id)
+            if len(entered) == 2:
+                both.set()
+            await release.wait()
+        tasks = [asyncio.create_task(self.batcher(handler, self.message("hello", user), self.data)) for user in (111, 222)]
+        try:
+            await asyncio.wait_for(both.wait(), 1)
+        finally:
+            release.set()
+            await asyncio.gather(*tasks)
+        self.assertFalse(self.batcher.pending)
+
+    async def test_confirmation_received_before_new_offer_cannot_confirm_it_later(self):
+        from aiogram.types import Message
+        token = None
+        async def handler(message, data):
+            nonlocal token
+            token = object()
+        self.agent.delivery_token.side_effect = lambda user_id: token
+        wrapped = AsyncMock(side_effect=handler)
+        with patch.object(Message, "answer", new_callable=AsyncMock) as answer:
+            await asyncio.gather(self.batcher(wrapped, self.message("подготовьте запись"), self.data),
+                                 self.batcher(wrapped, self.message("Да, подтверждаю запись"), self.data))
+        wrapped.assert_awaited_once()
+        answer.assert_awaited_once()
+        self.assertIn("подтвердите заново", answer.await_args.args[0])
+
+    async def test_undelivered_offer_confirmation_is_rejected_without_handler(self):
+        from aiogram.types import Message
+        self.agent.delivery_token.return_value = object()
+        self.agent._pending = {111: {"delivered": False}}
+        handler = AsyncMock()
+        with patch.object(Message, "answer", new_callable=AsyncMock) as answer:
+            await self.batcher(handler, self.message("Да, подтверждаю запись"), self.data)
+        handler.assert_not_awaited()
+        answer.assert_awaited_once()
+
+    async def test_delivered_confirmation_is_not_batched_with_following_text(self):
+        self.agent.delivery_token.return_value = object()
+        self.agent._pending = {111: {"delivered": True}}
+        handler = AsyncMock()
+        await asyncio.gather(self.batcher(handler, self.message("Да, подтверждаю запись"), self.data),
+                             self.batcher(handler, self.message("На когда запись?"), self.data))
+        self.assertEqual(handler.await_count, 2)
+
+    async def test_batch_errors_reach_every_waiter_and_do_not_poison_next_message(self):
+        handler = AsyncMock(side_effect=RuntimeError("synthetic failure"))
+        results = await asyncio.gather(*(self.batcher(handler, self.message(text), self.data)
+                                        for text in ("one", "two", "three")), return_exceptions=True)
+        self.assertTrue(all(isinstance(result, RuntimeError) for result in results))
+        self.assertFalse(self.batcher.pending)
+        handler.side_effect = None
+        await self.batcher(handler, self.message("new"), self.data)
+        self.assertEqual(handler.await_count, 2)
+
+    async def test_cancelled_waiter_does_not_cancel_the_shared_reply(self):
+        handler = AsyncMock(return_value="reply")
+        first = asyncio.create_task(self.batcher(handler, self.message("one"), self.data))
+        second = asyncio.create_task(self.batcher(handler, self.message("two"), self.data))
+        await asyncio.sleep(0)
+        second.cancel()
+        await asyncio.gather(second, return_exceptions=True)
+        self.assertEqual(await first, "reply")
+        handler.assert_awaited_once()
+        self.assertEqual(handler.await_args.args[0].text, "one\ntwo")
+        self.assertFalse(self.batcher.pending)
+
+    async def test_zero_delay_disables_grouping(self):
+        self.batcher.delay = 0
+        handler = AsyncMock()
+        await asyncio.gather(*(self.batcher(handler, self.message(text), self.data) for text in ("one", "two")))
+        self.assertEqual(handler.await_count, 2)
+
+    async def test_cancelled_owner_releases_all_waiters_and_cleans_the_queue(self):
+        entered = asyncio.Event()
+        async def blocked(message, data):
+            entered.set()
+            await asyncio.Event().wait()
+        owner = asyncio.create_task(self.batcher(blocked, self.message("one"), self.data))
+        await entered.wait()
+        waiter = asyncio.create_task(self.batcher(blocked, self.message("two"), self.data))
+        await asyncio.sleep(0)
+        owner.cancel()
+        results = await asyncio.wait_for(asyncio.gather(owner, waiter, return_exceptions=True), 1)
+        self.assertTrue(all(isinstance(result, asyncio.CancelledError) for result in results))
+        self.assertFalse(self.batcher.pending)
+        handler = AsyncMock()
+        await self.batcher(handler, self.message("new"), self.data)
+        handler.assert_awaited_once()

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import namedtuple
 from contextlib import suppress
 
 from aiogram import Bot, Dispatcher, F as Filter, Router
@@ -21,6 +22,68 @@ router = Router()
 router.message.filter(Filter.chat.type == "private")  # работаем только в личных чатах
 
 TG_LIMIT = 4000  # лимит Telegram — 4096 символов
+
+
+QueuedMessage = namedtuple("QueuedMessage", "handler message data batchable future confirmation token delivered")
+
+class MessageBatcher:
+    def __init__(self, delay):
+        self.delay, self.pending = delay, {}
+
+    async def __call__(self, handler, message, data):
+        if message.chat.type != "private" or not message.from_user:
+            return await handler(message, data)
+        user_id, text = message.from_user.id, message.text or ""
+        affirmative = any(Agent._affirmative(text, action) for action in ("create_booking", "cancel_booking"))
+        batchable = bool(text) and not text.startswith("/") and not affirmative and self.delay > 0
+        agent = data["agent"]
+        token = agent.delivery_token(user_id) if affirmative else None
+        delivered = agent._pending.get(user_id, {}).get("delivered", False)
+        future = asyncio.get_running_loop().create_future()
+        queue_owner = user_id not in self.pending
+        queue = self.pending.setdefault(user_id, [])
+        queue.append(QueuedMessage(handler, message, data, batchable, future, affirmative, token, delivered))
+        if queue_owner:
+            try:
+                await self._drain(user_id, queue)
+            finally:
+                self.pending.pop(user_id, None)
+        return await asyncio.shield(future)
+
+    async def _drain(self, user_id, queue):
+        batch = []
+        try:
+            while queue:
+                if queue[0].batchable:
+                    await asyncio.sleep(self.delay)
+                batch = [queue.pop(0)]
+                while batch[0].batchable and queue and queue[0].batchable:
+                    batch.append(queue.pop(0))
+                await self._deliver(user_id, batch)
+        finally:
+            for item in (*batch, *queue):
+                item.future.cancel()
+
+    async def _deliver(self, user_id, batch):
+        latest = batch[-1]
+        event = latest.message
+        if len(batch) > 1:
+            event = event.model_copy(update={"text": "\n".join(item.message.text for item in batch),
+                                             "entities": None})
+        try:
+            current_token = latest.data["agent"].delivery_token(user_id)
+            offer_changed = current_token is not latest.token
+            offer_undelivered = latest.token is not None and not latest.delivered
+            if latest.confirmation and (offer_changed or offer_undelivered):
+                result = await event.answer("Предложение ещё не было доставлено или уже изменилось. Проверьте его и подтвердите заново.")
+            else:
+                result = await latest.handler(event, latest.data)
+        except Exception as error:
+            for item in batch:
+                item.future.set_exception(error)
+        else:
+            for item in batch:
+                item.future.set_result(result)
 
 
 def split_text(text: str, limit: int = TG_LIMIT) -> list[str]:
@@ -101,6 +164,7 @@ async def main() -> None:
         reporter = AdminReporter(bot, config.admin_chat_id)
         agent = Agent(config, store, reporter)
         dispatcher = Dispatcher(agent=agent, config=config, reporter=reporter)
+        router.message.outer_middleware(MessageBatcher(config.reply_batch_sec))
         dispatcher.include_router(router)
         maintenance = asyncio.create_task(maintain_sessions(agent))
         if config.sheets_adaptive_enabled and config.sheets_discover_on_start:

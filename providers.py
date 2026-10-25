@@ -2,7 +2,26 @@
 from __future__ import annotations
 
 import logging
+import math
+import time
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
+
+
+def retry_after(error) -> float | None:
+    if getattr(error, "status_code", None) not in {429, 503}:
+        return None
+    value = getattr(getattr(error, "response", None), "headers", {}).get("retry-after")
+    if value is None:
+        return None
+    try:
+        try:
+            seconds = float(value)
+        except ValueError:
+            seconds = parsedate_to_datetime(value).timestamp() - time.time()
+        return min(max(seconds, 1), 86400) if math.isfinite(seconds) else None
+    except (ValueError, TypeError, OverflowError):
+        return None
 
 
 def invalid_tool_output(error) -> bool:

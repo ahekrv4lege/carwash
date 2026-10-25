@@ -19,6 +19,238 @@ def envelope(reply="Учту.", facts=None, tentative=None):
 
 
 class MemoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recognized_model_allows_explicit_ai_class_resolution_in_proposal(self):
+        self.agent._state[111] = {"facts": dict(ARGS, car_model="Toyota Camry"),
+            "tentative": {"size_class": "Легковой"}, "catalog": {"size_classes": ["Легковой", "Кроссовер"]}}
+        result = await self.agent._call_tool("create_booking", '{"size_class":"Легковой"}', self.user)
+        self.assertTrue(result["confirmation_required"])
+        self.assertNotIn("size_class", self.agent._state[111].get("tentative", {}))
+        self.assertEqual(self.agent._pending[111]["args"]["size_class"], "Легковой")
+        self.assertIn('класс «Легковой»', self.agent._proposal_text(self.agent._pending[111]))
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_class_resolution_does_not_bypass_other_uncertainty_or_catalog_validation(self):
+        for guesses, supplied in (({"size_class": "Легковой", "car": "Toyota Camry"}, "Легковой"),
+                                  ({"size_class": "Легковой", "car_model": "Toyota Camry"}, "Легковой"),
+                                  ({"size_class": "Легковой", "phone": ARGS["phone"]}, "Легковой"),
+                                  ({"size_class": "Легковой"}, "Кроссовер"),
+                                  ({"size_class": "Unknown"}, "Unknown")):
+            with self.subTest(guesses=guesses, supplied=supplied):
+                self.agent.reset(111)
+                self.agent._state[111] = {"facts": dict(ARGS, car_model="Toyota Camry"),
+                    "tentative": guesses, "catalog": {"size_classes": ["Легковой", "Кроссовер"]}}
+                result = await self.agent._call_tool("create_booking", json.dumps({"size_class": supplied}), self.user)
+                self.assertFalse(result["ok"])
+                self.assertNotIn(111, self.agent._pending)
+                self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_tentative_class_gets_actionable_memory_repair_before_proposal(self):
+        self.agent._state[111] = {"facts": {field: value for field, value in ARGS.items() if field != "size_class"},
+            "tentative": {"size_class": "Легковой"}, "catalog": {"size_classes": ["Легковой", "Кроссовер"]}}
+        self.transport.side_effect = [response(calls=[("create_booking", {"size_class": "Легковой"})]),
+            response(calls=[("respond", {"reply": "Проверим цену и время.",
+                "facts": {"size_class": ["Легковой", ARGS["car"]]}})])]
+        answer = await self.agent.reply(self.user, "Подготовьте запись")
+        self.assertIn("Предлагаю запись:", answer)
+        self.assertEqual(self.facts()["size_class"], "Легковой")
+        self.assertNotIn("size_class", self.agent._state[111].get("tentative", {}))
+        self.assertEqual(self.transport.await_count, 2)
+        self.assertEqual(self.transport.call_args.kwargs["tool_choice"]["function"]["name"], "respond")
+        messages = self.transport.call_args.kwargs["messages"]
+        self.assertTrue(any("Класс пока предположительный" in message.get("content", "") for message in messages))
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_vehicle_in_price_question_uses_memory_reply_after_catalog_without_extra_request(self):
+        self.transport.side_effect = [response(calls=[("get_price_list", {})]), response(calls=[("respond", {
+            "reply": "Для него есть Базовый.", "facts": {"car": ["лансера девять", "лансера девять"]}})])]
+        answer = await self.agent.reply(self.user, "Что есть для лансера девять?")
+        self.assertEqual(answer, "Для него есть Базовый.")
+        self.assertEqual(self.facts()["car"], "лансера девять")
+        self.assertEqual(self.transport.await_count, 2)
+        self.assertEqual(self.transport.call_args.kwargs["tool_choice"]["function"]["name"], "respond")
+        self.assertEqual([tool["function"]["name"] for tool in self.transport.call_args.kwargs["tools"]], ["respond"])
+
+    async def test_explicit_tariff_change_is_saved_even_when_ai_only_calculates(self):
+        self.spreadsheet.worksheet("Тарифы").values.append(["Стандарт", "Мойка", "0", "да"])
+        self.agent._state[111] = {"facts": dict(ARGS)}
+        self.transport.side_effect = [response(calls=[("calculate_price", {"size_class": "Легковой", "tariff": "Стандарт", "services": []})]),
+                                      response("Стандарт стоит 700 ₽.", raw=True)]
+        await self.agent.reply(self.user, "Передумал, вместо Базового Стандарт.")
+        self.assertEqual(self.facts()["tariff"], "Стандарт")
+        self.assertEqual(self.agent._state[111]["quote"]["total"], 700)
+        self.assertNotIn(111, self.agent._pending)
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_hypothetical_tariff_quote_does_not_change_customer_choice(self):
+        self.spreadsheet.worksheet("Тарифы").values.append(["Стандарт", "Мойка", "0", "да"])
+        for source in ("А если вместо Базового Стандарт, сколько будет?", "Сравните Базовый и Стандарт.", "Не выбираю Стандарт, просто посчитайте."):
+            with self.subTest(source=source):
+                self.agent.reset(111)
+                self.agent._state[111] = {"facts": dict(ARGS)}
+                self.transport.side_effect = [response(calls=[("calculate_price", {"size_class": "Легковой", "tariff": "Стандарт", "services": []})]),
+                                              response("Для сравнения: 700 ₽.", raw=True)]
+                await self.agent.reply(self.user, source)
+                self.assertEqual(self.facts()["tariff"], ARGS["tariff"])
+                self.assertNotIn(111, self.agent._pending)
+
+    async def test_explicit_prepare_after_hypothetical_quote_works_without_ai_tool_call(self):
+        self.agent._state[111] = {"facts": dict(ARGS),
+            "selection": {"size_class": "Легковой", "tariff": "Другой", "services": []}, "quote": {"total": 900}}
+        self.transport.side_effect = [response("Хорошо, подготовим.", raw=True)]
+        answer = await self.agent.reply(self.user, "Оставляем Базовый, без дополнительных услуг. Подготовьте запись, я проверю.")
+        self.assertIn("Предлагаю запись:", answer)
+        self.assertEqual(self.agent._pending[111]["quote"]["total"], 630)
+        self.assertEqual(self.transport.await_count, 1)
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+        self.agent.mark_delivered(111, self.agent.delivery_token(111, answer))
+        confirmed = await self.agent.reply(self.user, "Да, подтверждаю запись")
+        self.assertIn("10:00", confirmed)
+        self.assertEqual(len(self.spreadsheet.worksheet("Записи").writes), 1)
+        await self.agent.reply(self.user, "Да, подтверждаю запись")
+        self.assertEqual(len(self.spreadsheet.worksheet("Записи").writes), 1)
+
+    async def test_automatic_proposal_requires_explicit_unconditional_request(self):
+        for text in ("Если подготовьте запись — это команда?", "Не подготовьте запись, пока только смотрю.",
+                     "Можно ли подготовить запись?", "Подготовьте запись или просто расчёт, я не решил."):
+            with self.subTest(text=text):
+                self.agent.reset(111)
+                self.agent._state[111] = {"facts": dict(ARGS)}
+                self.transport.side_effect = [response("Уточним пожелания.", raw=True)]
+                await self.agent.reply(self.user, text)
+                self.assertNotIn(111, self.agent._pending)
+                self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_repeated_catalog_result_has_only_one_full_copy_in_model_context(self):
+        self.transport.side_effect = [response(calls=[("get_price_list", {})]),
+            response(calls=[("get_price_list", {})]), response("Цена 700 ₽.", raw=True)]
+        with patch.object(self.agent, "_call_tool", wraps=self.agent._call_tool) as tool:
+            answer = await self.agent.reply(self.user, "Какие услуги есть?")
+        results = [json.loads(message["content"]) for message in self.transport.call_args.kwargs["messages"] if message["role"] == "tool"]
+        self.assertEqual(answer, "Цена 700 ₽.")
+        self.assertEqual(tool.call_count, 1)
+        self.assertIn("services", results[0])
+        self.assertIn("tariffs", results[0])
+        self.assertTrue(results[1]["cached"])
+        self.assertNotIn("services", results[1])
+        self.assertLess(len(json.dumps(results[1])), len(json.dumps(results[0])))
+
+    async def test_different_catalog_filters_keep_both_full_results(self):
+        self.transport.side_effect = [response(calls=[("get_price_list", {"size_class": "Легковой"})]),
+            response(calls=[("get_price_list", {"size_class": "Кроссовер"})]), response("Цены разные.", raw=True)]
+        await self.agent.reply(self.user, "Сравните цены для легкового и кроссовера.")
+        results = [json.loads(message["content"]) for message in self.transport.call_args.kwargs["messages"] if message["role"] == "tool"]
+        self.assertEqual([result["selected_class"] for result in results], ["Легковой", "Кроссовер"])
+        self.assertTrue(all("services" in result and not result.get("cached") for result in results))
+
+    async def test_explicit_return_to_old_choice_discards_different_hypothetical_quote(self):
+        self.agent._state[111] = {"facts": dict(ARGS),
+            "selection": {"size_class": "Легковой", "tariff": "Другой", "services": []}, "quote": {"total": 900}}
+        await self.say("Оставляем Базовый.", facts={"tariff": ["Базовый", "Базовый"]})
+        self.assertNotIn("quote", self.agent._state[111])
+        self.assertNotIn("selection", self.agent._state[111])
+        self.assertEqual(self.agent._booking_args({}, self.user)["tariff"], "Базовый")
+
+    async def test_phone_is_kept_before_an_ordinary_reply_redacts_the_history(self):
+        self.transport.side_effect = [response("Уточните модель автомобиля.", raw=True)]
+        await self.agent.reply(self.user, "Мой телефон +7 000 111-22-33.")
+        self.assertEqual(self.facts()["phone"], "+7 000 111-22-33")
+        self.assertNotIn("111-22-33", self.agent._history[111][0]["content"])
+        self.assertEqual(self.transport.await_count, 1)
+
+    async def test_two_phones_negation_and_order_id_are_not_auto_selected(self):
+        for text in ("Телефон +7 000 111-22-33 или +7 000 222-33-44", "Не телефон 70001112233", "Заказ 70001112233", "2026-10-26 11:00", "Вроде телефон +7 000 111-22-33"):
+            with self.subTest(text=text):
+                self.agent.reset(self.user.id)
+                self.transport.side_effect = [response("Уточните номер.", raw=True)]
+                await self.agent.reply(self.user, text)
+                self.assertNotIn("phone", self.facts())
+
+    async def test_unambiguous_booking_datetime_is_kept_without_extra_ai_call(self):
+        now = datetime(2026, 10, 25, 12)
+        self.transport.side_effect = [response("Какой тариф вам нужен?", raw=True)]
+        with patch.object(self.store, "now", return_value=now):
+            await self.agent.reply(self.user, "Можно завтра в 11?")
+        self.assertEqual(self.facts()["date"], "2026-10-26")
+        self.assertEqual(self.facts()["time"], "11:00")
+        self.assertEqual(self.transport.await_count, 1)
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_hypothetical_negative_and_alternative_times_are_not_auto_selected(self):
+        for text in ("Хочу завтра или послезавтра", "Если можно завтра в 11", "Не хочу завтра в 11", "Можно в 11 или 12?", "Возможно хочу завтра в 11"):
+            with self.subTest(text=text):
+                self.agent.reset(self.user.id)
+                self.transport.side_effect = [response("Уточните время.", raw=True)]
+                await self.agent.reply(self.user, text)
+                self.assertNotIn("date", self.facts())
+                self.assertNotIn("time", self.facts())
+
+    async def test_booking_question_does_not_rewrite_confirmed_datetime(self):
+        self.agent._state[111] = {"facts": dict(ARGS), "stage": "booked", "confirmed": True,
+            "booking": {"booking_id": "1", "date": ARGS["date"], "time": "10:00", "car": ARGS["car"], "total": 630, "currency": "₽"}}
+        self.transport.side_effect = [response("У вас запись на 10:00.", raw=True)]
+        await self.agent.reply(self.user, "Можно завтра в 11 или у меня уже есть запись?")
+        self.assertEqual(self.facts()["date"], ARGS["date"])
+        self.assertEqual(self.facts()["time"], "10:00")
+
+    async def test_confirmed_total_question_does_not_require_new_catalog(self):
+        self.agent._state[111] = {"facts": dict(ARGS)}
+        await self.say("Подготовьте запись", calls=[("create_booking", {})])
+        await self.agent.reply(self.user, "Да, подтверждаю запись")
+        self.transport.side_effect = [response("Итого 630 ₽, запись на 10:00.", raw=True)]
+        before = self.transport.await_count
+        answer = await self.agent.reply(self.user, "Напомните итог, я забыл цену.")
+        self.assertIn("630", answer)
+        self.assertEqual(self.transport.await_count, before + 1)
+        self.assertEqual(self.transport.call_args.kwargs["tool_choice"], "auto")
+
+    async def test_sheet_read_failure_returns_without_another_ai_request(self):
+        with patch.object(self.store, "price_list", side_effect=OSError("offline")) as read:
+            self.transport.side_effect = [response(calls=[("get_price_list", {})]),
+                response(calls=[("respond", {"reply": "Прайс временно недоступен. Попробуйте позже."})])]
+            answer = await self.agent.reply(self.user, "Какие услуги и цены?")
+        self.assertIn("Не удалось прочитать таблицу", answer)
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(self.transport.await_count, 1)
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_adding_extra_preserves_already_selected_tariff(self):
+        self.agent._state[111] = {"facts": dict(ARGS)}
+        self.spreadsheet.worksheet("Услуги").values[2][-1] = "да"
+        await self.say("Добавьте Воск.", facts={"services": [["Воск"], "Воск"]})
+        self.assertEqual(self.facts()["tariff"], "Базовый")
+        self.assertEqual(self.facts()["services"], ["Воск"])
+
+    async def test_preview_cannot_silently_use_old_choice_after_different_quote(self):
+        self.agent._state[111] = {"facts": dict(ARGS),
+            "selection": {"size_class": "Легковой", "tariff": "Другой", "services": []}, "quote": {"total": 900}}
+        result = await self.agent._call_tool("create_booking", "{}", self.user)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["field"], "tariff")
+        self.assertIn("Уточните выбор", result["error"])
+        self.assertNotIn(111, self.agent._pending)
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_revision_schema_allows_known_fields_without_changing_facts(self):
+        self.agent._state[111] = {"facts": dict(ARGS), "stage": "collecting", "quote": {"total": 630}}
+        schema = next(tool["function"]["parameters"] for tool in self.agent._tools(self.user)
+                      if tool["function"]["name"] == "create_booking")
+        self.assertIn("time", schema["properties"])
+        self.assertIn("car", schema["properties"])
+        self.assertEqual(schema["required"], [])
+        self.assertEqual(self.facts()["time"], "10:00")
+
+    async def test_conflicting_time_is_repaired_from_customer_quote_before_proposal(self):
+        self.agent._state[111] = {"facts": dict(ARGS), "stage": "collecting", "quote": {"total": 630}}
+        self.spreadsheet.worksheet("Слоты").values.append([ARGS["date"], "12:00", "1"])
+        self.transport.side_effect = [response(calls=[("create_booking", {"time": "12:00"})]),
+            response(calls=[("respond", {"reply": "Проверю новое время.",
+                "facts": {"time": ["12:00", "12:00"]}})])]
+        answer = await self.agent.reply(self.user, "Да, но давайте в 12:00 вместо 10:00.")
+        self.assertIn("в 12:00", answer)
+        self.assertEqual(self.agent._pending[111]["args"]["time"], "12:00")
+        self.assertEqual(self.transport.await_count, 2)
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
     async def test_invented_class_without_catalog_routes_repair_to_catalog(self):
         self.agent._state[111] = {"facts": {key: value for key, value in ARGS.items() if key != "size_class"}}
         self.transport.side_effect = [response(calls=[("create_booking", {"size_class": "compact"})]),

@@ -14,7 +14,7 @@ from config import ProviderConfig, load_config
 from ai import Agent
 from openai import APIConnectionError, APIStatusError
 from tests.fakes import suggest_mappings
-from providers import client_options, completion_options, invalid_tool_output, request_arguments
+from providers import client_options, completion_options, invalid_tool_output, request_arguments, retry_after
 from tests.fakes import config, fixture
 
 
@@ -23,6 +23,26 @@ ENV = {"BOT_TOKEN": "123456:synthetic_token_never_used_12345", "SPREADSHEET_ID":
 
 
 class ProviderTests(unittest.TestCase):
+    def test_message_batch_window_is_optional_and_rejects_invalid_values(self):
+        self.assertEqual(self.load().reply_batch_sec, 0.4)
+        self.assertEqual(self.load(REPLY_BATCH_SEC="0").reply_batch_sec, 0)
+        for value in ("-1", "nan", "inf", "invalid"):
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "REPLY_BATCH_SEC"):
+                self.load(REPLY_BATCH_SEC=value)
+
+    def test_retry_after_accepts_seconds_and_http_date_but_not_invalid_values(self):
+        for value, expected in (("120", 120), ("0.5", 1), ("999999999", 86400),
+                                ("nan", None), ("inf", None), ("nonsense", None)):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    retry_after(N(status_code=429, response=N(headers={"retry-after": value}))), expected)
+        with patch("providers.time.time", return_value=0):
+            self.assertEqual(retry_after(N(
+                status_code=503,
+                response=N(headers={"retry-after": "Thu, 01 Jan 1970 00:02:00 GMT"}),
+            )), 120)
+        self.assertIsNone(retry_after(N(status_code=400, response=N(headers={"retry-after": "120"}))))
+
     def test_cloudflare_combines_system_messages_without_mutating_history(self):
         cfg = self.load(AI_BASE_URL="https://api.cloudflare.com/client/v4/accounts/synthetic/ai/v1",
                         AI_API_KEY="synthetic", AI_MODEL="@cf/zai-org/glm-4.7-flash")
@@ -233,6 +253,27 @@ class ProviderTests(unittest.TestCase):
 
 
 class Fallback(unittest.IsolatedAsyncioTestCase):
+    async def test_quota_retry_after_skips_the_key_until_its_own_deadline(self):
+        error = self.error(429)
+        error.response.headers["retry-after"] = "7200"
+        self.clients[0].chat.completions.create.side_effect = error
+        start = time.monotonic()
+        await self.agent._request(messages=[])
+        await self.agent._request(messages=[])
+        self.assertGreaterEqual(self.agent._provider_retry_at[0], start + 7200)
+        self.assertEqual(self.clients[0].chat.completions.create.await_count, 1)
+        self.assertEqual(self.clients[1].chat.completions.create.await_count, 2)
+
+    async def test_single_available_key_does_not_retry_before_server_deadline(self):
+        self.agent._provider_retry_at[1:] = [time.monotonic() + 60] * 2
+        error = self.error(429)
+        error.response.headers["retry-after"] = "120"
+        self.clients[0].chat.completions.create.side_effect = error
+        with patch("ai.asyncio.sleep", new_callable=AsyncMock) as sleep, self.assertRaises(APIStatusError):
+            await self.agent._request(messages=[])
+        self.assertEqual(self.clients[0].chat.completions.create.await_count, 1)
+        sleep.assert_not_awaited()
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

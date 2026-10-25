@@ -497,8 +497,16 @@ class Store:
                 return _failure("Неверная дата, нужен формат ГГГГ-ММ-ДД")
             dates = [booking_date]
         with self._lock:
-            slots = self._get_slots()
-            _, booking_rows = self._get_bookings()
+            previous, now = self._observed, time.monotonic()
+            expired = [key for key in ("slots", "bookings") if key not in self._cache
+                       or now - self._cache[key][0] >= self.config.slots_cache_sec]
+            try:
+                if self._adaptive and previous is None and len(expired) == 2:
+                    self._observed = self._adaptive.observe(roles=("slots", "bookings"))
+                slots = self._get_slots()
+                _, booking_rows = self._get_bookings()
+            finally:
+                self._observed = previous
         busy = self._booked_capacity(booking_rows)
         if not date_str:
             today = self.now().date()
