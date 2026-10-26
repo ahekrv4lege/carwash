@@ -167,7 +167,7 @@ async def on_proposal(callback: CallbackQuery, agent: Agent, reporter: AdminRepo
 async def cmd_start(message: Message, agent: Agent, config: Config) -> None:
     agent.reset(message.from_user.id)
     await message.answer(
-        f"Здравствуйте! Автомойка «{config.carwash_name}». Подскажу цены и помогу записаться. Чем помочь?",
+        f"Здравствуйте! Вас приветствует автомойка «{config.carwash_name}». Вам ответит первый свободный сотрудник. Чем можем помочь?",
     )
 
 
