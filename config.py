@@ -99,6 +99,7 @@ class Config:
     sheet_tariffs: str
     sheet_slots: str
     sheet_bookings: str
+    sheet_classes: str         # правила для машин с несколькими классами (напр. BMW X5)
 
     sheets_adaptive_enabled: bool = False
     sheets_discover_on_start: bool = False
@@ -214,7 +215,7 @@ def _ai_settings(sheets_only: bool) -> dict:
 
 
 def _sheet_settings() -> dict:
-    defaults = {"services": "Услуги", "tariffs": "Тарифы", "slots": "Слоты", "bookings": "Записи"}
+    defaults = {"services": "Услуги", "tariffs": "Тарифы", "slots": "Слоты", "bookings": "Записи", "classes": "Классы"}
     names = {
         f"sheet_{role}": os.getenv(f"SHEET_{role.upper()}", default).strip()
         for role, default in defaults.items()

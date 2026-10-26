@@ -12,13 +12,13 @@ import threading
 import time
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from gspread import HTTPClient
-from gspread.exceptions import APIError
+from gspread.exceptions import APIError, WorksheetNotFound
 
 from config import Config
 from adaptive import AdaptiveSheets, BOOKING_FIELDS
@@ -127,6 +127,9 @@ class Catalog:
     size_classes: list[str]
     services: dict[str, Service]    # ключ — название в нижнем регистре
     tariffs: dict[str, Tariff]
+    # Правила прайса для машин с несколькими классами (BMW X5 = кроссовер);
+    # каждое правило — (как записали в таблице автомобиль, какой класс выбрать).
+    class_rules: list[tuple[str, str]] = field(default_factory=list)
 
     # ---- классы автомобилей
     def match_class(self, value: str) -> str | None:
@@ -137,6 +140,25 @@ class Catalog:
             if class_name.lower() == normalized_class:
                 return class_name
         return None
+
+    def resolve_class_rule(self, value: str) -> str | None:
+        """Правило прайса для нестандартного автомобиля (напр. «BMW X5» → «Кроссовер»).
+
+        Сначала ищем точное совпадение (регистр не важен), затем включение в обе
+        стороны. Если совпало несколько правил, но все указывают один класс —
+        возвращаем его; разные классы считаем противоречием и не решаем за
+        администратора (None — пусть решает нейросеть по тексту правила).
+        """
+        needle = (value or "").strip().casefold()
+        if not needle:
+            return None
+        exact = [size_class for car, size_class in self.class_rules if car.strip().casefold() == needle]
+        if exact:
+            return exact[0]
+        hits = [size_class for car, size_class in self.class_rules
+                if (hit := car.strip().casefold()) and (hit in needle or needle in hit)]
+        unique = sorted(set(hits))
+        return unique[0] if len(unique) == 1 else None
 
     # ---- тариф = сумма цен ДОСТУПНЫХ услуг из состава минус скидка
     def tariff_quote(self, tariff: Tariff, size_class: str) -> dict | None:
@@ -268,6 +290,7 @@ class Catalog:
         return {
             "ok": True,
             "size_classes": self.size_classes,
+            "class_rules": [{"car": car, "class": size_class} for car, size_class in self.class_rules],
             "services": services,
             "tariffs": tariffs,
             "unavailable_services": unavailable,
@@ -444,7 +467,61 @@ class Store:
                 discount=to_number(pick(record, "Скидка %", "Скидка")) or 0.0,
                 enabled=is_yes(pick(record, "Доступен", "Доступна"), default=True),
             )
-        return Catalog(classes, services, tariffs)
+        return Catalog(classes, services, tariffs, self._load_class_rules(classes))
+
+    # ---------- правила классов (лист «Классы») ----------
+    def _load_class_rules(self, classes: list[str]) -> list[tuple[str, str]]:
+        """Пары «автомобиль → класс» для машин, подходящих под несколько категорий.
+
+        Лист необязателен: без него бот работает как раньше, класс выбирает
+        нейросеть. Правило с классом, которого нет в прайсе (или с повтором
+        одного автомобиля под разными классами), отбрасывается с предупреждением,
+        а не уходит в нейросеть как мусор.
+        """
+        try:
+            values = self._get_spreadsheet().worksheet(self.config.sheet_classes).get_all_values()
+        except (WorksheetNotFound, StopIteration):
+            return []
+        except Exception as error:  # unforeseen: no crash on the entire price list
+            log.warning("Не удалось прочитать лист «%s»: %s", self.config.sheet_classes, error)
+            return []
+        if not values:
+            return []
+        wanted_car = {"автомобиль", "модель", "машина"}
+        wanted_class = {"класс", "категория", "габарит"}
+        car_column = class_column = None
+        for index, header in enumerate(values[0]):
+            lowered = str(header).strip().lower()
+            if lowered in wanted_car and car_column is None:
+                car_column = index
+            elif lowered in wanted_class and class_column is None:
+                class_column = index
+        if car_column is None or class_column is None:
+            log.warning("Лист «%s»: нужны колонки «Автомобиль» и «Класс»", self.config.sheet_classes)
+            return []
+        by_lower = {class_name.lower(): class_name for class_name in classes}
+        pairs: list[tuple[str, str]] = []
+        for raw in values[1:]:
+            car = str(raw[car_column]).strip() if car_column < len(raw) else ""
+            rule_class = str(raw[class_column]).strip() if class_column < len(raw) else ""
+            if not car or not rule_class:
+                continue
+            matched = by_lower.get(rule_class.lower())
+            if not matched:
+                log.warning("Лист «%s»: правило «%s → %s» отброшено: класса нет в прайсе",
+                            self.config.sheet_classes, car, rule_class)
+                continue
+            pairs.append((car, matched))
+        # Один автомобиль под разными классами — противоречие: не используем оба правила.
+        variants: dict[str, set[str]] = {}
+        for car, matched in pairs:
+            variants.setdefault(car.casefold(), set()).add(matched)
+        conflicts = {key for key, matched_classes in variants.items() if len(matched_classes) > 1}
+        for key in conflicts:
+            matched_classes = variants[key]
+            log.warning("Лист «%s»: у «%s» противоречивые классы (%s) — правило не используется",
+                        self.config.sheet_classes, key, ", ".join(sorted(matched_classes)))
+        return [(car, matched) for car, matched in pairs if car.casefold() not in conflicts]
 
     def price_list(self) -> dict:
         data = self.get_catalog().price_list()
