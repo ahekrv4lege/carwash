@@ -190,7 +190,7 @@ class MergeTelegramTests(unittest.IsolatedAsyncioTestCase):
         spec.loader.exec_module(module)
         return module
 
-    async def test_real_aiogram_startup_routes_commands_contact_and_private_text(self):
+    async def test_real_aiogram_startup_routes_commands_and_private_text(self):
         module = self.module()
         cfg = fake_config("unused", ai_enabled=False)
         session = OfflineTelegram()
@@ -199,15 +199,13 @@ class MergeTelegramTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(telegram.token, cfg.bot_token)
             self.assertEqual(kwargs, {"close_bot_session": False})
             agent = dispatcher.workflow_data["agent"]
-            async def feed(index, text=None, contact=None, group=False):
+            async def feed(index, text=None, group=False):
                 message = {"message_id": index, "date": 0, "chat": {"id": 111, "type": "group" if group else "private"},
                            "from": {"id": 111, "is_bot": False, "first_name": "Synthetic"}}
                 if text is not None:
                     message["text"] = text
                     if text.startswith("/"):
                         message["entities"] = [{"type": "bot_command", "offset": 0, "length": len(text)}]
-                if contact:
-                    message["contact"] = contact
                 await dispatcher.feed_update(telegram, Update.model_validate({"update_id": index, "message": message}))
             agent._state[111] = {"old": True}
             await feed(1, "/start")
@@ -218,11 +216,9 @@ class MergeTelegramTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(agent, "reply", wraps=agent.reply) as reply:
                 await feed(3, "Здравствуйте")
                 self.assertEqual(reply.await_args.args[1], "Здравствуйте")
-                await feed(4, contact={"phone_number": "00000000000", "first_name": "Synthetic", "user_id": 111})
-                self.assertEqual(reply.await_args.args[1], "Мой номер телефона: 00000000000")
-                await feed(5)
-                await feed(6, "group message", group=True)
-                self.assertEqual(reply.await_count, 2)
+                await feed(4)
+                await feed(5, "group message", group=True)
+                self.assertEqual(reply.await_count, 1)
 
         with patch.object(module, "load_config", return_value=cfg), \
              patch.object(module, "Bot", side_effect=lambda token: Bot(token, session=session)), \
@@ -232,7 +228,7 @@ class MergeTelegramTests(unittest.IsolatedAsyncioTestCase):
         webhooks = [method for method in session.methods if isinstance(method, DeleteWebhook)]
         self.assertEqual(len(webhooks), 1)
         self.assertFalse(webhooks[0].drop_pending_updates)
-        self.assertEqual(len([method for method in session.methods if isinstance(method, SendMessage)]), 5)
+        self.assertEqual(len([method for method in session.methods if isinstance(method, SendMessage)]), 4)
 
     async def test_telegram_session_closes_when_agent_initialization_fails(self):
         module = self.module()

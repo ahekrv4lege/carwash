@@ -9,7 +9,7 @@ from contextlib import suppress
 
 from aiogram import Bot, Dispatcher, F as Filter, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import Message
 from aiogram.utils.chat_action import ChatActionSender
 
 from admin import AdminReporter
@@ -115,14 +115,8 @@ async def ask_agent(message: Message, agent: Agent, reporter: AdminReporter, tex
 @router.message(CommandStart())
 async def cmd_start(message: Message, agent: Agent, config: Config) -> None:
     agent.reset(message.from_user.id)
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📞 Отправить номер телефона", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
     await message.answer(
         f"Здравствуйте! Автомойка «{config.carwash_name}». Подскажу цены и помогу записаться. Чем помочь?",
-        reply_markup=keyboard,
     )
 
 
@@ -130,11 +124,6 @@ async def cmd_start(message: Message, agent: Agent, config: Config) -> None:
 async def cmd_reset(message: Message, agent: Agent) -> None:
     agent.reset(message.from_user.id)
     await message.answer("Диалог сброшен. Чем могу помочь?")
-
-
-@router.message(Filter.contact)
-async def on_contact(message: Message, agent: Agent, reporter: AdminReporter) -> None:
-    await ask_agent(message, agent, reporter, f"Мой номер телефона: {message.contact.phone_number}")
 
 
 @router.message(Filter.text)

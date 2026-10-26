@@ -152,14 +152,13 @@ class MessageBatchingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results, ["reply"] * 3)
         self.assertFalse(self.batcher.pending)
 
-    async def test_commands_contacts_and_confirmation_are_separate_boundaries(self):
+    async def test_commands_and_confirmation_are_separate_boundaries(self):
         handler = AsyncMock()
         messages = [self.message("Лансер"), self.message("/reset"), self.message("Иван"),
-                    self.message(None, contact={"phone_number": "00000000000", "first_name": "Synthetic"}),
                     self.message("Да, подтверждаю запись"), self.message("в 11")]
         await asyncio.gather(*(self.batcher(handler, message, self.data) for message in messages))
         self.assertEqual([call.args[0].text for call in handler.await_args_list],
-                         ["Лансер", "/reset", "Иван", None, "Да, подтверждаю запись", "в 11"])
+                         ["Лансер", "/reset", "Иван", "Да, подтверждаю запись", "в 11"])
 
     async def test_next_reply_waits_until_previous_delivery_finishes(self):
         entered, release = asyncio.Event(), asyncio.Event()
