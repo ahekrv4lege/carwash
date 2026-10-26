@@ -14,7 +14,7 @@ Google-таблицы. Модель только понимает клиента
 
 ```
    Клиент ◄──► Telegram (bot.py) ◄──► Agent (ai.py) ◄──► провайдеры AI (providers.py)
-                                    │    промпт, история,     │ Polza: DeepSeek V4.1 Flash (open-inference/fp4)
+                                    │    промпт, история,     │ Polza: DeepSeek V4.1 Flash (sail-research/fp4:batch)
                                     │    петля инструментов   ▼
                                     │                    вызовы инструментов
                                     ▼
@@ -213,7 +213,7 @@ Google Sheets возвращает сырые строки без пояснен
 
 ### 4.7. Провайдеры AI с запасными
 
-Текущий основной маршрут — Polza, DeepSeek V4.1 Flash через `open-inference/fp4` без
+Текущий основной маршрут — Polza, DeepSeek V4.1 Flash через `sail-research/fp4:batch` без
 резервного провайдера (`allow_fallbacks=false`). Другие совместимые API и резервные маршруты
 поддерживаются настройками, но не включены в текущий `.env`. Код также поддерживает второй
 ключ (`LLM_API_KEY_2`) и до трёх резервных маршрутов (`LLM_FALLBACK_N_BASE_URL/_API_KEY/_MODEL`);
@@ -277,7 +277,7 @@ python run.py --check    # проверка настроек и таблицы �
 | `SHEETS_SCHEMA_CHECK_INTERVAL_HOURS` | `24` | период полной перепроверки карты |
 | `SHEETS_MAPPING_FILE` | `.runtime/sheets-mapping.json` | файл карты |
 | `SHEETS_AI_MAPPING_ENABLED` (+ `SHEETS_AI_BASE_URL/_API_KEY/_MODEL/_JSON_MODE`) | false | AI-подсказки по заголовкам |
-| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | Polza: DeepSeek V4.1 Flash, `open-inference/fp4` | основной AI-маршрут |
+| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | Polza: DeepSeek V4.1 Flash, `sail-research/fp4:batch` | основной AI-маршрут |
 | `LLM_API_KEY_2` | пусто | второй ключ тем же API |
 | `LLM_FALLBACK_N_BASE_URL/_API_KEY/_MODEL` (N=1..3) | пусто | резервные провайдеры |
 | `AI_ENABLED` | true | общий выключатель диалогов |

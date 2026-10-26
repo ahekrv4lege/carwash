@@ -192,7 +192,7 @@ def _ai_settings(sheets_only: bool) -> dict:
     enabled = _bool("AI_ENABLED", True)
     primary_key = os.getenv("LLM_API_KEY", "").strip()
     primary_model = os.getenv(
-        "LLM_MODEL", "deepseek/deepseek-v4.1-flash@provider=open-inference/fp4&allow_fallbacks=false"
+        "LLM_MODEL", "deepseek/deepseek-v4.1-flash@provider=sail-research/fp4:batch&allow_fallbacks=false"
     ).strip()
     primary_url = _api_url("LLM_BASE_URL", os.getenv("LLM_BASE_URL", "https://polza.ai/api/v1").strip())
     base_url = _api_url("AI_BASE_URL", os.getenv("AI_BASE_URL", primary_url).strip())
