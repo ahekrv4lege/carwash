@@ -22,6 +22,12 @@ from conversation import (CATALOG_FIELDS, FIELDS, PHONE, apply_patch, folded, li
 log = logging.getLogger(__name__)
 PROVIDER_COOLDOWN_SEC = 60
 
+# Разрешение монотонных часов (на Windows — тики таймера около 16 мс).
+# Сравнения бюджетов на отрезках меньше одного тика бессмысленны: ожидание
+# может вернуться раньше дедлайна из-за квантования таймера. На Linux
+# разрешение — наносекунды, и поведение не меняется.
+MONOTONIC_RESOLUTION = time.get_clock_info("monotonic").resolution
+
 
 @dataclass
 class ChatUser:
@@ -601,7 +607,7 @@ car — исходные слова без исправления падежа/�
             if self._provider_retry_at[index] > time.monotonic() or index in self._provider_probes:
                 continue
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if remaining <= MONOTONIC_RESOLUTION:
                 raise asyncio.TimeoutError("Истёк общий бюджет AI-запроса")
             recovering = bool(self._provider_retry_at[index])
             if recovering:

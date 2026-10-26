@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 import time
@@ -396,7 +397,16 @@ class Store:
         if self._adaptive and observed is None:
             observed = self._adaptive.observe(roles=("services", "tariffs"))
         headers, rows = self._table(self.config.sheet_services, observed)
-        classes = [header for header in headers if header and header.lower() not in SERVICE_FIXED_COLS]
+        # Классы без повторов: две колонки с одинаковым названием (даже в
+        # разном регистре) не должны удваивать выбор в прайсе и подсказках.
+        classes: list[str] = []
+        seen_classes: set[str] = set()
+        for header in headers:
+            label = str(header).strip()
+            lowered = label.lower()
+            if lowered and lowered not in SERVICE_FIXED_COLS and lowered not in seen_classes:
+                seen_classes.add(lowered)
+                classes.append(label)
 
         services: dict[str, Service] = {}
         for record in rows:
@@ -406,7 +416,9 @@ class Store:
             prices: dict[str, int] = {}
             for class_name in classes:
                 price = to_number(record.get(class_name, ""))
-                if price is not None:
+                # Отрицательные и нечисловые значения — испорченные данные:
+                # цена для класса не указана, а не ушла в расчёт со знаком минус.
+                if price is not None and math.isfinite(price) and price >= 0:
                     prices[class_name] = int(round(price))
             services[name.lower()] = Service(
                 name=name,

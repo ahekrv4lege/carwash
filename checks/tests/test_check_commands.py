@@ -48,8 +48,11 @@ class CheckCommands(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 socket.getaddrinfo("example.invalid", 443)
             with socket.socket() as connection:
+                # Петля (127.0.0.1) не блокируется: на Windows внутренние
+                # self-pipe asyncio требуют её, охраняются только внешние
+                # адреса. 203.0.113.1 — тестовый диапазон (TEST-NET-3).
                 with self.assertRaises(AssertionError):
-                    connection.connect(("127.0.0.1", 1))
+                    connection.connect(("203.0.113.1", 1))
         suite = unittest.TestSuite([unittest.FunctionTestCase(isolated)])
         with patch.object(sys, "argv", [str(commands.FOLDER / "run.py")]), \
              patch.dict(sys.modules, {"live": live}), patch.dict(os.environ, {"LLM_API_KEY": "diagnostic-sentinel"}), \

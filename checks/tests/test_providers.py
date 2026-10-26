@@ -437,7 +437,10 @@ class Fallback(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.clients[0].chat.completions.create.await_count, 2)
 
     async def test_total_time_budget_includes_all_providers(self):
-        self.agent.config = replace(self.agent.config, ai_timeout_sec=0.04, ai_request_budget_sec=0.12)
+        # Значения кратны масштабу real-конфигурации (~12 с / 45 с), но
+        # растянуты под разрешение таймера Windows (~16 мс), чтобы доли
+        # бюджета всегда превышали тик часов и тест не зависел от квантования.
+        self.agent.config = replace(self.agent.config, ai_timeout_sec=0.12, ai_request_budget_sec=0.45)
         async def hang(**arguments):
             await asyncio.Event().wait()
         self.clients[0].chat.completions.create.side_effect = hang

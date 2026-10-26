@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -141,13 +142,20 @@ class MergeConfigTests(unittest.TestCase):
     def test_real_ai_client_initialization_uses_restored_provider_without_inference(self):
         cfg = self.load(LLM_API_KEY="synthetic-llm", LLM_MODEL="team-model")
         # Инициализация настоящего SDK не должна отправлять запросы.
-        with patch("socket.socket.connect", side_effect=AssertionError("Network disabled")) as send:
+        # Жёстко блокируем только внешние адреса: локальную петлю использует
+        # self-pipe asyncio на Windows, полностью блокировать её нельзя.
+        def denied(self_source, address, *rest):
+            host = address[0] if isinstance(address, (tuple, list)) and address else address
+            if isinstance(host, str) and host not in ("127.0.0.1", "::1", "localhost") and not host.endswith(".localhost"):
+                raise AssertionError("Network disabled")
+            return connect_original(self_source, address, *rest)
+        connect_original = socket.socket.connect
+        with patch("socket.socket.connect", new=denied):
             agent = Agent(cfg, Mock())
             self.assertEqual(str(agent.client.base_url), "https://api.xkiro.com/v1/")
             self.assertEqual(agent.client.api_key, "synthetic-llm")
             import asyncio
             asyncio.run(agent.close())
-        send.assert_not_called()
 
 
 class OfflineTelegram(BaseSession):

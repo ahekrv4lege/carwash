@@ -49,8 +49,60 @@ class Results(unittest.TextTestResult):
                 self.stream.writeln(line)
 
 
-def block_network(*arguments, **options):
-    raise AssertionError("Сеть запрещена в изолированном режиме")
+_LOOPBACK_HOSTS = {"", "localhost", "127.0.0.1", "::1", "::", "0.0.0.0"}
+
+
+def _loopback(address):
+    """Адрес разрешён, если это локальная петля или не адрес вовсе (None, порт)."""
+    if address is None or isinstance(address, int):
+        return True
+    if isinstance(address, (tuple, list)) and address:
+        address = address[0]
+    if not isinstance(address, str):
+        return False
+    lowered = address.lower()
+    return lowered in _LOOPBACK_HOSTS or lowered.endswith(".localhost")
+
+
+def deny_external(original, take):
+    """Блокирует внешнюю сеть, но разрешает локальную петлю.
+
+    Полная блокировка сокетов ломала бы запуск на Windows: событийный цикл
+    asyncio создаёт self-pipe через эмулированный socketpair, который
+    выполняет настоящий connect на 127.0.0.1 (на Linux socketpair — системный
+    вызов, поэтому проблема не проявлялась у команды). Внешние вызовы к
+    Telegram/Sheets/LLM по-прежнему запрещены.
+
+    take — «address» (адрес — первый позиционный аргумент) либо «sock»
+    (перед self адрес идёт вторым; у sendto учитывается форма
+    sendto(data, flags, address)).
+    """
+
+    def _target(arguments):
+        if take == "address":
+            return arguments[0] if arguments else None
+        if len(arguments) < 2:
+            return None
+        address = arguments[1]
+        if isinstance(address, (bytes, bytearray, memoryview, int)):
+            # sendto(self, data) без адреса (сокет уже подключён)
+            # либо sendto(self, data, flags, address).
+            return arguments[2] if len(arguments) >= 3 else None
+        return address
+
+    def guarded(*arguments, **options):
+        target = _target(arguments)
+        if not _loopback(target):
+            raise AssertionError(f"Сеть запрещена в изолированном режиме: {target!r}")
+        return original(*arguments, **options)
+
+    return guarded
+
+
+_CONNECT = deny_external(socket.socket.connect, "sock")
+_CONNECT_EX = deny_external(socket.socket.connect_ex, "sock")
+_GETADDRINFO = deny_external(socket.getaddrinfo, "address")
+_SENDTO = deny_external(socket.socket.sendto, "sock")
 
 
 def main():
@@ -78,14 +130,19 @@ def main():
             safe = {name: value for name, value in os.environ.items() if name in {
                 "PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "LANG", "LC_ALL",
                 "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "TMPDIR", "PYTHONPATH",
+                # Windows-переменные системного окружения: некоторые библиотеки
+                # (например, gspread — APPDATA) читают их при импорте и падают
+                # с KeyError без них. Секретов среди них нет.
+                "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "SYSTEMDRIVE", "COMSPEC",
+                "PATHEXT", "OS", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
             }}
             safe.update(PYTHONDONTWRITEBYTECODE="1", PYTHON_DOTENV_DISABLED="1")
             context.enter_context(patch.dict(os.environ, safe, clear=True))
             context.enter_context(patch("dotenv.load_dotenv", return_value=False))
-            context.enter_context(patch.object(socket.socket, "connect", block_network))
-            context.enter_context(patch.object(socket.socket, "connect_ex", block_network))
-            context.enter_context(patch.object(socket, "getaddrinfo", block_network))
-            context.enter_context(patch.object(socket.socket, "sendto", block_network))
+            context.enter_context(patch.object(socket.socket, "connect", _CONNECT))
+            context.enter_context(patch.object(socket.socket, "connect_ex", _CONNECT_EX))
+            context.enter_context(patch.object(socket, "getaddrinfo", _GETADDRINFO))
+            context.enter_context(patch.object(socket.socket, "sendto", _SENDTO))
             loader = unittest.defaultTestLoader
             suite = loader.loadTestsFromNames(args.names) if args.names else loader.discover(str(FOLDER / "tests"), top_level_dir=str(FOLDER))
             print("ISOLATED: настоящие .env и ключи не загружаются; сеть запрещена.", flush=True)
