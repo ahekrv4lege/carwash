@@ -77,7 +77,7 @@ class ProviderConfig:
 @dataclass(frozen=True)
 class Config:
     # Telegram / LLM-провайдер (OpenAI-совместимый API).
-    # LLM_* — основной xKiro; AI_* — явные переопределения совместимого API.
+    # LLM_* — основной Polza; AI_* — явные переопределения совместимого API.
     bot_token: str
     # Google Sheets
     spreadsheet_id: str
@@ -108,7 +108,7 @@ class Config:
     sheets_force_schema_refresh: bool = False
     sheets_mapping_file: str = str(ROOT / ".runtime/sheets-mapping.json")
     ai_enabled: bool = True
-    ai_base_url: str = "https://api.xkiro.com/v1"
+    ai_base_url: str = "https://polza.ai/api/v1"
     ai_api_key: str = ""
     ai_model: str = ""
     ai_timeout_sec: float = 60
@@ -191,8 +191,10 @@ def _generation_settings() -> dict:
 def _ai_settings(sheets_only: bool) -> dict:
     enabled = _bool("AI_ENABLED", True)
     primary_key = os.getenv("LLM_API_KEY", "").strip()
-    primary_model = os.getenv("LLM_MODEL", "qwen/qwen3.8-max:free").strip()
-    primary_url = _api_url("LLM_BASE_URL", os.getenv("LLM_BASE_URL", "https://api.xkiro.com/v1").strip())
+    primary_model = os.getenv(
+        "LLM_MODEL", "deepseek/deepseek-v4.1-flash@provider=open-inference/fp4&allow_fallbacks=false"
+    ).strip()
+    primary_url = _api_url("LLM_BASE_URL", os.getenv("LLM_BASE_URL", "https://polza.ai/api/v1").strip())
     base_url = _api_url("AI_BASE_URL", os.getenv("AI_BASE_URL", primary_url).strip())
     same_provider = urlsplit(base_url)[:2] == urlsplit(primary_url)[:2]
     api_key = os.getenv("AI_API_KEY", "").strip() or (primary_key if same_provider else "")

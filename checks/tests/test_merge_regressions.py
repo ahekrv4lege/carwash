@@ -34,7 +34,7 @@ class MergeConfigTests(unittest.TestCase):
         cfg = self.load(LLM_API_KEY="synthetic-xkiro")
         self.assertEqual(client_options(cfg)["base_url"], "https://api.xkiro.com/v1")
         self.assertEqual(client_options(cfg)["api_key"], "synthetic-xkiro")
-        self.assertEqual(completion_options(cfg)["model"], "qwen/qwen3.8-max:free")
+        self.assertEqual(completion_options(cfg)["model"], "minimax/minimax-m3.1-flash")
 
     def test_llm_custom_configuration_keeps_its_key_url_and_model(self):
         cfg = self.load(LLM_API_KEY="synthetic-llm", LLM_BASE_URL="https://llm.invalid/v1/",
@@ -45,7 +45,7 @@ class MergeConfigTests(unittest.TestCase):
 
     def test_llm_custom_url_preserves_original_default_model(self):
         cfg = self.load(LLM_API_KEY="synthetic-llm", LLM_BASE_URL="https://llm.invalid/v1")
-        self.assertEqual(completion_options(cfg)["model"], "qwen/qwen3.8-max:free")
+        self.assertEqual(completion_options(cfg)["model"], "minimax/minimax-m3.1-flash")
 
     def test_second_llm_key_does_not_override_primary(self):
         cfg = self.load(LLM_API_KEY="synthetic-primary", LLM_MODEL="team-model", LLM_API_KEY_2="synthetic-second")

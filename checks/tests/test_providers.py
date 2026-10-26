@@ -108,7 +108,7 @@ class ProviderTests(unittest.TestCase):
 
     def test_existing_xkiro_defaults_are_preserved(self):
         cfg = self.load()
-        self.assertEqual(cfg.ai_model, "qwen/qwen3.8-max:free")
+        self.assertEqual(cfg.ai_model, "minimax/minimax-m3.1-flash")
         options = client_options(cfg)
         self.assertEqual(options["base_url"], "https://api.xkiro.com/v1")
         self.assertEqual(options["api_key"], ENV["LLM_API_KEY"])

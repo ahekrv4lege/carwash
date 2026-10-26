@@ -34,8 +34,14 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
     async def say(self, text, *outputs):
         self.transport.side_effect = list(outputs)
         result = await self.agent.reply(self.user, text)
-        self.agent.mark_delivered(111, self.agent.delivery_token(111))
+        self.agent.mark_delivered(111, self.agent.delivery_token(111, result))
         return result
+
+    async def confirm(self):
+        offer_id = self.agent._pending.get(111, {}).get("offer_id", "missing")
+        answer = await self.agent.proposal_action(self.user, offer_id, "confirm")
+        self.agent.mark_delivered(111, self.agent.delivery_token(111, answer))
+        return answer
 
     async def offer(self):
         return await self.say(json.dumps(ARGS, ensure_ascii=False), response(calls=[('create_booking', ARGS)]))
@@ -48,7 +54,7 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
             self.agent.reset(111)
             return await execute(*args, **kwargs)
         with patch.object(self.agent, '_execute', side_effect=reset_then_execute):
-            answer = await self.say('Да')
+            answer = await self.confirm()
         self.assertIn('сброшен', answer)
         self.assertNotIn(111, self.agent._pending)
         self.assertNotIn(111, self.agent._history)
@@ -83,7 +89,7 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
         self.transport.side_effect = [response(calls=[('create_booking', {})]), response(calls=[
             ('respond', {'reply': '', 'facts': facts}), ('create_booking', {})])]
         answer = await self.agent.reply(self.user, json.dumps(ARGS, ensure_ascii=False))
-        self.assertIn('Подтверждаете', answer)
+        self.assertIn('выберите кнопку', answer)
         self.assertIn(111, self.agent._pending)
         self.assertFalse(self.spreadsheet.worksheet('Записи').writes)
 
@@ -104,7 +110,7 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_repeat_confirmation_uses_python_receipt_without_model(self):
         await self.offer()
-        await self.say('Да')
+        await self.confirm()
         before = self.transport.call_count
         answer = await self.say('Да')
         self.assertEqual(self.transport.call_count, before)
@@ -147,11 +153,11 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
         await self.offer()
         with patch.object(self.agent, '_execute', new=AsyncMock(side_effect=asyncio.CancelledError)):
             with self.assertRaises(asyncio.CancelledError):
-                await self.agent.reply(self.user, 'Да')
+                await self.confirm()
         self.assertEqual(self.agent._state[111]['stage'], 'uncertain')
         self.assertFalse(self.agent._state[111]['confirmed'])
         before = self.transport.call_count
-        await self.say('Да')
+        await self.confirm()
         self.assertEqual(self.transport.call_count, before)
 
     async def test_oversize_removes_visible_pending_metadata_without_erasing_facts(self):
@@ -286,7 +292,7 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ordinary_reply_after_booking_is_not_replaced_in_history(self):
         await self.offer()
-        await self.say('Да')
+        await self.confirm()
         await self.say('А адрес?',response('Адрес уточнит администратор.'))
         self.assertEqual(self.agent._history[111][-1]['content'],'Адрес уточнит администратор.')
 
@@ -327,7 +333,7 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('70002223344',proposal)
         self.assertNotIn('Базовый',proposal)
         with patch.object(self.store,'create_booking',wraps=self.store.create_booking) as write:
-            answer=await self.say('Да')
+            answer=await self.confirm()
             self.assertEqual(write.call_count,1)
             got=write.call_args.kwargs
             self.assertEqual((got['car'],got['name'],got['phone'],got['date_str'],got['time_str'],got['services']),

@@ -51,7 +51,11 @@ async def run_dialog(config, folder, emit=print):
         assert pending["args"]["date"] == day and pending["args"]["time"] == "11:00"
         assert pending["quote"]["total"] == 700
         assert not spreadsheet.worksheet("Записи").writes, "Запись в таблицу до подтверждения"
-        await say("Да, подтверждаю запись")
+        offer_id = pending["offer_id"]
+        emit("Клиент: кнопка Подтвердить")
+        answer = await agent.proposal_action(user, offer_id, "confirm")
+        emit(f"Бот: {answer}\n")
+        agent.mark_delivered(user.id, agent.delivery_token(user.id, answer))
         bookings = store.my_bookings(user.id)["bookings"]
         assert len(bookings) == 1 and bookings[0]["date"] == day and bookings[0]["time"] == "11:00"
         assert str(bookings[0]["total"]) == "700"

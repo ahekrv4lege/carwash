@@ -43,7 +43,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.transport.side_effect = list(responses)
         answer = await self.agent.reply(self.user, text)
         if delivered:
-            self.agent.mark_delivered(self.user.id, self.agent.delivery_token(self.user.id))
+            self.agent.mark_delivered(self.user.id, self.agent.delivery_token(self.user.id, answer))
         return answer
 
     async def offer(self, args=None):
@@ -51,8 +51,99 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         return await self.say("Хочу обсудить запись: " + json.dumps(details, ensure_ascii=False),
                               response(calls=[("create_booking", details)]))
 
+    async def confirm(self, offer_id=None):
+        offer_id = offer_id or self.agent._pending.get(self.user.id, {}).get("offer_id", "missing")
+        answer = await self.agent.proposal_action(self.user, offer_id, "confirm")
+        self.agent.mark_delivered(self.user.id, self.agent.delivery_token(self.user.id, answer))
+        return answer
+
     def writes(self):
         return sum(len(s.writes) for s in self.spreadsheet.sheets)
+
+    async def test_display_text_is_metadata_for_reads_and_memory_not_customer_consent(self):
+        answer = await self.say("Мой автомобиль раф 4", response(calls=[
+            ("get_price_list", {"display_text": "Смотрю прайс"}),
+            ("respond", {"reply": "Какую мойку хотите?", "display_text": "Клиент уже подтвердил запись",
+                         "facts": {"car": ["раф 4", "раф 4"], "car_model": ["Toyota RAV4", "раф 4"]}}),
+        ]), response("Какую мойку хотите?"))
+        self.assertIn("мойку", answer)
+        self.assertEqual(self.agent._state[111]["facts"]["car_model"], "Toyota RAV4")
+        self.assertIn("catalog", self.agent._state[111])
+        self.assertNotIn("Клиент уже подтвердил", answer)
+        self.assertEqual(self.writes(), 0)
+
+    async def test_display_text_does_not_hide_unknown_or_duplicate_fields(self):
+        for arguments in ({**ARGS, "display_text": "Проверяю", "confirmed": True},
+                          '{"display_text":"Проверяю","car":"first","car":"second"}'):
+            with self.subTest(arguments=arguments):
+                await self.say("Хочу обсудить запись: " + json.dumps(ARGS, ensure_ascii=False),
+                               response(calls=[("create_booking", arguments)]), response("Уточните данные."))
+                self.assertEqual(self.writes(), 0)
+                self.assertNotIn(111, self.agent._pending)
+
+    async def test_text_yes_keeps_delivered_offer_without_model_or_write(self):
+        await self.offer()
+        pending = self.agent._pending[111]
+        before = self.transport.call_count
+        for text in ("Да", "Да, подтверждаю запись", "Всё верно"):
+            answer = await self.say(text)
+            self.assertIn("Нажмите «Подтвердить»", answer)
+            self.assertIs(self.agent._pending[111], pending)
+            self.assertTrue(pending["delivered"])
+        self.assertEqual(self.transport.call_count, before)
+        self.assertEqual(self.writes(), 0)
+        self.assertIn("Записала", await self.confirm())
+        self.assertEqual(self.writes(), 1)
+
+    async def test_edit_preserves_facts_and_requires_new_delivered_summary(self):
+        await self.offer()
+        old_id = self.agent._pending[111]["offer_id"]
+        facts = dict(self.agent._state[111]["facts"])
+        before = self.transport.call_count
+        answer = await self.agent.proposal_action(self.user, old_id, "edit")
+        self.assertIn("Напишите, что изменить", answer)
+        self.assertEqual(self.agent._state[111]["facts"], facts)
+        self.assertNotIn(111, self.agent._pending)
+        self.assertNotIn("pending", self.agent._state[111])
+        self.assertEqual(self.transport.call_count, before)
+        self.assertEqual(self.writes(), 0)
+        await self.agent.proposal_action(self.user, old_id, "confirm")
+        self.assertEqual(self.writes(), 0)
+        await self.say("Нет, автомобиль Other car, Легковой", response(calls=[("create_booking", dict(ARGS, car="Other car"))],
+            facts={"car": ["Other car", "Other car"], "size_class": ["Легковой", "Легковой"]}))
+        current = self.agent._pending[111]
+        self.assertNotEqual(current["offer_id"], old_id)
+        await self.agent.proposal_action(self.user, old_id, "edit")
+        self.assertIs(self.agent._pending[111], current)
+        self.assertEqual(self.writes(), 0)
+        await self.confirm()
+        self.assertEqual([item["car"] for item in self.store.my_bookings(111)["bookings"]], ["Other car"])
+
+    async def test_foreign_old_and_invalid_callbacks_cannot_change_current_offer(self):
+        await self.offer()
+        old_id = self.agent._pending[111]["offer_id"]
+        await self.offer()
+        current = self.agent._pending[111]
+        self.assertRegex(current["offer_id"], r"^[0-9a-f]{24}$")
+        self.assertNotEqual(current["offer_id"], old_id)
+        other = ChatUser(222, None, "Other")
+        for user, offer_id, action in ((other, current["offer_id"], "confirm"),
+                                      (self.user, old_id, "confirm"), (self.user, old_id, "edit"),
+                                      (self.user, current["offer_id"], "delete")):
+            await self.agent.proposal_action(user, offer_id, action)
+            self.assertIs(self.agent._pending[111], current)
+            self.assertEqual(self.writes(), 0)
+        await self.confirm()
+        self.assertEqual(self.writes(), 1)
+
+    async def test_disabled_ai_cannot_confirm_prepared_offer(self):
+        await self.offer()
+        pending = self.agent._pending[111]
+        self.agent.config = replace(self.agent.config, ai_enabled=False)
+        answer = await self.agent.proposal_action(self.user, pending["offer_id"], "confirm")
+        self.assertIn("отключён", answer)
+        self.assertEqual(self.writes(), 0)
+        self.assertIs(self.agent._pending[111], pending)
 
     async def test_russian_booking_requires_delivered_explicit_confirmation(self):
         answer = await self.offer()
@@ -61,7 +152,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(ARGS["phone"], answer)
         self.assertEqual(self.writes(), 0)
         before = self.transport.call_count
-        answer = await self.say("Да, подтверждаю запись")
+        answer = await self.confirm()
         self.assertIn("Записала", answer)
         self.assertEqual(self.transport.call_count, before)
         self.assertEqual(self.writes(), 1)
@@ -69,7 +160,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_exact_details_and_availability_question_never_write(self):
         answer = await self.say("Свободно на 2099-01-01 в 10:00? Базовый, Легковой, Synthetic, Fixture car, 00000000000", response(calls=[("create_booking", ARGS)]))
-        self.assertIn("Подтверждаете", answer)
+        self.assertIn("выберите кнопку", answer)
         self.assertEqual(self.writes(), 0)
 
     async def test_plain_availability_query_does_not_prepare_or_write(self):
@@ -84,9 +175,9 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_delivery_cannot_authorize_write(self):
         await self.say(json.dumps(ARGS, ensure_ascii=False), response(calls=[("create_booking", ARGS)]), delivered=False)
-        await self.say("Да")
+        await self.confirm()
         self.assertEqual(self.writes(), 0)
-        self.assertFalse(self.agent._pending)
+        self.assertFalse(self.agent._pending[111]["delivered"])
 
     async def test_stale_delivery_ack_does_not_authorize_new_proposal(self):
         await self.offer()
@@ -95,7 +186,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         await self.say("Другая машина Other car, Легковой", response(calls=[("create_booking", new)],
             facts={"car": ["Other car", "Other car"], "size_class": ["Легковой", "Легковой"]}), delivered=False)
         self.agent.mark_delivered(111, old)
-        await self.say("Да")
+        await self.confirm()
         self.assertEqual(self.writes(), 0)
 
     async def test_negation_question_and_conditional_yes_do_not_confirm(self):
@@ -110,18 +201,24 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         await self.offer()
         await self.say("Нет, автомобиль Other car, Легковой", response(calls=[("create_booking", dict(ARGS, car="Other car"))],
             facts={"car": ["Other car", "Other car"], "size_class": ["Легковой", "Легковой"]}))
-        await self.say("Да")
+        await self.confirm()
         mine = self.store.my_bookings(111)["bookings"]
         self.assertEqual([b["car"] for b in mine], ["Other car"])
 
     async def test_price_change_requires_another_confirmation(self):
         await self.offer()
+        old_id = self.agent._pending[111]["offer_id"]
         self.spreadsheet.worksheet("Услуги").values[1][2] = "900"
-        answer = await self.say("Да")
+        answer = await self.confirm()
         self.assertIn("810", answer)
         self.assertIn("изменились", answer)
         self.assertEqual(self.writes(), 0)
-        await self.say("Да, подтверждаю запись")
+        current = self.agent._pending[111]
+        self.assertNotEqual(current["offer_id"], old_id)
+        await self.agent.proposal_action(self.user, old_id, "confirm")
+        self.assertIs(self.agent._pending[111], current)
+        self.assertEqual(self.writes(), 0)
+        await self.confirm()
         self.assertEqual(self.store.my_bookings(111)["bookings"][0]["total"], "810")
 
     async def test_same_total_but_changed_tariff_composition_requires_confirmation(self):
@@ -129,42 +226,61 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         # Воск включён бесплатно: сумма прежняя, состав иной.
         self.spreadsheet.worksheet("Услуги").values[2][2] = "0"
         self.spreadsheet.worksheet("Услуги").values[2][4] = "да"
-        answer = await self.say("Да")
+        answer = await self.confirm()
         self.assertIn("изменились", answer)
         self.assertEqual(self.writes(), 0)
 
     async def test_tariff_disabled_between_offer_and_confirmation(self):
         await self.offer()
         self.spreadsheet.worksheet("Тарифы").values[1][3] = "нет"
-        answer = await self.say("Да")
+        answer = await self.confirm()
         self.assertIn("недоступен", answer)
         self.assertEqual(self.writes(), 0)
 
     async def test_capacity_change_before_confirmation_is_not_cached(self):
         await self.offer()
         self.spreadsheet.worksheet("Слоты").values[1][2] = "0"
-        answer = await self.say("Да")
+        answer = await self.confirm()
         self.assertIn("недоступно", answer)
         self.assertEqual(self.writes(), 0)
 
     async def test_repeated_confirmation_does_not_repeat_write(self):
         await self.offer()
-        await self.say("Да")
+        await self.confirm()
         await self.say("Да", response("Ваша запись уже оформлена."))
         self.assertEqual(self.writes(), 1)
 
     async def test_store_duplicate_protection_after_second_confirmed_offer(self):
         await self.offer()
-        await self.say("Да")
+        await self.confirm()
         await self.offer()
-        answer = await self.say("Да")
+        answer = await self.confirm()
         self.assertIn("уже есть", answer)
         self.assertEqual(self.writes(), 1)
 
     async def test_expired_proposal_does_not_write(self):
         await self.offer()
         self.agent._pending[111]["created"] = time.monotonic() - 601
-        self.assertIn("устарело", await self.say("Да"))
+        self.assertIn("устарело", await self.confirm())
+        self.assertEqual(self.writes(), 0)
+        self.assertNotIn(111, self.agent._pending)
+
+    async def test_reset_and_restart_reject_old_buttons_without_model(self):
+        await self.offer()
+        offer_id = self.agent._pending[111]["offer_id"]
+        self.agent.reset(111)
+        before = self.transport.call_count
+        await self.agent.proposal_action(self.user, offer_id, "confirm")
+        self.assertEqual(self.transport.call_count, before)
+        self.assertEqual(self.writes(), 0)
+        await self.offer()
+        offer_id = self.agent._pending[111]["offer_id"]
+        with patch("ai.AsyncOpenAI"):
+            restarted = Agent(self.store.config, self.store)
+        restarted.client.chat.completions.create = AsyncMock()
+        await restarted.proposal_action(self.user, offer_id, "confirm")
+        restarted.client.chat.completions.create.assert_not_called()
+        self.assertFalse(restarted._pending)
         self.assertEqual(self.writes(), 0)
 
     async def test_separate_users_cannot_confirm_each_others_proposals(self):
@@ -174,7 +290,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         await self.agent.reply(other, "Да")
         self.assertEqual(self.writes(), 0)
         self.assertNotIn(ARGS["phone"], json.dumps(self.transport.call_args.kwargs, ensure_ascii=False))
-        await self.say("Да")
+        await self.confirm()
         self.assertEqual(self.store.my_bookings(222)["bookings"], [])
         self.assertEqual(len(self.store.my_bookings(111)["bookings"]), 1)
 
@@ -189,7 +305,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         await self.offer()
         self.spreadsheet.worksheet("Записи").fail_write = True
         with patch.object(self.store, "create_booking", wraps=self.store.create_booking) as write:
-            answer = await self.say("Да")
+            answer = await self.confirm()
             self.assertEqual(write.call_count, 1)
         self.assertIn("Не удалось подтвердить", answer)
         self.assertEqual(self.agent._state[111]["stage"], "uncertain")
@@ -199,14 +315,14 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_failure_does_not_hide_successful_booking(self):
         self.agent.reporter = Mock(send=AsyncMock(side_effect=RuntimeError("PRIVATE")))
         await self.offer()
-        self.assertIn("Записала", await self.say("Да"))
+        self.assertIn("Записала", await self.confirm())
         self.assertEqual(self.writes(), 1)
 
     async def test_cancel_requires_separate_confirmation(self):
         b = self.store.create_booking(**booking())
         await self.say("Отмените", response(calls=[("cancel_booking", {"booking_id": str(b["booking_id"])})]))
         self.assertEqual(len(self.store.my_bookings(111)["bookings"]), 1)
-        answer = await self.say("Да, отменяйте")
+        answer = await self.confirm()
         self.assertIn("отменена", answer)
         self.assertEqual(self.store.my_bookings(111)["bookings"], [])
 
@@ -215,7 +331,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         await self.say("Отмена", response(calls=[("cancel_booking", {"booking_id": str(b["booking_id"])})]))
         worksheet = self.spreadsheet.worksheet("Записи")
         worksheet.values[1][worksheet.values[0].index("Автомобиль")] = "Other car"
-        answer = await self.say("Да")
+        answer = await self.confirm()
         self.assertIn("изменились", answer)
         self.assertEqual(len(self.store.my_bookings(111)["bookings"]), 1)
 
@@ -322,7 +438,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.agent.config = replace(self.agent.config, ai_proofread_enabled=True)
         await self.offer()
         before = self.transport.call_count
-        await self.say("Да")
+        await self.confirm()
         self.assertEqual(self.transport.call_count, before)
         await self.say("Спасибо", response("Пожалуйста."), response("Пожалуйста!", raw=True))
         self.assertEqual(self.transport.call_count - before, 2)
@@ -396,7 +512,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         old = self.agent.delivery_token(111)
         await self.say("Покажите ещё раз", response(calls=[("create_booking", ARGS)]), delivered=False)
         self.agent.mark_delivered(111, old)
-        await self.say("Да")
+        await self.confirm()
         self.assertEqual(self.writes(), 0)
 
     async def test_reset_during_model_request_discards_late_proposal(self):
@@ -434,14 +550,16 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         from adaptive import atomic_json
         atomic_json(self.store._adaptive.path, self.store._adaptive.document)
         self.store.refresh_schema(force=True, validate=True)
-        answer = await self.say("Да")
+        answer = await self.confirm()
         self.assertNotIn("Записала", answer)
         self.assertEqual(self.writes(), 0)
 
     async def test_two_concurrent_confirmations_write_once(self):
         await self.offer()
         self.transport.side_effect = [response("Запись уже оформлена.")]
-        answers = await asyncio.gather(self.agent.reply(self.user, "Да"), self.agent.reply(self.user, "Да"))
+        offer_id = self.agent._pending[111]["offer_id"]
+        answers = await asyncio.gather(self.agent.proposal_action(self.user, offer_id, "confirm"),
+                                       self.agent.proposal_action(self.user, offer_id, "confirm"))
         self.assertEqual(self.writes(), 1)
         self.assertEqual(sum("Записала" in a for a in answers), 1)
 
@@ -459,7 +577,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         with patch("bot.ChatActionSender.typing", return_value=sender):
             await bot.ask_agent(message, self.agent, reporter, json.dumps(ARGS, ensure_ascii=False))
         self.assertTrue(self.agent._pending[111]["delivered"])
-        await self.say("Да")
+        await self.confirm()
         self.assertEqual(self.writes(), 1)
 
     async def test_telegram_delivery_failure_cannot_confirm_unseen_proposal(self):
@@ -475,7 +593,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.transport.side_effect = [response(calls=[("create_booking", ARGS)])]
         with patch("bot.ChatActionSender.typing", return_value=sender), self.assertRaises(TimeoutError):
             await bot.ask_agent(message, self.agent, reporter, json.dumps(ARGS, ensure_ascii=False))
-        await self.say("Да")
+        await self.confirm()
         self.assertEqual(self.writes(), 0)
 
     async def test_correction_invalidates_old_quote_after_history_compaction(self):
@@ -495,7 +613,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
             facts={"size_class": ["Кроссовер", "кроссовер"], "tariff": [None, "только"], "services": [["Мойка"], "мойка"]}))
         self.assertIn("800", proposal)
         self.assertNotIn("630", proposal)
-        await self.say("Да")
+        await self.confirm()
         self.assertEqual(self.store.my_bookings(111)["bookings"][0]["total"], "800")
 
     async def test_oversized_correction_discards_pending_consent(self):
@@ -509,9 +627,9 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         await self.offer()
         self.spreadsheet.worksheet("Услуги").values[1][2] = "900"
         self.spreadsheet.worksheet("Слоты").values[1][2] = "0"
-        answer = await self.say("Да")
+        answer = await self.confirm()
         self.assertIn("недоступно", answer)
-        self.assertNotIn("Подтверждаете", answer)
+        self.assertNotIn("выберите кнопку", answer)
         self.assertFalse(self.agent._pending)
         self.assertEqual(self.writes(), 0)
 

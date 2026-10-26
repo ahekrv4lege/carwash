@@ -103,10 +103,10 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.transport.await_count, 1)
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
         self.agent.mark_delivered(111, self.agent.delivery_token(111, answer))
-        confirmed = await self.agent.reply(self.user, "Да, подтверждаю запись")
+        confirmed = await self.confirm()
         self.assertIn("10:00", confirmed)
         self.assertEqual(len(self.spreadsheet.worksheet("Записи").writes), 1)
-        await self.agent.reply(self.user, "Да, подтверждаю запись")
+        await self.confirm()
         self.assertEqual(len(self.spreadsheet.worksheet("Записи").writes), 1)
 
     async def test_automatic_proposal_requires_explicit_unconditional_request(self):
@@ -195,7 +195,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_confirmed_total_question_does_not_require_new_catalog(self):
         self.agent._state[111] = {"facts": dict(ARGS)}
         await self.say("Подготовьте запись", calls=[("create_booking", {})])
-        await self.agent.reply(self.user, "Да, подтверждаю запись")
+        await self.confirm()
         self.transport.side_effect = [response("Итого 630 ₽, запись на 10:00.", raw=True)]
         before = self.transport.await_count
         answer = await self.agent.reply(self.user, "Напомните итог, я забыл цену.")
@@ -246,7 +246,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
             response(calls=[("respond", {"reply": "Проверю новое время.",
                 "facts": {"time": ["12:00", "12:00"]}})])]
         answer = await self.agent.reply(self.user, "Да, но давайте в 12:00 вместо 10:00.")
-        self.assertIn("в 12:00", answer)
+        self.assertIn("Время: 12:00", answer)
         self.assertEqual(self.agent._pending[111]["args"]["time"], "12:00")
         self.assertEqual(self.transport.await_count, 2)
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
@@ -302,7 +302,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_confirmed_booking_history_keeps_time_and_price_not_internal_instructions(self):
         self.agent._state[111] = {"facts": dict(ARGS)}
         await self.say("Подготовьте запись", calls=[("create_booking", {})])
-        answer = await self.agent.reply(self.user, "Да, подтверждаю запись")
+        answer = await self.confirm()
         saved = self.agent._history[111][-1]["content"]
         self.assertEqual(saved, answer)
         self.assertIn("10:00", saved)
@@ -409,9 +409,9 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.transport.await_count, 2)
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
         self.agent.mark_delivered(111, self.agent.delivery_token(111))
-        await self.agent.reply(self.user, "Да, подтверждаю запись")
+        await self.confirm()
         self.assertEqual(len(self.store.my_bookings(111)["bookings"]), 1)
-        await self.agent.reply(self.user, "Да, подтверждаю запись")
+        await self.confirm()
         self.assertEqual(len(self.store.my_bookings(111)["bookings"]), 1)
 
     def test_inferred_class_requires_current_known_car_and_real_catalog(self):
@@ -487,7 +487,14 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         if calls and calls[0][0] not in {"create_booking", "cancel_booking"} or follow is not None:
             self.transport.side_effect = [response(content, calls=calls), response(envelope(follow or reply))]
         answer = await self.agent.reply(self.user, text)
-        self.agent.mark_delivered(111, self.agent.delivery_token(111))
+        self.agent.mark_delivered(111, self.agent.delivery_token(111, answer))
+        return answer
+
+    async def confirm(self):
+        self.turns += 1
+        offer_id = self.agent._pending.get(111, {}).get("offer_id", "missing")
+        answer = await self.agent.proposal_action(self.user, offer_id, "confirm")
+        self.agent.mark_delivered(111, self.agent.delivery_token(111, answer))
         return answer
 
     def facts(self):
@@ -551,7 +558,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Базовый", proposal)
         self.assertEqual(sum(len(s.writes) for s in self.spreadsheet.sheets), 0)
         with patch.object(self.store, "create_booking", wraps=self.store.create_booking) as write:
-            result = await self.say("Да, подтверждаю запись")
+            result = await self.confirm()
             self.assertEqual(write.call_count, 1)
             args = write.call_args.kwargs
             self.assertEqual((args["name"], args["car"], args["phone"]), ("Артём", "Toyota Corolla 1.6", "+7 000 222-33-44"))
@@ -684,19 +691,21 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         async def reply_from_contract(**payload):
             self.assertEqual(payload["tool_choice"], "auto")
             prompt = payload["messages"][0]["content"]
-            self.assertIn("Обычный ответ пиши текстом", prompt)
-            self.assertIn("сохрани их через respond", prompt)
-            self.assertIn("точная цитата из текущего сообщения", prompt)
-            example = prompt.split("Пример на сообщение «Никита»: ", 1)[1].splitlines()[0]
+            self.assertIn("Нет новых данных — обычный текст", prompt)
+            self.assertIn("Есть данные — respond", prompt)
+            self.assertIn("точная цитата текущего сообщения", prompt)
+            example = prompt.split("Пример «у мя раф 4»: ", 1)[1].splitlines()[0]
             memory = json.loads(example.removesuffix("."))
-            self.assertEqual(memory["facts"]["client_name"], ["Никита", "Никита"])
+            self.assertEqual(memory["facts"]["car"], ["раф 4", "раф 4"])
+            self.assertEqual(memory["facts"]["car_model"], ["Toyota RAV4", "раф 4"])
             self.assertIn("respond", [tool["function"]["name"] for tool in payload["tools"]])
             return response(calls=[("respond", memory)])
 
         self.transport.side_effect = reply_from_contract
-        answer = await self.agent.reply(self.user, "Никита")
-        self.assertEqual(answer, "Никита, какой у вас автомобиль?")
-        self.assertEqual(self.facts()["client_name"], "Никита")
+        answer = await self.agent.reply(self.user, "у мя раф 4")
+        self.assertEqual(answer, "Какую мойку хотите?")
+        self.assertEqual(self.facts()["car"], "раф 4")
+        self.assertEqual(self.facts()["car_model"], "Toyota RAV4")
         self.assertFalse(sum(len(sheet.writes) for sheet in self.spreadsheet.sheets))
 
     async def test_inferred_catalog_class_is_repaired_before_any_booking_tool(self):

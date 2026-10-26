@@ -9,7 +9,7 @@ from contextlib import suppress
 
 from aiogram import Bot, Dispatcher, F as Filter, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.chat_action import ChatActionSender
 
 from admin import AdminReporter
@@ -24,16 +24,25 @@ router.message.filter(Filter.chat.type == "private")  # работаем тол�
 TG_LIMIT = 4000  # лимит Telegram — 4096 символов
 
 
-QueuedMessage = namedtuple("QueuedMessage", "handler message data batchable future confirmation token delivered")
+QueuedMessage = namedtuple("QueuedMessage", "handler message data batchable future confirmation token delivered ack")
+
+
+async def acknowledge(callback):
+    try:
+        await callback.answer()
+    except Exception as error:
+        log.warning("Не удалось ответить на нажатие (%s)", type(error).__name__)
 
 class MessageBatcher:
     def __init__(self, delay):
         self.delay, self.pending = delay, {}
 
     async def __call__(self, handler, message, data):
-        if message.chat.type != "private" or not message.from_user:
+        callback = isinstance(message, CallbackQuery)
+        chat = message.message.chat if callback and isinstance(message.message, Message) else getattr(message, "chat", None)
+        if chat is None or chat.type != "private" or not message.from_user:
             return await handler(message, data)
-        user_id, text = message.from_user.id, message.text or ""
+        user_id, text = message.from_user.id, "" if callback else message.text or ""
         affirmative = any(Agent._affirmative(text, action) for action in ("create_booking", "cancel_booking"))
         batchable = bool(text) and not text.startswith("/") and not affirmative and self.delay > 0
         agent = data["agent"]
@@ -42,7 +51,8 @@ class MessageBatcher:
         future = asyncio.get_running_loop().create_future()
         queue_owner = user_id not in self.pending
         queue = self.pending.setdefault(user_id, [])
-        queue.append(QueuedMessage(handler, message, data, batchable, future, affirmative, token, delivered))
+        ack = asyncio.create_task(acknowledge(message)) if callback else None
+        queue.append(QueuedMessage(handler, message, data, batchable, future, affirmative, token, delivered, ack))
         if queue_owner:
             try:
                 await self._drain(user_id, queue)
@@ -63,6 +73,8 @@ class MessageBatcher:
         finally:
             for item in (*batch, *queue):
                 item.future.cancel()
+                if item.ack is not None:
+                    item.ack.cancel()
 
     async def _deliver(self, user_id, batch):
         latest = batch[-1]
@@ -71,6 +83,8 @@ class MessageBatcher:
             event = event.model_copy(update={"text": "\n".join(item.message.text for item in batch),
                                              "entities": None})
         try:
+            if latest.ack is not None:
+                await latest.ack
             current_token = latest.data["agent"].delivery_token(user_id)
             offer_changed = current_token is not latest.token
             offer_undelivered = latest.token is not None and not latest.delivered
@@ -98,6 +112,27 @@ def split_text(text: str, limit: int = TG_LIMIT) -> list[str]:
     return parts
 
 
+async def send_answer(message: Message, agent: Agent, reporter: AdminReporter,
+                      user: ChatUser, text: str, answer: str) -> None:
+    delivery_token = agent.delivery_token(user.id, answer)
+    pending = agent._pending.get(user.id, {})
+    offer_id = pending.get("offer_id") if delivery_token is not None else None
+    keyboard = None
+    if isinstance(offer_id, str):
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Подтвердить", callback_data=f"booking:confirm:{offer_id}"),
+            InlineKeyboardButton(text="Изменить", callback_data=f"booking:edit:{offer_id}"),
+        ]])
+    chunks = split_text(answer)
+    for index, chunk in enumerate(chunks):
+        if keyboard is not None and index == len(chunks) - 1:
+            await message.answer(chunk, reply_markup=keyboard)
+        else:
+            await message.answer(chunk)
+    agent.mark_delivered(user.id, delivery_token)
+    await reporter.dialog(user.id, user.full_name, user.username, text, answer)
+
+
 async def ask_agent(message: Message, agent: Agent, reporter: AdminReporter, text: str) -> None:
     telegram_user = message.from_user
     user = ChatUser(id=telegram_user.id, username=telegram_user.username, full_name=telegram_user.full_name)
@@ -105,11 +140,27 @@ async def ask_agent(message: Message, agent: Agent, reporter: AdminReporter, tex
     async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
         answer = await agent.reply(user, text)
         await asyncio.sleep(max(0, agent.config.reply_min_delay_sec - (time.monotonic() - started)))
-    delivery_token = agent.delivery_token(telegram_user.id, answer)
-    for chunk in split_text(answer):
-        await message.answer(chunk)
-    agent.mark_delivered(telegram_user.id, delivery_token)
-    await reporter.dialog(telegram_user.id, telegram_user.full_name, telegram_user.username, text, answer)
+    await send_answer(message, agent, reporter, user, text, answer)
+
+
+@router.callback_query(Filter.data.startswith("booking:"))
+async def on_proposal(callback: CallbackQuery, agent: Agent, reporter: AdminReporter) -> None:
+    if not isinstance(callback.message, Message) or callback.message.chat.type != "private":
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or parts[1] not in {"confirm", "edit"}:
+        return
+    telegram_user = callback.from_user
+    user = ChatUser(id=telegram_user.id, username=telegram_user.username, full_name=telegram_user.full_name)
+    answer = await agent.proposal_action(user, parts[2], parts[1])
+    pending = agent._pending.get(user.id, {})
+    if pending.get("offer_id") != parts[2] and callback.message.reply_markup:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception as error:
+            log.warning("Не удалось убрать старые кнопки (%s)", type(error).__name__)
+    label = "Подтвердить" if parts[1] == "confirm" else "Изменить"
+    await send_answer(callback.message, agent, reporter, user, label, answer)
 
 
 @router.message(CommandStart())
@@ -133,7 +184,7 @@ async def on_text(message: Message, agent: Agent, reporter: AdminReporter) -> No
 
 @router.message()
 async def on_other(message: Message) -> None:
-    await message.answer("Пожалуйста, напишите ваш вопрос текстом 🙂")
+    await message.answer("Напишите ваш вопрос текстом.")
 
 
 async def maintain_sessions(agent: Agent) -> None:
@@ -153,7 +204,9 @@ async def main() -> None:
         reporter = AdminReporter(bot, config.admin_chat_id)
         agent = Agent(config, store, reporter)
         dispatcher = Dispatcher(agent=agent, config=config, reporter=reporter)
-        router.message.outer_middleware(MessageBatcher(config.reply_batch_sec))
+        batcher = MessageBatcher(config.reply_batch_sec)
+        router.message.outer_middleware(batcher)
+        router.callback_query.outer_middleware(batcher)
         dispatcher.include_router(router)
         maintenance = asyncio.create_task(maintain_sessions(agent))
         if config.sheets_adaptive_enabled and config.sheets_discover_on_start:
