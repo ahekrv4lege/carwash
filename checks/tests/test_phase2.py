@@ -1,6 +1,7 @@
 """Регрессии второго аудита. Модель и таблица синтетические; временные файлы плоские."""
 import asyncio
 import json
+import re
 from pathlib import Path
 import time
 import unittest
@@ -171,7 +172,8 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
         for claim in ('Вы запи\u200bсаны.', 'Вы зaписаны.', 'Запись принята.', 'Бронирование внесено.'):
             answer = await self.say('Проверить?', response(claim))
             self.assertNotEqual(answer, claim)
-            self.assertIn('не подтверждён', answer)
+            # Безопасная замена: вопрос о данных вместо заявления об успехе.
+            self.assertFalse(re.search(r'запис(?:ал|ан)|принят|внесен|бронир', answer, re.I), claim)
 
     async def test_ambiguous_sheet_owner_cannot_authorize_cancellation(self):
         from tests.fakes import booking
@@ -267,14 +269,23 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(111,self.agent._pending)
         self.assertFalse(self.spreadsheet.worksheet('Записи').writes)
 
-    async def test_restart_does_not_restore_a_pending_confirmation(self):
+    async def test_restart_restores_delivered_proposal_without_model(self):
         await self.offer()
+        offer_id = self.agent._pending[111]['offer_id']
         with patch('ai.AsyncOpenAI'):
-            other=Agent(self.store.config,self.store)
-        other.client.chat.completions.create=AsyncMock(return_value=response('Уточним детали.'))
-        await other.reply(self.user,'Да')
-        self.assertFalse(other._pending)
+            other = Agent(self.store.config, self.store)
+        other.client.chat.completions.create = AsyncMock(return_value=response('Уточним детали.'))
+        # Текстовое согласие по-прежнему ничего не подтверждает.
+        answer = await other.reply(self.user, 'Да')
+        self.assertIn('«Подтвердить»', answer)
+        self.assertTrue(other._pending)
         self.assertFalse(self.spreadsheet.worksheet('Записи').writes)
+        # Кнопка восстановленной сводки работает без модели.
+        before = other.client.chat.completions.create.await_count
+        answer = await other.proposal_action(self.user, offer_id, 'confirm')
+        self.assertEqual(other.client.chat.completions.create.await_count, before)
+        self.assertIn('Записала', answer)
+        self.assertEqual(len(self.spreadsheet.worksheet('Записи').writes), 1)
 
     async def test_restart_preserves_uncertain_write_journal_without_saving_profile(self):
         from sheets import Store
@@ -409,7 +420,7 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
         self.transport.side_effect=[response(calls=[('create_booking',{})]) for _ in range(6)]
         with patch.object(self.store,'calculate_price',wraps=self.store.calculate_price) as quote:
             answer=await self.agent.reply(self.user,'Записываем?')
-        self.assertIn('остановлен',answer)
+        self.assertIn('другое время',answer)
         self.assertEqual(quote.call_count,1)
         self.assertEqual(self.transport.call_count,2)
 

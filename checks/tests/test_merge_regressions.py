@@ -30,11 +30,11 @@ class MergeConfigTests(unittest.TestCase):
         with patch.dict(os.environ, dict(ENV, **values), clear=True):
             return config.load_config()
 
-    def test_1451f6d_llm_configuration_keeps_xkiro_defaults(self):
-        cfg = self.load(LLM_API_KEY="synthetic-xkiro")
-        self.assertEqual(client_options(cfg)["base_url"], "https://api.xkiro.com/v1")
-        self.assertEqual(client_options(cfg)["api_key"], "synthetic-xkiro")
-        self.assertEqual(completion_options(cfg)["model"], "minimax/minimax-m3.1-flash")
+    def test_llm_configuration_keeps_default_route(self):
+        cfg = self.load(LLM_API_KEY="synthetic-polza")
+        self.assertEqual(client_options(cfg)["base_url"], "https://polza.ai/api/v1")
+        self.assertEqual(client_options(cfg)["api_key"], "synthetic-polza")
+        self.assertEqual(completion_options(cfg)["model"], "deepseek/deepseek-v4.1-flash")
 
     def test_llm_custom_configuration_keeps_its_key_url_and_model(self):
         cfg = self.load(LLM_API_KEY="synthetic-llm", LLM_BASE_URL="https://llm.invalid/v1/",
@@ -43,13 +43,13 @@ class MergeConfigTests(unittest.TestCase):
         self.assertEqual(client_options(cfg)["api_key"], "synthetic-llm")
         self.assertEqual(completion_options(cfg)["model"], "team-model")
 
-    def test_llm_custom_url_preserves_original_default_model(self):
-        cfg = self.load(LLM_API_KEY="synthetic-llm", LLM_BASE_URL="https://llm.invalid/v1")
-        self.assertEqual(completion_options(cfg)["model"], "minimax/minimax-m3.1-flash")
+    def test_llm_custom_url_requires_explicit_model(self):
+        with self.assertRaisesRegex(RuntimeError, "LLM_MODEL"):
+            self.load(LLM_API_KEY="synthetic-llm", LLM_BASE_URL="https://llm.invalid/v1")
 
     def test_second_llm_key_does_not_override_primary(self):
         cfg = self.load(LLM_API_KEY="synthetic-primary", LLM_MODEL="team-model", LLM_API_KEY_2="synthetic-second")
-        self.assertEqual(client_options(cfg)["base_url"], "https://api.xkiro.com/v1")
+        self.assertEqual(client_options(cfg)["base_url"], "https://polza.ai/api/v1")
         self.assertEqual(client_options(cfg)["api_key"], "synthetic-primary")
         self.assertEqual(completion_options(cfg)["model"], "team-model")
         self.assertEqual(cfg.llm_fallbacks[0].api_key, "synthetic-second")
@@ -152,7 +152,7 @@ class MergeConfigTests(unittest.TestCase):
         connect_original = socket.socket.connect
         with patch("socket.socket.connect", new=denied):
             agent = Agent(cfg, Mock())
-            self.assertEqual(str(agent.client.base_url), "https://api.xkiro.com/v1/")
+            self.assertEqual(str(agent.client.base_url), "https://polza.ai/api/v1/")
             self.assertEqual(agent.client.api_key, "synthetic-llm")
             import asyncio
             asyncio.run(agent.close())
@@ -209,7 +209,8 @@ class MergeTelegramTests(unittest.IsolatedAsyncioTestCase):
                 await dispatcher.feed_update(telegram, Update.model_validate({"update_id": index, "message": message}))
             agent._state[111] = {"old": True}
             await feed(1, "/start")
-            self.assertNotIn(111, agent._state)
+            # /start сбрасывает диалог и отмечает приветствие.
+            self.assertEqual(agent._state[111], {"greeted": True})
             agent._state[111] = {"old": True}
             await feed(2, "/reset")
             self.assertNotIn(111, agent._state)
@@ -221,7 +222,7 @@ class MergeTelegramTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(reply.await_count, 1)
 
         with patch.object(module, "load_config", return_value=cfg), \
-             patch.object(module, "Bot", side_effect=lambda token: Bot(token, session=session)), \
+             patch.object(module, "Bot", side_effect=lambda *args, **kwargs: Bot(cfg.bot_token, session=session)), \
              patch.object(module.Dispatcher, "start_polling", new=polling):
             await module.main()
         self.assertTrue(session.closed)
@@ -234,7 +235,7 @@ class MergeTelegramTests(unittest.IsolatedAsyncioTestCase):
         module = self.module()
         session = OfflineTelegram()
         with patch.object(module, "load_config", return_value=fake_config("unused")), \
-             patch.object(module, "Bot", side_effect=lambda token: Bot(token, session=session)), \
+             patch.object(module, "Bot", side_effect=lambda *args, **kwargs: Bot(fake_config("unused").bot_token, session=session)), \
              patch.object(module, "Agent", side_effect=RuntimeError("synthetic startup failure")):
             with self.assertRaisesRegex(RuntimeError, "synthetic startup failure"):
                 await module.main()

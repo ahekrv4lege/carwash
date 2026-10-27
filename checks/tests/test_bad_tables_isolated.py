@@ -299,9 +299,9 @@ class NewTable(unittest.TestCase):
                 return store
             target = Path(run.prepare_new_table(config(d), factory))
             self.assertEqual(str(target), table_mapping_path('synthetic-spreadsheet'))
-            self.assertEqual(json.loads(target.read_text())['spreadsheet_id'], 'synthetic-spreadsheet')
-            self.assertEqual(old.read_text(), '{"spreadsheet_id": "previous"}')
-            self.assertEqual(old_journal.read_text(), '{"pending": true}')
+            self.assertEqual(json.loads(target.read_text(encoding='utf-8'))['spreadsheet_id'], 'synthetic-spreadsheet')
+            self.assertEqual(old.read_text(encoding='utf-8'), '{"spreadsheet_id": "previous"}')
+            self.assertEqual(old_journal.read_text(encoding='utf-8'), '{"pending": true}')
             self.assertFalse(any(ws.writes for ws in sheet.sheets))
             settings = _sheet_settings()
             self.assertEqual(settings['sheets_mapping_file'], str(target))
@@ -322,7 +322,7 @@ class NewTable(unittest.TestCase):
                 return store
             with self.assertRaises(run.StartupError):
                 run.prepare_new_table(config(d), factory)
-            self.assertEqual(old.read_text(), 'old')
+            self.assertEqual(old.read_text(encoding='utf-8'), 'old')
             self.assertFalse(Path(table_mapping_path('synthetic-spreadsheet')).exists())
             self.assertFalse(any(ws.writes for ws in sheet.sheets))
             self.assertEqual(len(list(Path(d).glob('*-candidate-*.json'))), 1)
@@ -344,8 +344,8 @@ class NewTable(unittest.TestCase):
                 store = Store(cfg); store._spreadsheet = sheet
                 return store
             self.assertEqual(run.prepare_new_table(config(d), factory), str(old))
-            self.assertNotIn('obsolete', json.loads(old.read_text()))
-            self.assertEqual(journal.read_text(), original_journal)
+            self.assertNotIn('obsolete', json.loads(old.read_text(encoding='utf-8')))
+            self.assertEqual(journal.read_text(encoding='utf-8'), original_journal)
             self.assertFalse(any(ws.writes for ws in sheet.sheets))
 
     def test_invalid_rebuild_keeps_same_table_map_and_journal(self):
@@ -365,8 +365,8 @@ class NewTable(unittest.TestCase):
                 return store
             with self.assertRaises(run.StartupError):
                 run.prepare_new_table(config(d), factory)
-            self.assertEqual(old.read_text(), original)
-            self.assertEqual(journal.read_text(), '{"pending": true}')
+            self.assertEqual(old.read_text(encoding='utf-8'), original)
+            self.assertEqual(journal.read_text(encoding='utf-8'), '{"pending": true}')
             self.assertFalse(any(ws.writes for ws in sheet.sheets))
 
     def test_new_table_flag_checks_before_start(self):

@@ -12,11 +12,12 @@ import time
 from collections import defaultdict, OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 from openai import AsyncOpenAI, APIConnectionError, APIStatusError, RateLimitError
 
-from config import ROOT, Config
+from config import Config
 from providers import api_error_label, client_options, completion_options, invalid_tool_output, request_arguments, retry_after
 from sheets import WEEKDAYS_RU, Store, parse_date, parse_time, digits, valid_phone
 from conversation import (CATALOG_FIELDS, FIELDS, PHONE, apply_patch, folded, literal_car_patch, model_state,
@@ -130,7 +131,6 @@ def vehicle_clarification(text):
     named = (
         (r"(?:mercedes(?:-benz)?|мерседес)\s+([acesаес])(?:-?class|\s+класс)?\b", {"a": "A-Class / GLA", "а": "A-Class / GLA", "c": "C-Class / GLC", "с": "C-Class / GLC", "e": "E-Class / GLE", "е": "E-Class / GLE", "s": "S-Class / GLS"}, r"\b(?:gla|glc|gle|gls)\b"),
         (r"(?:citro[eё]n|ситроен|ситро[её]н)\s+c\s*([345])\b", {"3": "C3 / C3 Aircross", "4": "C4 / C4 X", "5": "C5 / C5 Aircross / C5 X"}, r"\b(?:aircross|аиркросс|x|х)\b"),
-        (r"(?:toyota|тойота|та[её]та)\s+(yaris|ярис|corolla|королла)\b", {"yaris": "Yaris / Yaris Cross", "ярис": "Yaris / Yaris Cross", "corolla": "Corolla / Corolla Cross", "королла": "Corolla / Corolla Cross"}, r"\b(?:cross|кросс)\b"),
         (r"(?:mitsubishi|митсубиси)\s+(eclipse|эклипс)\b", {"eclipse": "Eclipse / Eclipse Cross", "эклипс": "Eclipse / Eclipse Cross"}, r"\b(?:cross|кросс)\b"),
         (r"(?:ford|форд)\s+(mustang|мустанг)\b", {"mustang": "Mustang / Mustang Mach-E", "мустанг": "Mustang / Mustang Mach-E"}, r"\b(?:mach|мак|мач)\b"),
         (r"(?:chevrolet|шевроле)\s+(blazer|блейзер)\b", {"blazer": "Blazer / Trailblazer", "блейзер": "Blazer / Trailblazer"}, r"trailblazer|трейлблейзер"),
@@ -168,7 +168,9 @@ class Agent:
         self._turn_sources: dict[int, dict] = {}
 
     def _proposal_file(self, user_id):
-        return ROOT / ".runtime" / f"proposals-{self.config.bot_token.split(':')[0]}" / f"{user_id}.json"
+        # Локальное состояние живёт рядом с картой таблиц: в проде это .runtime.
+        folder = Path(self.config.sheets_mapping_file).parent / f"proposals-{self.config.bot_token.split(':')[0]}"
+        return folder / f"{user_id}.json"
 
     def _save_proposal(self, user_id):
         pending = self._pending.get(user_id)
@@ -272,6 +274,7 @@ class Agent:
 
     def _offer(self, user_id, pending, prefix=""):
         answer = prefix + self._proposal_text(pending)
+        pending.setdefault("created", time.monotonic())
         pending.update(offer_id=secrets.token_hex(12), delivery_token=object(), delivered=False, reply=answer)
         self._pending[user_id] = pending
         self._state[user_id]["pending"] = {"action": pending["action"], "delivered": False}
@@ -426,7 +429,7 @@ car — слова клиента с исходной цитатой; car_model 
             self._turn_sources[user.id] = {}
             phones = PHONE.findall(text)
             if (len(phones) == 1 and valid_phone(phones[0])
-                    and not re.search(r"\b(?:не|если|или|либо|возможно|может)\b", text, re.I)):
+                    and not re.search(r"\b(?:не|если|или|либо|возможно|может|вроде|кажется|наверное|заказ\w*|брон\w*)\b", text, re.I)):
                 apply_patch(self._state[user.id], {"phone": phones[0]}, {})
             pending = self._pending.get(user.id)
             if pending and self._affirmative(text, pending["action"]):

@@ -58,12 +58,14 @@ class ProviderTests(unittest.TestCase):
 
     def test_cloudflare_thinking_is_explicit_and_token_limit_is_singular(self):
         cfg = self.load(AI_BASE_URL="https://api.cloudflare.com/client/v4/accounts/synthetic/ai/v1",
-                        AI_API_KEY="synthetic", AI_MODEL="@cf/zai-org/glm-4.7-flash")
+                        AI_API_KEY="synthetic", AI_MODEL="@cf/zai-org/glm-4.7-flash",
+                        AI_MAX_OUTPUT_TOKENS="1024")
         options = completion_options(cfg)
         self.assertEqual(options["extra_body"], {"chat_template_kwargs": {"enable_thinking": False}})
         self.assertEqual(options["max_completion_tokens"], 1024)
         self.assertNotIn("max_tokens", options)
-        self.assertNotIn("extra_body", completion_options(self.load()))
+        # Дефолт Polza переводит алиасы модели в extra_body; чистый URL без алиасов — без него.
+        self.assertNotIn("extra_body", completion_options(self.load(AI_MODEL="plain-model")))
         self.assertTrue(completion_options(replace(cfg, ai_reasoning_effort="low"))["extra_body"]["chat_template_kwargs"]["enable_thinking"])
 
     def test_cloudflare_thinking_controls_do_not_leak_to_other_endpoints_or_models(self):
@@ -103,17 +105,22 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn("synthetic-first", repr(cfg.llm_fallbacks))
         self.assertEqual(client_options(cfg)["api_key"], ENV["LLM_API_KEY"])
 
-    def test_existing_xkiro_defaults_are_preserved(self):
+    def test_default_polza_route_and_alias_translation(self):
         cfg = self.load()
-        self.assertEqual(cfg.ai_model, "minimax/minimax-m3.1-flash")
+        self.assertEqual(cfg.ai_model,
+                         "deepseek/deepseek-v4.1-flash@provider=open-inference/fp4&allow_fallbacks=false&reasoning_effort=low")
         options = client_options(cfg)
-        self.assertEqual(options["base_url"], "https://api.xkiro.com/v1")
+        self.assertEqual(options["base_url"], "https://polza.ai/api/v1")
         self.assertEqual(options["api_key"], ENV["LLM_API_KEY"])
         self.assertEqual(options["max_retries"], 0)
         request = completion_options(cfg)
+        self.assertEqual(request["model"], "deepseek/deepseek-v4.1-flash")
+        self.assertEqual(request["extra_body"], {"provider": {"only": ["open-inference/fp4"],
+                                                             "allow_fallbacks": False},
+                                                 "reasoning": {"effort": "low"}})
         self.assertNotIn("reasoning_effort", request)
         self.assertEqual(request["temperature"], 0.3)
-        self.assertEqual(request["max_tokens"], 1024)
+        self.assertNotIn("max_tokens", request)
 
     def test_generic_provider_overrides_without_legacy_key(self):
         cfg = self.load(LLM_API_KEY="", AI_API_KEY="new-key", AI_MODEL="selected-later",
@@ -146,7 +153,10 @@ class ProviderTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "AI_REASONING_SUPPORTED"):
                     self.load(AI_REASONING_EFFORT=effort)
                 cfg = self.load(AI_REASONING_EFFORT=effort, AI_REASONING_SUPPORTED="true")
-                self.assertEqual(completion_options(cfg)["reasoning_effort"], effort)
+                request = completion_options(cfg)
+                self.assertNotIn("reasoning_effort", request)
+                expected = {"enabled": False} if effort == "none" else {"effort": effort}
+                self.assertEqual(request["extra_body"]["reasoning"], expected)
         with self.assertRaisesRegex(RuntimeError, "AI_REASONING_EFFORT"):
             self.load(AI_REASONING_EFFORT="invented")
 
@@ -157,8 +167,7 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn("max_tokens", options)
         with self.assertRaisesRegex(RuntimeError, "AI_TOKEN_LIMIT_PARAMETER"):
             self.load(AI_TOKEN_LIMIT_PARAMETER="max_output_tokens")
-        with self.assertRaisesRegex(RuntimeError, "AI_MAX_OUTPUT_TOKENS"):
-            self.load(AI_MAX_OUTPUT_TOKENS="300")
+        self.assertEqual(self.load(AI_MAX_OUTPUT_TOKENS="300").ai_max_output_tokens, 300)
 
     def test_temperature_can_be_omitted_for_unsupported_models(self):
         cfg = self.load(AI_TEMPERATURE="")
