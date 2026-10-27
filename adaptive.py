@@ -1033,3 +1033,65 @@ class AdaptiveSheets:
             if journal.get(key, {}).get("state") == "done":
                 del journal[key]
                 atomic_json(journal_path, journal)
+
+    def validate_reschedule(self, record: dict, new_date: str) -> dict:
+        rule = self._target(sheet_id=record["__sheet_id__"])
+        if rule.get("date_source") and date_value(new_date) != date_value(record["Дата"]):
+            raise MappingError("Перенос между отдельными областями дат требует администратора; исходная запись сохранена")
+        if "Время" not in rule["columns"] or "Дата" not in rule["columns"] and date_value(new_date) != date_value(record["Дата"]):
+            raise MappingError("Нет доступных для изменения колонок даты и времени")
+        return rule
+
+    def reschedule(self, record: dict, telegram_id: int, new_date: str, new_time: str) -> None:
+        with self.lock:
+            versions = dict(self.read_versions)
+            observed = self._preflight()
+            for role in ("slots", "bookings"):
+                self.table(role, _observed=observed)
+                if role not in versions or self.read_versions[role] != versions[role]:
+                    raise MappingError("Слоты или записи изменились перед переносом; проверьте время заново")
+            rule = self.validate_reschedule(record, new_date)
+            _, records = self.table("bookings", _observed=observed)
+            matches = [candidate for candidate in records if candidate["ID"] == record["ID"]]
+            if len(matches) != 1 or matches[0] != record or record["Telegram ID"] != str(telegram_id):
+                raise MappingError("Исходная запись изменилась; перенос заблокирован")
+            worksheet, row = self._worksheet(rule["sheet_id"]), record["__row__"]
+            raw = worksheet.get(f"A{row}:{cell_name(row, max(rule['columns'].values()))}",
+                                value_render_option="FORMULA", date_time_render_option="FORMATTED_STRING")
+            formulas = [(row, column) for column, value in enumerate(raw[0] if raw else [], 1) if str(value).startswith("=")]
+            if self._typed_formulas(rule["sheet_id"], worksheet.title, formulas):
+                raise MappingError("В строке записи есть формула; перенос заблокирован")
+            row_rule = {**rule, "first_data_row": 1, "end_row": 1, "date_source": None}
+            candidates = self._extract_records(row_rule, raw, worksheet.title)
+            if len(candidates) != 1 or any(candidates[0].get(field) != record.get(field) for field in rule["columns"]):
+                raise MappingError("Строка записи перемещена или изменена; перенос заблокирован")
+            date = datetime.strptime(new_date, "%Y-%m-%d")
+            updates = []
+            for field, value in (("Дата", date.strftime("%d.%m.%Y")), ("Время", new_time)):
+                if field not in rule["columns"]:
+                    continue
+                transform = rule.get("transforms", {}).get(field, "")
+                if field == "Дата" and transform == "serial_date":
+                    value = (date - datetime(1899, 12, 30)).days
+                elif field == "Дата" and transform.startswith("date:"):
+                    value = date.strftime(transform[5:])
+                elif field == "Время" and transform == "serial_time":
+                    hour, minute = map(int, new_time.split(":"))
+                    value = (hour * 60 + minute) / 1440
+                updates.append({"range": cell_name(row, rule["columns"][field]), "values": [[value]]})
+            path, journal = self._journal()
+            key = fingerprint({"move": record, "date": new_date, "time": new_time})
+            if journal.get(key, {}).get("state") == "pending":
+                raise MappingError("Результат прошлого переноса неизвестен; нужна ручная сверка")
+            journal[key] = {"state": "pending", "sheet_id": rule["sheet_id"], "row": row, "at": time.time()}
+            atomic_json(path, journal)
+            try:
+                worksheet.batch_update(updates, value_input_option="RAW")
+            except Exception:
+                raise MappingError("Результат переноса неизвестен. Проверьте таблицу перед повтором") from None
+            journal[key]["state"] = "done"
+            original = fingerprint({field.lower(): str(record.get(field, "")).strip().casefold()
+                                    for field in ("Telegram ID", "Дата", "Время", "Автомобиль")})
+            if journal.get(original, {}).get("state") == "done":
+                journal.pop(original)
+            atomic_json(path, journal)

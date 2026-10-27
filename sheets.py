@@ -19,9 +19,11 @@ from zoneinfo import ZoneInfo
 
 from gspread import HTTPClient
 from gspread.exceptions import APIError, WorksheetNotFound
+from requests.exceptions import ConnectionError as HTTPConnectionError, Timeout as HTTPTimeout
+from google.auth.exceptions import TransportError
 
 from config import Config
-from adaptive import AdaptiveSheets, BOOKING_FIELDS
+from adaptive import AdaptiveSheets, BOOKING_FIELDS, MappingError
 
 log = logging.getLogger(__name__)
 
@@ -309,6 +311,10 @@ class SheetsHTTPClient(HTTPClient):
             except APIError as error:
                 retryable = error.code in {408, 429} or error.code >= 500
                 if method.lower() != "get" or not retryable or attempt == 2:
+                    raise
+                time.sleep(0.5 * (attempt + 1))
+            except (HTTPConnectionError, HTTPTimeout, TransportError):
+                if method.lower() != "get" or attempt == 2:
                     raise
                 time.sleep(0.5 * (attempt + 1))
 
@@ -791,3 +797,58 @@ class Store:
                     "message": "Запись отменена, слот освобождён",
                 }
             return _failure("Запись с таким номером не найдена")
+
+    def reschedule_booking(self, booking_id: Any, telegram_id: int, date_str: str, time_str: str,
+                           *, expected_booking: dict | None = None, dry_run: bool = False) -> dict:
+        new_date, new_time = parse_date(date_str), parse_time(time_str)
+        if not new_date or not new_time or not self._is_future(new_date, new_time):
+            return _failure("Укажите предстоящую дату и время с учётом минимального интервала до записи")
+        with self.fresh_tables():
+            self._invalidate("slots", "bookings")
+            slots = self._get_slots()
+            headers, rows = self._get_bookings()
+            matches = [row for row in rows if pick(row, "ID") == str(booking_id).strip()]
+            if len(matches) != 1 or pick(matches[0], "Telegram ID") != str(telegram_id):
+                return _failure("Запись не найдена среди ваших записей")
+            record = matches[0]
+            if not self._is_active(record):
+                return _failure("Эта запись уже отменена")
+            old_date, old_time = parse_date(pick(record, "Дата")), parse_time(pick(record, "Время"))
+            if not old_date or not old_time or self._slot_datetime(old_date, old_time) < self.now():
+                return _failure("Прошедшую запись перенести нельзя")
+            current = {"booking_id": str(booking_id), "date": old_date.isoformat(), "time": old_time,
+                       **{key: pick(record, column) for key, column in (("car", "Автомобиль"),
+                          ("tariff", "Тариф"), ("extras", "Доп. услуги"), ("total", "Сумма"), ("status", "Статус"))}}
+            if expected_booking is not None and any(str(current.get(key)) != str(expected_booking.get(key))
+                    for key in ("date", "time", "car", "tariff", "extras", "total", "status")):
+                return _failure("Исходная запись изменилась. Проверьте её и подтвердите перенос заново")
+            if (old_date, old_time) == (new_date, new_time):
+                return _failure("Запись уже назначена на это время; перенос не требуется")
+            if self._adaptive:
+                try:
+                    self._adaptive.validate_reschedule(record, new_date.isoformat())
+                except MappingError as error:
+                    return _failure(str(error))
+            busy = self._booked_capacity([row for row in rows if row is not record])
+            if slots.get((new_date, new_time), 0) - busy.get((new_date, new_time), 0) <= 0:
+                return _failure("Новое время занято. Исходная запись сохранена",
+                                free_times_that_day=self._free_times(new_date, slots, busy))
+            result = {"ok": True, "booking": current, "booking_id": str(booking_id),
+                      "date": new_date.isoformat(), "time": new_time, "car": current["car"],
+                      "total": current["total"], "currency": self.config.currency}
+            if dry_run:
+                return result
+            if self._adaptive:
+                self._adaptive.reschedule(record, telegram_id, new_date.isoformat(), new_time)
+            else:
+                columns = {header.strip().lower(): index for index, header in enumerate(headers, 1)}
+                if not {"дата", "время"} <= columns.keys():
+                    return _failure("В таблице нет колонок даты и времени; исходная запись сохранена")
+                from adaptive import cell_name
+                worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
+                worksheet.batch_update([
+                    {"range": cell_name(record["__row__"], columns["дата"]), "values": [[new_date.strftime("%d.%m.%Y")]]},
+                    {"range": cell_name(record["__row__"], columns["время"]), "values": [[new_time]]},
+                ], value_input_option="RAW")
+            self._invalidate("bookings")
+            return result

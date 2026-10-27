@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import timedelta
+from datetime import date, timedelta
 
 from sheets import digits, parse_date, parse_time, valid_phone
 
@@ -65,9 +65,25 @@ def source_date(source, now, embedded=False):
     relative = {"сегодня": 0, "завтра": 1, "послезавтра": 2}
     if text in relative:
         return now.date() + timedelta(days=relative[text])
+    short = re.fullmatch(r"(\d{1,2})\.(\d{1,2})", text)
+    if short:
+        try:
+            return date(now.year, int(short[2]), int(short[1]))
+        except ValueError:
+            return None
     pattern = r"понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресенье"
+    months = ("январ", "феврал", "март", "апрел", "ма[йя]", "июн", "июл", "август", "сентябр", "октябр", "ноябр", "декабр")
+    natural = re.fullmatch(r"(\d{1,2})(?:-?го)?\s+(" + "|".join(month + r"\w*" for month in months) + r")(?:\s+(\d{4})(?:\s*г(?:ода|\.)?)?)?", text)
+    if natural:
+        month = next(i + 1 for i, name in enumerate(months) if re.fullmatch(name + r"\w*", natural[2]))
+        try:
+            return date(int(natural[3]) if natural[3] else now.year, month, int(natural[1]))
+        except ValueError:
+            return None
     if embedded:
-        dates = re.findall(rf"\b(?:сегодня|завтра|послезавтра|{pattern}|\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}\.\d{{1,2}}\.\d{{4}})\b", text)
+        month_names = "|".join(month + r"\w*" for month in months)
+        dates = re.findall(rf"\b(?:сегодня|завтра|послезавтра|{pattern}|\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}\.\d{{1,2}}(?:\.\d{{4}})?|\d{{1,2}}(?:-?го)?\s+(?:{month_names})(?:\s+\d{{4}})?)\b", text)
+        dates = [value for value in dates if source_date(value, now) is not None]
         return source_date(dates[0], now) if len(dates) == 1 else None
     weekday = re.fullmatch(rf"(?:в |во )?({pattern})", text)
     if weekday:
@@ -81,8 +97,13 @@ def source_time(source, embedded=False):
     text = folded(source)
     if embedded:
         clocks = re.findall(r"\b(?:в|к)\s*(\d{1,2}(?:[:.]\d{2})?)(?!\d)", text)
-        return source_time(clocks[0]) if len(clocks) == 1 else source_time(text)
-    clock = re.fullmatch(r"(?:в\s*|к\s*)?(\d{1,2})(?:[:.](\d{2})(?::00)?)?(?:\s*(?:час(?:а|ов)?|ч))?", text)
+        if (re.fullmatch(r"(?:на\s*)?\d{1,2}:\d{2}", text)
+                or re.search(r"\b(?:на|завтра|сегодня|послезавтра|запиш\w*|перенес\w*|перенос\w*|тогда|вместо)\b|\d{1,2}\.\d{1,2}", text)
+                or PHONE.search(text)):
+            clocks += re.findall(r"(?<![\w:.])(\d{1,2}:\d{2})(?![\d:])", text)
+        clocks = list(dict.fromkeys(value for clock in clocks if (value := source_time(clock)) is not None))
+        return clocks[0] if len(clocks) == 1 else source_time(text)
+    clock = re.fullmatch(r"(?:в\s*|к\s*|на\s*(?=\d{1,2}:))?(\d{1,2})(?:[:.](\d{2})(?::00)?)?(?:\s*(?:час(?:а|ов)?|ч))?", text)
     return parse_time(f"{clock[1]}:{clock[2] or '00'}") if clock else None
 
 

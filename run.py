@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import importlib.util
 import json
@@ -16,7 +17,7 @@ import venv
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(__file__).resolve().parent
-REQUIRED_PACKAGES = ("aiogram", "gspread", "google.auth", "openai", "dotenv", "tzdata")
+REQUIRED_PACKAGES = ("aiogram", "aiohttp_socks", "gspread", "google.auth", "openai", "dotenv", "tzdata")
 RESTART_DELAY_SEC = 5
 WIN_CTRL_C_EXIT_CODE = 0xC000013A
 
@@ -132,7 +133,7 @@ def validate_config(sheets_only: bool = False):
     return config
 
 
-def run_forever() -> None:
+def run_forever(output=None) -> None:
     print("Запускаю бота. Остановка — Ctrl+C.", flush=True)
     process = None
     stopping = False
@@ -152,7 +153,8 @@ def run_forever() -> None:
     previous = signal.signal(signal.SIGTERM, stop)
     try:
         while not stopping:
-            process = subprocess.Popen([sys.executable, str(ROOT / "bot.py")], cwd=ROOT)
+            streams = {"stdout": output, "stderr": output} if output is not None else {}
+            process = subprocess.Popen([sys.executable, str(ROOT / "bot.py")], cwd=ROOT, **streams)
             try:
                 code = process.wait()
             except KeyboardInterrupt:
@@ -174,6 +176,12 @@ def main() -> int:
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--check", action="store_true", help="Проверить настройки без сетевых запросов")
     modes.add_argument("--setup-only", action="store_true", help="Только подготовить .venv и зависимости")
+    modes.add_argument("--doctor", action="store_true", help="Проверить Telegram и Sheets; без сообщений, записей и платного AI")
+    for mode, description in (("host", "Фоновый хостинг с автозапуском"), ("stop", "Остановить и выключить автозапуск"),
+                              ("status", "Состояние фонового бота"), ("logs", "Последние сообщения журнала")):
+        modes.add_argument("--" + mode, action="store_true", help=description)
+    parser.add_argument("--host-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--profile", choices=("cheap", "demo"), help="Профиль модели; ключи остаются в .env")
     parser.add_argument("--no-install", action="store_true", help="Запретить установку зависимостей")
     modes.add_argument("--refresh-schema", action="store_true", help="Принудительно перечитать структуру без запуска бота")
     modes.add_argument("--validate-mappings", action="store_true", help="Проверить вручную исправленную конфигурацию без записи в Sheets")
@@ -181,12 +189,40 @@ def main() -> int:
     args = parser.parse_args()
     try:
         os.chdir(ROOT)
+        if args.host_worker:
+            folder = ROOT / ".runtime"
+            folder.mkdir(exist_ok=True)
+            path = folder / "host.log"
+            if path.exists() and path.stat().st_size > 5_000_000:
+                path.replace(folder / "host.previous.log")
+            sys.stdout = sys.stderr = path.open("a", encoding="utf-8", buffering=1)
         prepare_environment(args.no_install)
+        if args.profile:
+            from dotenv import dotenv_values
+            path = ROOT / "profiles" / (args.profile + ".env")
+            if not path.is_file():
+                raise StartupError("Профиль модели не найден")
+            allowed = {"LLM_BASE_URL", "LLM_MODEL", "LLM_MAX_INPUT_RUB", "LLM_MAX_OUTPUT_RUB", "AI_TIMEOUT_SEC",
+                       "AI_REQUEST_BUDGET_SEC", "AI_REQUEST_RETRIES", "AI_MAX_OUTPUT_TOKENS", "AI_DIRECT_ACTIONS"}
+            values = dotenv_values(path)
+            if values.keys() - allowed or any(value is None for value in values.values()):
+                raise StartupError("В профиле есть недопустимые настройки")
+            os.environ.update(values)
         if args.setup_only:
             print("Виртуальное окружение и зависимости готовы")
             return 0
         sheets_only = args.refresh_schema or args.validate_mappings or args.suggest_mappings
         config = validate_config(sheets_only=sheets_only)
+        if args.doctor or args.host:
+            from healthcheck import diagnose
+            if not asyncio.run(diagnose(config)):
+                raise StartupError("Подключения не готовы; исправьте указанную выше ошибку")
+            if args.doctor:
+                return 0
+        if any(getattr(args, action) for action in ("host", "stop", "status", "logs")):
+            from hosting import manage
+            action = next(action for action in ("host", "stop", "status", "logs") if getattr(args, action))
+            return manage(action, ROOT, config.bot_token.split(":", 1)[0], profile=args.profile)
         # Общая блокировка по bot id защищает также копии проекта на этом компьютере.
         lock_key = config.bot_token.split(":", 1)[0] if not sheets_only else hashlib.sha256(config.spreadsheet_id.encode()).hexdigest()[:24]
         import tempfile
@@ -209,7 +245,7 @@ def main() -> int:
             if args.check:
                 print("Локальная конфигурация корректна; сетевые подключения не выполнялись")
                 return 0
-            run_forever()
+            run_forever(sys.stdout if args.host_worker else None)
         return 0
     except KeyboardInterrupt:
         print("Остановлено пользователем")

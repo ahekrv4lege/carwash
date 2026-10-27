@@ -1,4 +1,5 @@
 aiogram>=3.7,<4
+aiohttp-socks>=0.9,<1
 gspread>=6.0
 google-auth>=2.20
 openai>=1.40

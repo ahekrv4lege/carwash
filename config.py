@@ -108,6 +108,7 @@ class Config:
     sheets_force_schema_refresh: bool = False
     sheets_mapping_file: str = str(ROOT / ".runtime/sheets-mapping.json")
     ai_enabled: bool = True
+    ai_direct_actions: bool = False
     ai_base_url: str = "https://polza.ai/api/v1"
     ai_api_key: str = ""
     ai_model: str = ""
@@ -116,6 +117,8 @@ class Config:
     ai_reasoning_effort: str = ""
     ai_temperature: float | None = 0.3
     ai_max_output_tokens: int = 1024
+    ai_max_prompt_price_rub: float | None = None
+    ai_max_completion_price_rub: float | None = None
     ai_token_limit_parameter: str = "max_tokens"
     ai_max_tool_iterations: int = 6
     ai_max_tool_calls: int = 12
@@ -176,6 +179,8 @@ def _generation_settings() -> dict:
         ai_reasoning_effort=effort,
         ai_temperature=temperature,
         ai_max_output_tokens=_integer("AI_MAX_OUTPUT_TOKENS", "1024", 512),
+        ai_max_prompt_price_rub=_number("LLM_MAX_INPUT_RUB", "0", 0.001) if os.getenv("LLM_MAX_INPUT_RUB", "").strip() else None,
+        ai_max_completion_price_rub=_number("LLM_MAX_OUTPUT_RUB", "0", 0.001) if os.getenv("LLM_MAX_OUTPUT_RUB", "").strip() else None,
         ai_token_limit_parameter=token_parameter,
         ai_max_tool_iterations=_integer("AI_MAX_TOOL_ITERATIONS", "6", 1),
         ai_max_tool_calls=_integer("AI_MAX_TOOL_CALLS", "12", 1),
@@ -192,9 +197,11 @@ def _ai_settings(sheets_only: bool) -> dict:
     enabled = _bool("AI_ENABLED", True)
     primary_key = os.getenv("LLM_API_KEY", "").strip()
     primary_model = os.getenv(
-        "LLM_MODEL", "deepseek/deepseek-v4.1-flash@provider=sail-research/fp4:batch&allow_fallbacks=false"
+        "LLM_MODEL", "deepseek/deepseek-v4.1-flash@provider=open-inference/fp4&allow_fallbacks=false&reasoning_effort=none"
     ).strip()
     primary_url = _api_url("LLM_BASE_URL", os.getenv("LLM_BASE_URL", "https://polza.ai/api/v1").strip())
+    if primary_url != "https://polza.ai/api/v1" and not os.getenv("LLM_MODEL", "").strip():
+        primary_model = ""
     base_url = _api_url("AI_BASE_URL", os.getenv("AI_BASE_URL", primary_url).strip())
     same_provider = urlsplit(base_url)[:2] == urlsplit(primary_url)[:2]
     api_key = os.getenv("AI_API_KEY", "").strip() or (primary_key if same_provider else "")
@@ -208,6 +215,7 @@ def _ai_settings(sheets_only: bool) -> dict:
             raise RuntimeError("Для выбранного адреса явно задайте AI_MODEL или LLM_MODEL")
     return dict(
         ai_enabled=enabled,
+        ai_direct_actions=_bool("AI_DIRECT_ACTIONS", False),
         ai_base_url=base_url,
         ai_api_key=api_key,
         ai_model=model,

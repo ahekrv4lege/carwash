@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import time
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 
 def retry_after(error) -> float | None:
@@ -62,6 +63,36 @@ def completion_options(config, *, mapping: bool = False) -> dict:
         options["temperature"] = 0 if mapping else config.ai_temperature
     if config.ai_reasoning_effort and not mapping:
         options["reasoning_effort"] = config.ai_reasoning_effort
+    if urlsplit(url).hostname == "polza.ai" and not mapping:
+        polza = {}
+        effort = options.pop("reasoning_effort", None)
+        canonical, marker, aliases = model.partition("@")
+        if marker:
+            seen = set()
+            for key, value in parse_qsl(aliases, strict_parsing=True):
+                if key in seen or key not in {"provider", "allow_fallbacks", "reasoning_effort"}:
+                    raise RuntimeError("LLM_MODEL: неизвестный или повторный параметр Polza")
+                seen.add(key)
+                if key == "reasoning_effort":
+                    if effort is None:
+                        effort = value
+                elif key == "provider":
+                    polza.setdefault("provider", {})["only"] = [value]
+                else:
+                    if value not in {"true", "false"}:
+                        raise RuntimeError("LLM_MODEL: allow_fallbacks должен быть true или false")
+                    polza.setdefault("provider", {})[key] = value == "true"
+            options["model"] = canonical
+        if effort:
+            polza["reasoning"] = {"effort": effort}
+        ceilings = {key: value for key, value in (
+            ("prompt", config.ai_max_prompt_price_rub),
+            ("completion", config.ai_max_completion_price_rub),
+        ) if value is not None}
+        if ceilings:
+            polza.setdefault("provider", {})["max_price"] = ceilings
+        if polza:
+            options["extra_body"] = polza
     if urlsplit(url).hostname == "api.cloudflare.com":
         options["max_completion_tokens"] = options.pop(config.ai_token_limit_parameter)
         if model in {"@cf/zai-org/glm-4.7-flash", "@cf/google/gemma-4-26b-a4b-it", "@cf/qwen/qwen3.8-27b"}:
@@ -70,6 +101,15 @@ def completion_options(config, *, mapping: bool = False) -> dict:
             if effort and effort != "none" and model == "@cf/qwen/qwen3.8-27b":
                 options["reasoning_effort"] = effort
     return options
+
+
+def api_error_label(error) -> str:
+    status = getattr(error, "status_code", None)
+    body = getattr(error, "body", None)
+    nested = body.get("error", body) if isinstance(body, dict) else {}
+    code = str(nested.get("code", "")) if isinstance(nested, dict) else ""
+    code = code if re.fullmatch(r"[A-Za-z0-9_.-]{1,60}", code) else ""
+    return " ".join(filter(None, (type(error).__name__, f"HTTP {status}" if isinstance(status, int) else "", f"code={code}" if code else "")))
 
 
 def request_arguments(config, arguments) -> dict:

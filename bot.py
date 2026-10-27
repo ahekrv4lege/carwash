@@ -15,6 +15,7 @@ from aiogram.utils.chat_action import ChatActionSender
 from admin import AdminReporter
 from ai import Agent, ChatUser
 from config import Config, load_config
+from network import telegram_session
 from sheets import Store
 
 log = logging.getLogger(__name__)
@@ -121,7 +122,6 @@ async def send_answer(message: Message, agent: Agent, reporter: AdminReporter,
     if isinstance(offer_id, str):
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="Подтвердить", callback_data=f"booking:confirm:{offer_id}"),
-            InlineKeyboardButton(text="Изменить", callback_data=f"booking:edit:{offer_id}"),
         ]])
     chunks = split_text(answer)
     for index, chunk in enumerate(chunks):
@@ -169,6 +169,7 @@ async def cmd_start(message: Message, agent: Agent, config: Config) -> None:
     await message.answer(
         f"Здравствуйте! Вас приветствует автомойка «{config.carwash_name}». Вам ответит первый свободный сотрудник. Чем можем помочь?",
     )
+    agent._state[message.from_user.id]["greeted"] = True
 
 
 @router.message(Command("reset"))
@@ -196,13 +197,18 @@ async def maintain_sessions(agent: Agent) -> None:
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     config = load_config()
-    bot = Bot(config.bot_token)
+    bot = Bot(config.bot_token, session=telegram_session())
     agent = None
     maintenance = None
     try:
         store = Store(config)
         reporter = AdminReporter(bot, config.admin_chat_id)
         agent = Agent(config, store, reporter)
+        if config.ai_direct_actions:
+            try:
+                await asyncio.wait_for(asyncio.to_thread(store.price_list), timeout=15)
+            except Exception as error:
+                log.warning("Прайс не прогрет (%s); чтение будет повторено при обращении", type(error).__name__)
         dispatcher = Dispatcher(agent=agent, config=config, reporter=reporter)
         batcher = MessageBatcher(config.reply_batch_sec)
         router.message.outer_middleware(batcher)
