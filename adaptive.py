@@ -748,6 +748,7 @@ class AdaptiveSheets:
                 free = {str(field_value).strip().casefold() for field_value in rule["free_markers"]}
                 record["Постов"] = str(sum(str(value_at(values, row, column_index)).strip().casefold() in free
                                           for column_index in rule["grid_columns"]))
+                record["__free_capacity__"] = True
             if "Время" in record:
                 record["Время"] = time_value(record["Время"], transforms.get("Время", "time"))
             if "Статус" in record:
@@ -915,7 +916,7 @@ class AdaptiveSheets:
         observed = {}
         self.refresh(force=True, _observed=observed)
         for role in ("services", "tariffs", "slots", "bookings"):
-            self._rules(role)
+            self.table(role, _observed=observed)
         if any(rule.get("grid_columns") for rule in self._rules("slots")):
             raise MappingError("Сетка постов доступна только для чтения; создание/отмена записей заблокированы")
         return observed

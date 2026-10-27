@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 import math
@@ -108,7 +109,6 @@ class Config:
     sheets_force_schema_refresh: bool = False
     sheets_mapping_file: str = str(ROOT / ".runtime/sheets-mapping.json")
     ai_enabled: bool = True
-    ai_direct_actions: bool = False
     ai_base_url: str = "https://polza.ai/api/v1"
     ai_api_key: str = ""
     ai_model: str = ""
@@ -116,9 +116,7 @@ class Config:
     ai_request_budget_sec: float = 120
     ai_reasoning_effort: str = ""
     ai_temperature: float | None = 0.3
-    ai_max_output_tokens: int = 1024
-    ai_max_prompt_price_rub: float | None = None
-    ai_max_completion_price_rub: float | None = None
+    ai_max_output_tokens: int = 0
     ai_token_limit_parameter: str = "max_tokens"
     ai_max_tool_iterations: int = 6
     ai_max_tool_calls: int = 12
@@ -178,9 +176,7 @@ def _generation_settings() -> dict:
         ai_request_budget_sec=_number("AI_REQUEST_BUDGET_SEC", str(timeout * 2), 0.1),
         ai_reasoning_effort=effort,
         ai_temperature=temperature,
-        ai_max_output_tokens=_integer("AI_MAX_OUTPUT_TOKENS", "1024", 512),
-        ai_max_prompt_price_rub=_number("LLM_MAX_INPUT_RUB", "0", 0.001) if os.getenv("LLM_MAX_INPUT_RUB", "").strip() else None,
-        ai_max_completion_price_rub=_number("LLM_MAX_OUTPUT_RUB", "0", 0.001) if os.getenv("LLM_MAX_OUTPUT_RUB", "").strip() else None,
+        ai_max_output_tokens=_integer("AI_MAX_OUTPUT_TOKENS", "0"),
         ai_token_limit_parameter=token_parameter,
         ai_max_tool_iterations=_integer("AI_MAX_TOOL_ITERATIONS", "6", 1),
         ai_max_tool_calls=_integer("AI_MAX_TOOL_CALLS", "12", 1),
@@ -197,7 +193,7 @@ def _ai_settings(sheets_only: bool) -> dict:
     enabled = _bool("AI_ENABLED", True)
     primary_key = os.getenv("LLM_API_KEY", "").strip()
     primary_model = os.getenv(
-        "LLM_MODEL", "deepseek/deepseek-v4.1-flash@provider=open-inference/fp4&allow_fallbacks=false&reasoning_effort=none"
+        "LLM_MODEL", "deepseek/deepseek-v4.1-flash@provider=open-inference/fp4&allow_fallbacks=false&reasoning_effort=low"
     ).strip()
     primary_url = _api_url("LLM_BASE_URL", os.getenv("LLM_BASE_URL", "https://polza.ai/api/v1").strip())
     if primary_url != "https://polza.ai/api/v1" and not os.getenv("LLM_MODEL", "").strip():
@@ -215,13 +211,18 @@ def _ai_settings(sheets_only: bool) -> dict:
             raise RuntimeError("Для выбранного адреса явно задайте AI_MODEL или LLM_MODEL")
     return dict(
         ai_enabled=enabled,
-        ai_direct_actions=_bool("AI_DIRECT_ACTIONS", False),
         ai_base_url=base_url,
         ai_api_key=api_key,
         ai_model=model,
         llm_fallbacks=_fallbacks(primary_url, model if same_provider else primary_model),
         **_generation_settings(),
     )
+
+
+def table_mapping_path(spreadsheet_id: str) -> str:
+    base = Path(_path("SHEETS_MAPPING_FILE", ".runtime/sheets-mapping.json"))
+    key = hashlib.sha256(spreadsheet_id.encode()).hexdigest()[:24]
+    return str(base.with_name(f"{base.stem}-{key}{base.suffix}"))
 
 
 def _sheet_settings() -> dict:
@@ -235,14 +236,16 @@ def _sheet_settings() -> dict:
     mapping_url = os.getenv("SHEETS_AI_BASE_URL", "").strip()
     if mapping_url:
         mapping_url = _api_url("SHEETS_AI_BASE_URL", mapping_url)
+    table_mapping = table_mapping_path(os.getenv("SPREADSHEET_ID", "").strip())
+    has_table_mapping = Path(table_mapping).is_file()
     return dict(
         **names,
-        sheets_adaptive_enabled=_bool("SHEETS_ADAPTIVE_ENABLED"),
+        sheets_adaptive_enabled=_bool("SHEETS_ADAPTIVE_ENABLED", has_table_mapping),
         sheets_discover_on_start=_bool("SHEETS_DISCOVER_ON_START"),
         sheets_schema_check_interval_hours=_number("SHEETS_SCHEMA_CHECK_INTERVAL_HOURS", "24", 0.001),
         sheets_ai_mapping_enabled=_bool("SHEETS_AI_MAPPING_ENABLED"),
         sheets_force_schema_refresh=_bool("SHEETS_FORCE_SCHEMA_REFRESH"),
-        sheets_mapping_file=_path("SHEETS_MAPPING_FILE", ".runtime/sheets-mapping.json"),
+        sheets_mapping_file=table_mapping if has_table_mapping else _path("SHEETS_MAPPING_FILE", ".runtime/sheets-mapping.json"),
         sheets_ai_base_url=mapping_url,
         sheets_ai_api_key=os.getenv("SHEETS_AI_API_KEY", "").strip(),
         sheets_ai_model=os.getenv("SHEETS_AI_MODEL", "").strip(),

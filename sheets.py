@@ -106,6 +106,10 @@ def _failure(text: str, **extra: Any) -> dict:
     return {"ok": False, "error": text, **extra}
 
 
+class FreeCapacity(int):
+    """Число уже свободных боксов, а не общая вместимость."""
+
+
 # ───────────────────────────── модель данных ─────────────────────────────
 
 @dataclass
@@ -129,8 +133,7 @@ class Catalog:
     size_classes: list[str]
     services: dict[str, Service]    # ключ — название в нижнем регистре
     tariffs: dict[str, Tariff]
-    # Правила прайса для машин с несколькими классами (BMW X5 = кроссовер);
-    # каждое правило — (как записали в таблице автомобиль, какой класс выбрать).
+    # Пары «автомобиль, класс» из необязательного листа «Классы».
     class_rules: list[tuple[str, str]] = field(default_factory=list)
 
     # ---- классы автомобилей
@@ -144,23 +147,18 @@ class Catalog:
         return None
 
     def resolve_class_rule(self, value: str) -> str | None:
-        """Правило прайса для нестандартного автомобиля (напр. «BMW X5» → «Кроссовер»).
-
-        Сначала ищем точное совпадение (регистр не важен), затем включение в обе
-        стороны. Если совпало несколько правил, но все указывают один класс —
-        возвращаем его; разные классы считаем противоречием и не решаем за
-        администратора (None — пусть решает нейросеть по тексту правила).
-        """
+        """Точное правило важнее частичного; неоднозначный класс не выбираем."""
         needle = (value or "").strip().casefold()
         if not needle:
             return None
-        exact = [size_class for car, size_class in self.class_rules if car.strip().casefold() == needle]
-        if exact:
-            return exact[0]
-        hits = [size_class for car, size_class in self.class_rules
-                if (hit := car.strip().casefold()) and (hit in needle or needle in hit)]
-        unique = sorted(set(hits))
-        return unique[0] if len(unique) == 1 else None
+        matches = set()
+        for car, size_class in self.class_rules:
+            car = car.strip().casefold()
+            if car == needle:
+                return size_class
+            if car and (car in needle or needle in car):
+                matches.add(size_class)
+        return next(iter(matches)) if len(matches) == 1 else None
 
     # ---- тариф = сумма цен ДОСТУПНЫХ услуг из состава минус скидка
     def tariff_quote(self, tariff: Tariff, size_class: str) -> dict | None:
@@ -477,31 +475,21 @@ class Store:
 
     # ---------- правила классов (лист «Классы») ----------
     def _load_class_rules(self, classes: list[str]) -> list[tuple[str, str]]:
-        """Пары «автомобиль → класс» для машин, подходящих под несколько категорий.
-
-        Лист необязателен: без него бот работает как раньше, класс выбирает
-        нейросеть. Правило с классом, которого нет в прайсе (или с повтором
-        одного автомобиля под разными классами), отбрасывается с предупреждением,
-        а не уходит в нейросеть как мусор.
-        """
+        """Читаем необязательные правила, отбрасывая неизвестные и противоречивые классы."""
         try:
             values = self._get_spreadsheet().worksheet(self.config.sheet_classes).get_all_values()
         except (WorksheetNotFound, StopIteration):
             return []
-        except Exception as error:  # unforeseen: no crash on the entire price list
-            log.warning("Не удалось прочитать лист «%s»: %s", self.config.sheet_classes, error)
+        except Exception as error:
+            log.warning("Не удалось прочитать лист «%s» (%s)", self.config.sheet_classes, type(error).__name__)
             return []
         if not values:
             return []
         wanted_car = {"автомобиль", "модель", "машина"}
         wanted_class = {"класс", "категория", "габарит"}
-        car_column = class_column = None
-        for index, header in enumerate(values[0]):
-            lowered = str(header).strip().lower()
-            if lowered in wanted_car and car_column is None:
-                car_column = index
-            elif lowered in wanted_class and class_column is None:
-                class_column = index
+        headers = [str(header).strip().lower() for header in values[0]]
+        car_column = next((index for index, header in enumerate(headers) if header in wanted_car), None)
+        class_column = next((index for index, header in enumerate(headers) if header in wanted_class), None)
         if car_column is None or class_column is None:
             log.warning("Лист «%s»: нужны колонки «Автомобиль» и «Класс»", self.config.sheet_classes)
             return []
@@ -553,7 +541,12 @@ class Store:
                 continue
             capacity_value = to_number(pick(record, "Постов", "Мест", "Боксов"))
             capacity = 1 if capacity_value is None else max(int(capacity_value), 0)
-            slots[(booking_date, booking_time)] = slots.get((booking_date, booking_time), 0) + capacity
+            key = (booking_date, booking_time)
+            free = bool(record.get("__free_capacity__"))
+            if key in slots and isinstance(slots[key], FreeCapacity) != free:
+                raise MappingError("Для одного времени смешаны сетка боксов и общая вместимость")
+            total = slots.get(key, 0) + capacity
+            slots[key] = FreeCapacity(total) if free else total
         return slots
 
     def _load_bookings(self) -> tuple[list[str], list[dict[str, Any]]]:
@@ -582,7 +575,7 @@ class Store:
     def _free_times(self, requested_date: date, slots: dict, busy: Counter) -> list[str]:
         return sorted(
             slot_time for (slot_date, slot_time), capacity in slots.items()
-            if slot_date == requested_date and capacity - busy.get((slot_date, slot_time), 0) > 0 and self._is_future(slot_date, slot_time)
+            if slot_date == requested_date and capacity - (0 if isinstance(capacity, FreeCapacity) else busy.get((slot_date, slot_time), 0)) > 0 and self._is_future(slot_date, slot_time)
         )
 
     def free_slots(self, date_str: str | None = None, days: int = 7) -> dict:
@@ -715,6 +708,9 @@ class Store:
             if self._adaptive:
                 self._adaptive.create(data, expected_bookings=booking_rows)
             else:
+                self._invalidate("slots", "bookings")
+                if self._get_slots() != slots or self._get_bookings() != (headers, booking_rows):
+                    return _failure("Расписание или записи изменились. Проверьте время заново")
                 row = [data.get(header.strip().lower(), "") for header in headers]
                 worksheet.append_row(row, value_input_option="RAW")
             self._invalidate("bookings")
@@ -755,6 +751,7 @@ class Store:
                 "extras": pick(record, "Доп. услуги"),
                 "total": pick(record, "Сумма"),
                 "status": pick(record, "Статус"),
+                "_location": (record.get("__sheet_id__"), record.get("__row__")),
             })
         output.sort(key=lambda booking: (booking["date"], booking["time"]))
         return {"ok": True, "bookings": output}
@@ -772,6 +769,8 @@ class Store:
                     return _failure("Эта запись уже отменена")
                 booking_date, booking_time = parse_date(pick(record, "Дата")), parse_time(pick(record, "Время"))
                 if expected_booking is not None:
+                    if "_location" in expected_booking and tuple(expected_booking["_location"]) != (record.get("__sheet_id__"), record.get("__row__")):
+                        return _failure("Расположение записи изменилось. Подтвердите отмену заново")
                     observed = {"date": booking_date.isoformat() if booking_date else "", "time": booking_time,
                                 **{key: pick(record, column) for key, column in
                                    (("car", "Автомобиль"), ("tariff", "Тариф"), ("extras", "Доп. услуги"),
@@ -787,6 +786,11 @@ class Store:
                     self._adaptive.cancel(record, telegram_id)
                 else:
                     worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
+                    self._invalidate("bookings")
+                    current_headers, current_rows = self._get_bookings()
+                    matches = [row for row in current_rows if pick(row, "ID") == str(booking_id).strip()]
+                    if current_headers != headers or len(matches) != 1 or matches[0] != record:
+                        return _failure("Запись изменилась. Проверьте её и подтвердите отмену заново")
                     worksheet.update_cell(record["__row__"], column, "Отменена")
                 self._invalidate("bookings")
                 return {
@@ -817,11 +821,14 @@ class Store:
             if not old_date or not old_time or self._slot_datetime(old_date, old_time) < self.now():
                 return _failure("Прошедшую запись перенести нельзя")
             current = {"booking_id": str(booking_id), "date": old_date.isoformat(), "time": old_time,
+                       "_location": (record.get("__sheet_id__"), record.get("__row__")),
                        **{key: pick(record, column) for key, column in (("car", "Автомобиль"),
                           ("tariff", "Тариф"), ("extras", "Доп. услуги"), ("total", "Сумма"), ("status", "Статус"))}}
             if expected_booking is not None and any(str(current.get(key)) != str(expected_booking.get(key))
                     for key in ("date", "time", "car", "tariff", "extras", "total", "status")):
                 return _failure("Исходная запись изменилась. Проверьте её и подтвердите перенос заново")
+            if expected_booking is not None and "_location" in expected_booking and tuple(expected_booking["_location"]) != current["_location"]:
+                return _failure("Расположение записи изменилось. Подтвердите перенос заново")
             if (old_date, old_time) == (new_date, new_time):
                 return _failure("Запись уже назначена на это время; перенос не требуется")
             if self._adaptive:
@@ -846,6 +853,9 @@ class Store:
                     return _failure("В таблице нет колонок даты и времени; исходная запись сохранена")
                 from adaptive import cell_name
                 worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
+                self._invalidate("slots", "bookings")
+                if self._get_slots() != slots or self._get_bookings() != (headers, rows):
+                    return _failure("Расписание или записи изменились. Проверьте перенос заново")
                 worksheet.batch_update([
                     {"range": cell_name(record["__row__"], columns["дата"]), "values": [[new_date.strftime("%d.%m.%Y")]]},
                     {"range": cell_name(record["__row__"], columns["время"]), "values": [[new_time]]},

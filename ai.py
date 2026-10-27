@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import secrets
+import tempfile
 import time
 from collections import defaultdict, OrderedDict
 from contextlib import asynccontextmanager
@@ -14,19 +16,16 @@ from typing import Any
 
 from openai import AsyncOpenAI, APIConnectionError, APIStatusError, RateLimitError
 
-from config import Config
+from config import ROOT, Config
 from providers import api_error_label, client_options, completion_options, invalid_tool_output, request_arguments, retry_after
 from sheets import WEEKDAYS_RU, Store, parse_date, parse_time, digits, valid_phone
 from conversation import (CATALOG_FIELDS, FIELDS, PHONE, apply_patch, folded, literal_car_patch, model_state,
-                          redact_phone, safe_reply, same, strict_json, unpack, validate_patch, salvage_patch, source_date, source_time)
+                          plain_text, redact_phone, safe_reply, same, strict_json, unpack, validate_patch, salvage_patch, source_date, source_time)
 
 log = logging.getLogger(__name__)
 PROVIDER_COOLDOWN_SEC = 60
 
-# Разрешение монотонных часов (на Windows — тики таймера около 16 мс).
-# Сравнения бюджетов на отрезках меньше одного тика бессмысленны: ожидание
-# может вернуться раньше дедлайна из-за квантования таймера. На Linux
-# разрешение — наносекунды, и поведение не меняется.
+# Учитываем разрешение часов: на Windows ожидание может закончиться раньше дедлайна.
 MONOTONIC_RESOLUTION = time.get_clock_info("monotonic").resolution
 
 
@@ -45,52 +44,8 @@ def _tool(name, description, fields, required=()):
 
 TEXT = {"type": "string"}
 SERVICES = {"type": "array", "items": TEXT}
-CAR_BRANDS = r"toyota|тойота|та[её]та|bmw|бмв|беха|бэха|ford|форд|lada|лада|ваз|hyundai|х[её]ндай|хенде|киа|kia|skoda|шкода|volkswagen|фольксваген|vw|audi|ауди|mercedes|мерседес|nissan|ниссан|renault|рено|mazda|мазда|mitsubishi|митсубиси|lexus|лексус|honda|хонда|volvo|вольво|peugeot|пежо|citroen|ситроен|opel|опель|chevrolet|шевроле|geely|джили|haval|хавал|chery|чери|changan|чанган|omoda|омода|jaecoo|джейку|tank|танк|gac|гак|zeekr|зикр|byd|бид|jetour|джетур|exeed|эксид|tesla|тесла|porsche|порше|suzuki|сузуки|subaru|субару|smart|смарт|уАЗ|уаз"
 
 
-def vehicle_clarification(text):
-    if re.search(r"\b(?:не|если|или|либо)\b", text, re.I):
-        return None
-    numbers = {
-        1: r"1|перв\w*|единич\w*", 2: r"2|втор\w*|двойк\w*",
-        3: r"3|трет\w*|тройк\w*", 4: r"4|четв[её]рт\w*|четв[её]рк\w*",
-        5: r"5|пят\w*", 6: r"6|шест\w*", 7: r"7|седьм\w*|сем[её]р\w*|семь",
-        8: r"8|восьм\w*", 40: r"40|сорок", 50: r"50|пятьдесят",
-        60: r"60|шестьдесят", 70: r"70|семьдесят", 90: r"90|девяносто",
-    }
-    families = (
-        (r"bmw|бмв|беха|бэха", "BMW", {n: f"{n} Series / X{n}" + (f" / i{n} / M{n}" if n in (4, 5) else " / i7" if n == 7 else "") for n in range(1, 8)}, r"series|сери\w*"),
-        (r"audi|ауди", "Audi", {n: f"A{n} / Q{n}" for n in (3, 4, 5, 6, 7, 8)}, ""),
-        (r"mazda|мазда", "Mazda", {3: "Mazda3 / CX-3", 5: "Mazda5 / CX-5"}, ""),
-        (r"infiniti|инфинити", "Infiniti", {n: f"Q{n} / QX{n}" for n in (50, 60, 70)}, ""),
-        (r"volvo|вольво", "Volvo", {n: f"S{n} / V{n} / XC{n}" for n in (40, 60, 90)}, ""),
-    )
-    for brand, label, choices, suffix in families:
-        for number, options in choices.items():
-            pattern = r"\b(?:" + brand + r")\s+(?:" + numbers[number] + r")\b"
-            match = re.search(pattern, text, re.I)
-            if match and not (suffix and re.match(r"\s*(?:" + suffix + r")\b", text[match.end():], re.I)):
-                # Полное обозначение в том же сообщении снимает неоднозначность.
-                if re.search(r"\b(?:a|q|qx|xc|cx|s|v|x|i|m)[-\s]*" + str(number) + r"\b", text, re.I):
-                    continue
-                display = options if options.startswith(label) else f"{label} {options}"
-                return f"Уточните, пожалуйста, какую модель вы имеете в виду: {display}?"
-    named = (
-        (r"(?:mercedes(?:-benz)?|мерседес)\s+([acesаес])(?:-?class|\s+класс)?\b", {"a": "A-Class / GLA", "а": "A-Class / GLA", "c": "C-Class / GLC", "с": "C-Class / GLC", "e": "E-Class / GLE", "е": "E-Class / GLE", "s": "S-Class / GLS"}, r"\b(?:gla|glc|gle|gls)\b"),
-        (r"(?:citro[eё]n|ситроен|ситро[её]н)\s+c\s*([345])\b", {"3": "C3 / C3 Aircross", "4": "C4 / C4 X", "5": "C5 / C5 Aircross / C5 X"}, r"\b(?:aircross|аиркросс|x|х)\b"),
-        (r"(?:toyota|тойота|та[её]та)\s+(yaris|ярис|corolla|королла)\b", {"yaris": "Yaris / Yaris Cross", "ярис": "Yaris / Yaris Cross", "corolla": "Corolla / Corolla Cross", "королла": "Corolla / Corolla Cross"}, r"\b(?:cross|кросс)\b"),
-        (r"(?:mitsubishi|митсубиси)\s+(eclipse|эклипс)\b", {"eclipse": "Eclipse / Eclipse Cross", "эклипс": "Eclipse / Eclipse Cross"}, r"\b(?:cross|кросс)\b"),
-        (r"(?:ford|форд)\s+(mustang|мустанг)\b", {"mustang": "Mustang / Mustang Mach-E", "мустанг": "Mustang / Mustang Mach-E"}, r"\b(?:mach|мак|мач)\b"),
-        (r"(?:chevrolet|шевроле)\s+(blazer|блейзер)\b", {"blazer": "Blazer / Trailblazer", "блейзер": "Blazer / Trailblazer"}, r"trailblazer|трейлблейзер"),
-        (r"(?:haval|хавал)\s+(f\s*7|ф\s*7|dargo|дарго)\b", {"f7": "F7 / F7x", "ф7": "F7 / F7x", "dargo": "Dargo / Dargo X", "дарго": "Dargo / Dargo X"}, r"(?:f|ф)\s*7\s*[xх]\b|\b(?:dargo|дарго)\s*[xх]\b"),
-    )
-    for pattern, choices, specific in named:
-        match = re.search(pattern, text, re.I)
-        if match and not re.search(specific, text, re.I):
-            options = choices.get(re.sub(r"\s+", "", match.group(1).lower()))
-            if options:
-                return f"Уточните, пожалуйста: {options}?"
-    return None
 SELECTION = {"size_class": {"type": "string", "description": "From size_classes"},
              "tariff": {"type": "string", "description": "Catalog tariff, not a service"},
              "services": {**SERVICES, "description": "Only separately requested extras; never tariff components. Tariff without extras: []"}}
@@ -141,6 +96,55 @@ def _clean_text(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def vehicle_clarification(text):
+    if re.search(r"\b(?:не|если|или|либо)\b", text, re.I):
+        return None
+    numbers = {
+        1: r"1|перв\w*|единич\w*", 2: r"2|втор\w*|двойк\w*",
+        3: r"3|трет\w*|тройк\w*", 4: r"4|четв[её]рт\w*|четв[её]рк\w*",
+        5: r"5|пят\w*", 6: r"6|шест\w*", 7: r"7|седьм\w*|сем[её]р\w*|семь",
+        8: r"8|восьм\w*", 40: r"40|сорок", 50: r"50|пятьдесят",
+        60: r"60|шестьдесят", 70: r"70|семьдесят", 90: r"90|девяносто",
+    }
+    bmw = {n: f"{n} Series / X{n}" for n in range(1, 8)}
+    for n in (4, 5):
+        bmw[n] += f" / i{n} / M{n}"
+    bmw[7] += " / i7"
+    families = (
+        (r"bmw|бмв|беха|бэха", "BMW", bmw, r"series|сери\w*"),
+        (r"audi|ауди", "Audi", {n: f"A{n} / Q{n}" for n in (3, 4, 5, 6, 7, 8)}, ""),
+        (r"mazda|мазда", "Mazda", {3: "Mazda3 / CX-3", 5: "Mazda5 / CX-5"}, ""),
+        (r"infiniti|инфинити", "Infiniti", {n: f"Q{n} / QX{n}" for n in (50, 60, 70)}, ""),
+        (r"volvo|вольво", "Volvo", {n: f"S{n} / V{n} / XC{n}" for n in (40, 60, 90)}, ""),
+    )
+    for brand, label, choices, suffix in families:
+        for number, options in choices.items():
+            pattern = r"\b(?:" + brand + r")\s+(?:" + numbers[number] + r")\b"
+            match = re.search(pattern, text, re.I)
+            if match and not (suffix and re.match(r"\s*(?:" + suffix + r")\b", text[match.end():], re.I)):
+                # Полное обозначение в том же сообщении снимает неоднозначность.
+                if re.search(r"\b(?:a|q|qx|xc|cx|s|v|x|i|m)[-\s]*" + str(number) + r"\b", text, re.I):
+                    continue
+                display = options if options.startswith(label) else f"{label} {options}"
+                return f"Уточните, пожалуйста, какую модель вы имеете в виду: {display}?"
+    named = (
+        (r"(?:mercedes(?:-benz)?|мерседес)\s+([acesаес])(?:-?class|\s+класс)?\b", {"a": "A-Class / GLA", "а": "A-Class / GLA", "c": "C-Class / GLC", "с": "C-Class / GLC", "e": "E-Class / GLE", "е": "E-Class / GLE", "s": "S-Class / GLS"}, r"\b(?:gla|glc|gle|gls)\b"),
+        (r"(?:citro[eё]n|ситроен|ситро[её]н)\s+c\s*([345])\b", {"3": "C3 / C3 Aircross", "4": "C4 / C4 X", "5": "C5 / C5 Aircross / C5 X"}, r"\b(?:aircross|аиркросс|x|х)\b"),
+        (r"(?:toyota|тойота|та[её]та)\s+(yaris|ярис|corolla|королла)\b", {"yaris": "Yaris / Yaris Cross", "ярис": "Yaris / Yaris Cross", "corolla": "Corolla / Corolla Cross", "королла": "Corolla / Corolla Cross"}, r"\b(?:cross|кросс)\b"),
+        (r"(?:mitsubishi|митсубиси)\s+(eclipse|эклипс)\b", {"eclipse": "Eclipse / Eclipse Cross", "эклипс": "Eclipse / Eclipse Cross"}, r"\b(?:cross|кросс)\b"),
+        (r"(?:ford|форд)\s+(mustang|мустанг)\b", {"mustang": "Mustang / Mustang Mach-E", "мустанг": "Mustang / Mustang Mach-E"}, r"\b(?:mach|мак|мач)\b"),
+        (r"(?:chevrolet|шевроле)\s+(blazer|блейзер)\b", {"blazer": "Blazer / Trailblazer", "блейзер": "Blazer / Trailblazer"}, r"trailblazer|трейлблейзер"),
+        (r"(?:haval|хавал)\s+(f\s*7|ф\s*7|dargo|дарго)\b", {"f7": "F7 / F7x", "ф7": "F7 / F7x", "dargo": "Dargo / Dargo X", "дарго": "Dargo / Dargo X"}, r"(?:f|ф)\s*7\s*[xх]\b|\b(?:dargo|дарго)\s*[xх]\b"),
+    )
+    for pattern, choices, specific in named:
+        match = re.search(pattern, text, re.I)
+        if match and not re.search(specific, text, re.I):
+            options = choices.get(re.sub(r"\s+", "", match.group(1).lower()))
+            if options:
+                return f"Уточните, пожалуйста: {options}?"
+    return None
+
+
 PROOFREAD_PROMPT = "Ты — корректор. Исправь только ошибки русского языка, о себе — женский род. Сохрани все имена, числа, смысл. Верни только исправленный текст."
 
 
@@ -166,6 +170,50 @@ class Agent:
         self._active: dict[int, int] = defaultdict(int)
         self._turn_sources: dict[int, dict] = {}
 
+    def _proposal_file(self, user_id):
+        return ROOT / ".runtime" / f"proposals-{self.config.bot_token.split(':')[0]}" / f"{user_id}.json"
+
+    def _save_proposal(self, user_id):
+        pending = self._pending.get(user_id)
+        if not pending or not pending.get("delivered"):
+            return
+        path = self._proposal_file(user_id)
+        saved = {key: value for key, value in pending.items() if key not in {"created", "delivery_token"}}
+        saved["expires"] = time.time() + 600 - (time.monotonic() - pending["created"])
+        temporary = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+                temporary = stream.name
+                json.dump({"proposal": saved, "state": self._state[user_id]}, stream, ensure_ascii=False)
+            os.replace(temporary, path)
+        except (OSError, TypeError, ValueError) as error:
+            log.error("Не удалось сохранить сводку (%s)", type(error).__name__)
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def _take_proposal(self, user_id):
+        path = self._proposal_file(user_id)
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (ValueError, OSError) as error:
+            log.error("Не удалось прочитать сводку (%s)", type(error).__name__)
+            saved = None
+        # Удаляем до обработки: после обрыва операции согласие нельзя использовать повторно.
+        path.unlink(missing_ok=True)
+        if saved and user_id not in self._pending:
+            try:
+                pending, state = saved["proposal"], saved["state"]
+                remaining = pending.pop("expires") - time.time()
+                if 0 < remaining <= 600 and pending.get("delivered") and isinstance(state, dict):
+                    pending.update(created=time.monotonic() - (600 - remaining), delivery_token=object())
+                    self._pending[user_id], self._state[user_id] = pending, state
+            except (KeyError, TypeError, AttributeError):
+                log.error("Сохранённая сводка повреждена")
+
     def cleanup_sessions(self, now=None, reserve=0):
         now = time.monotonic() if now is None else now
         expired = []
@@ -185,7 +233,11 @@ class Agent:
         try:
             async with self._locks[user_id]:
                 entered = True
-                yield
+                self._take_proposal(user_id)
+                try:
+                    yield
+                finally:
+                    self._save_proposal(user_id)
         finally:
             self._active[user_id] -= 1
             self._last_seen[user_id] = time.monotonic()
@@ -196,6 +248,7 @@ class Agent:
             self.cleanup_sessions()
 
     def reset(self, user_id: int) -> None:
+        self._proposal_file(user_id).unlink(missing_ok=True)
         if self._active.get(user_id):
             self._generation[user_id] += 1
         else:
@@ -218,6 +271,7 @@ class Agent:
         if pending and token is not None and pending.get("delivery_token") is token:
             pending["delivered"] = True
             self._state[user_id]["pending"] = {"action": pending["action"], "delivered": True}
+            self._save_proposal(user_id)
 
     def _offer(self, user_id, pending, prefix=""):
         answer = prefix + self._proposal_text(pending)
@@ -229,17 +283,19 @@ class Agent:
     def _system_prompt(self) -> str:
         config, now = self.config, self.store.now()
         contacts = ", ".join(contact for contact in (config.carwash_address, config.carwash_phone) if contact) or "не указаны"
-        return f"""РОЛЬ И КОНТЕКСТ
+        return plain_text(f"""РОЛЬ И КОНТЕКСТ
 Ты — Светлана, администратор автомойки «{config.carwash_name}». Говори о себе в женском роде.
 
 МАНЕРА РЕЧИ
-Отвечай как внимательный администратор в личной переписке: спокойно, по делу, грамотным живым русским языком. Обращайся на «вы». Обычный ответ — короткий абзац; объяснение или прайс могут быть длиннее, если клиенту нужны подробности. Сначала ответь на его вопрос, затем помоги со следующим шагом. Не пересказывай сообщение клиента и не описывай свои внутренние действия.
+В ответах используй только обычный дефис (-), в том числе вместо тире и для пунктов списка. Для кавычек используй только прямой двойной знак ("). Не используй длинное и среднее тире, кавычки-ёлочки и типографские кавычки.
+Пиши как администратор в обычном чате: спокойно, понятно, на «вы». На простой вопрос обычно достаточно одной-двух фраз; состав услуги или варианты времени покажи списком. Отвечай сразу по существу. Задавай вопрос, только когда ответ нужен для следующего действия: после справки не обязательно предлагать запись. Не пересказывай сообщение клиента и не описывай свои внутренние действия.
 Здоровайся один раз. Не начинай каждый ответ с «Поняла», «Отлично», «Конечно» или имени клиента. Без комплиментов машине, рекламных обещаний, навязчивых допродаж и финального «Чем ещё могу помочь?». Не используй канцелярит: вместо «осуществляется запись» — «можно записаться», вместо «предоставьте контактный номер» — «Напишите имя и телефон». Не ставь извинение перед обычным уточнением. Если ошиблась, один раз коротко исправься и продолжай с верными данными.
 Не копируй ругань и фамильярность клиента, не читай ему нотаций. «Братик», «додик», «привет» и подобные обращения — не имя. Имя бери из явного представления или ответа на вопрос об имени; имя Telegram не подставляй. На вопрос о себе честно скажи, что ты автоматический помощник автомойки. Не выдавай себя за человека и не обещай личных действий сотрудника.
 Не говори «записала» или «оформила», когда просто поняла модель автомобиля или запомнила данные. Если модель неоднозначна, уточни её. Не начинай объяснять подтверждение записи до сводки заказа. Приветствие уже отправляется командой /start: если клиент сразу переходит к машине или услуге, не здоровайся заново.
+Не превращай переписку в анкету или инструкцию. Вместо «Для продолжения оформления необходимо уточнить желаемую дату посещения» напиши «На какой день вас записать?». Вместо «Ваш запрос принят, данные успешно обновлены» продолжи разговор с учётом правки. Не добавляй вводные фразы, оценку выбора и пересказ правил к каждому ответу. Не повторяй цену и состав выбранной услуги, если клиент уже их видел и ничего не изменилось. При исправлении отвечай только о том, что изменилось или ещё нужно уточнить. Сохраняй нормальную грамотную речь: намеренные опечатки, сленг, уменьшительные слова и фамильярность не делают ответ живее.
 
 ОФОРМЛЕНИЕ ДЛЯ TELEGRAM
-Только обычный текст, без Markdown-заголовков, жирного шрифта, таблиц, кода и эмодзи. Разделяй смысловые блоки пустой строкой. Перечисление услуг, состава тарифа, тарифов или вариантов времени оформляй с новой строки, один пункт на строку с «— ». Не склеивай список запятыми в одно длинное предложение. У тарифа сначала название и проверенная цена, ниже состав. В прайсе показывай только то, о чём спросили; весь каталог нужен лишь по прямой просьбе. Для нескольких цен указывай класс, чтобы их нельзя было перепутать. Рубли пиши «1485 ₽», время — «14:00», даты в разговоре — «27 октября» с годом, если без него неясно. Не меняй смысл и числа ради красивой фразы.
+Только обычный текст, без Markdown-заголовков, жирного шрифта, таблиц, кода и эмодзи. Разделяй смысловые блоки пустой строкой. Перечисление услуг, состава тарифа, тарифов или вариантов времени оформляй с новой строки, один пункт на строку с "- ". Не склеивай список запятыми в одно длинное предложение. У тарифа сначала название и проверенная цена, ниже состав. В прайсе показывай только то, о чём спросили; весь каталог нужен лишь по прямой просьбе. Для нескольких цен указывай класс, чтобы их нельзя было перепутать. Рубли пиши «1485 ₽», время — «14:00», даты в разговоре — «27 октября» с годом, если без него неясно. Не меняй смысл и числа ради красивой фразы.
 
 КОНТЕКСТ И УТОЧНЕНИЯ
 CUSTOMER хранит подтверждённые словами клиента сведения и недостающие поля; STATE — проверенные инструментами результаты. Учитывай также переписку. Исправление заменяет только названное поле, остальные данные сохраняй. Уже известные имя, телефон, модель или дату не спрашивай заново. Сверяй вопрос с CUSTOMER.missing, но не выдавай весь список как анкету: спроси о ближайшем нужном шаге. Имя и телефон можно спросить вместе, когда клиент выбрал мойку и время. Для ответа о цене и составе имя и телефон не нужны.
@@ -248,7 +304,7 @@ CUSTOMER хранит подтверждённые словами клиента
 Не объединяй модели по совпадению номера или части названия. Уточняй, если клиент не назвал различающую часть: BMW 1–7 Series и X1–X7 (также i4/M4, i5/M5, i7); Audi A3–A8 и Q3–Q8; Mazda3/CX-3, Mazda5/CX-5, CX-3/CX-30, CX-5/CX-50; Infiniti Q50/QX50, Q60/QX60, Q70/QX70; Volvo S/V/XC 40, 60, 90; Mercedes A/GLA, C/GLC, E/GLE, S/GLS, CLA/GLA, CLS/GLS; Peugeot 208/2008, 308/3008, 408/4008, 508/5008; Citroën C3/C3 Aircross, C4/C4 X, C5/C5 Aircross/C5 X; Toyota Yaris/Yaris Cross, Corolla/Corolla Cross; Mitsubishi Eclipse/Eclipse Cross; Ford Mustang/Mustang Mach-E; Chevrolet Blazer/Trailblazer; Haval F7/F7x, Dargo/Dargo X. Если клиент указал полное обозначение, не заменяй его похожим и не задавай вопрос о букве, которую он уже назвал. Не определяй класс или цену по предположению: после уточнения следуй прайсу и правилам таблицы.
 
 КЛАСС И ПРАЙС
-STATE.catalog_data — полный прайс, уже прочитанный кодом из таблицы. Используй его без повторного get_price_list. Если данных для ответа достаточно, сразу отвечай или вызывай нужный инструмент; не перечитывай тот же прайс.
+Используй уже полученные результаты инструментов. Если данных достаточно, сразу отвечай или вызывай нужный инструмент; не перечитывай тот же прайс.
 Класс выбирай по марке/модели, кузову и прайсу. Если class_rules задаёт класс модели, следуй правилу и не спрашивай категорию. Иначе седан, хэтчбек и универсал — легковые; неоднозначную категорию уточни. Название класса копируй из size_classes. Если прайса нет в STATE, сначала вызови get_price_list. Не выводи цены из примеров, общей памяти или своих догадок. Цены, состав, доступность и скидки бери только из инструментов. Тариф — пакет из каталога; отдельная услуга — не название тарифа. Если клиент уже перечислил услуги, посчитай их; не заставляй выбирать пакет. Предлагай пакет только с проверенным составом и ценой, без неподтверждённого «так выгоднее».
 При изменении выбора или класса вызови calculate_price. Состав тарифа не дублируй в services: без отдельно заказанных допуслуг services=[]. Не добавляй сушку, коврики, воск или скидку, которых нет в результате инструмента. Сообщай о недоступном компоненте и изменении суммы до подтверждения. Допуслугу можно уместно предложить один раз; после отказа её не повторяй.
 
@@ -282,18 +338,35 @@ car — слова клиента с исходной цитатой; car_model 
 
 АКТУАЛЬНЫЕ ДАННЫЕ АВТОМОЙКИ
 Сейчас {now:%Y-%m-%d %H:%M}, {WEEKDAYS_RU[now.weekday()]} ({config.timezone}). Контакты: {contacts}. Валюта: {config.currency}.
-"""
+""")
+
+    def _clarification(self, user_id, field=None):
+        state = self._state[user_id]
+        missing = model_state(state)["missing"]
+        field = field or next(iter(missing), None)
+        questions = {"date": "На какой день вас записать?", "time": "На какое время вас записать?",
+                     "client_name": "Как вас зовут?", "phone": "Напишите телефон для записи.",
+                     "car": "Какой у вас автомобиль?", "car_model": "Уточните модель автомобиля, пожалуйста.",
+                     "size_class": "Уточните модель и кузов автомобиля, пожалуйста.",
+                     "tariff_or_services": "Какую мойку хотите?", "tariff": "Какой тариф выберете?",
+                     "services": "Какие услуги оставим?", "requested_service": "Какую мойку хотите?",
+                     "requested_datetime": "На какой день и время вас записать?",
+                     "available_time": "Какое другое время вам подойдёт?"}
+        return questions.get(field, "Не удалось проверить запись. Попробуйте ещё раз чуть позже.")
 
     def _remember(self, user_id, text, answer):
+        if re.search(r"\b(?:respond|CUSTOMER|STATE|tentative|tool_choice|missing_[a-z_]+)\b", answer, re.I):
+            log.warning("Служебный текст заменён вопросом клиенту")
+            answer = self._clarification(user_id)
         self._turn_text.pop(user_id, None)
         history = self._history[user_id]
         pending = self._pending.get(user_id)
         state = self._state[user_id]
-        greeting = re.match(r"^(?:здравствуйте|здравствуй|привет|доброе утро|добрый день|добрый вечер)[!,.\s]+", answer, re.I)
+        greeting = re.match(r"^(?:здравствуйте|здравствуй|привет|доброе утро|добрый день|добрый вечер)(?:[!,.\s]+|$)", answer, re.I)
         if greeting:
-            if state.get("greeted") and answer[greeting.end():].strip():
+            if state.get("greeted"):
                 answer = answer[greeting.end():].lstrip()
-                answer = answer[0].upper() + answer[1:]
+                answer = answer[0].upper() + answer[1:] if answer else "Чем могу помочь?"
             state["greeted"] = True
         state.pop("choice_offer", None)
         selection = state.get("selection", {})
@@ -305,12 +378,6 @@ car — слова клиента с исходной цитатой; car_model 
                 state["choice_offer"] = {"tariff": mentioned[0]}
                 if selection.get("tariff") == mentioned[0] and "services" in selection:
                     state["choice_offer"]["services"] = selection["services"]
-        if (not pending and self._state[user_id].get("stage") not in {"booked", "cancelled"}
-                and not re.search(r"\b(?:не|если|или|либо|вроде|кажется|наверное|возможно|может)\b", text, re.I)):
-            phones = PHONE.findall(text)
-            if (len(phones) == 1 and valid_phone(phones[0])
-                    and (PHONE.fullmatch(text.strip()) or re.search(r"\b(?:телефон\w*|запишите|записаться|мой\s+номер)\b", text, re.I))):
-                apply_patch(self._state[user_id], {"phone": phones[0]}, {})
         name = self._state[user_id].get("facts", {}).get("client_name", "")
         prefix = rf"^{re.escape(name)},\s*(?=\S)"
         if (name and not pending and re.match(prefix, answer, re.I) and any(
@@ -344,250 +411,6 @@ car — слова клиента с исходной цитатой; car_model 
             extra = {"подтверждаю отмену", "да отменяйте", "отменяйте", "да отменяйте запись"}
         return value in common | extra
 
-    @staticmethod
-    def _direct_boundary(text):
-        if re.search(r"системн\w*\s+(?:промпт|инструкц)|(?:api|апи)[ -]*ключ|токен\s+бот|игнорир\w*.{0,25}(?:правил|инструкц)|ты\s+теперь|я\s+твой\s+(?:начальник|разработчик)", text, re.I):
-            return "Могу помочь с услугами автомойки и вашими записями. Оформление, перенос и отмена выполняются только после кнопки «Подтвердить»."
-        if re.search(r"(?:подтверд|оформ|запиш)\w*.{0,30}(?:без\s+(?:кнопк|подтвержд)|сам(?:а)?\b)|\b(?:убью|уничтожу|взорву|угрожаю)\b", text, re.I):
-            return "Для оформления или изменения записи нужна кнопка «Подтвердить». Если данные неверны, напишите правильные в чат."
-        return None
-
-    async def _direct_booking(self, user, text):
-        state = self._state[user.id]
-        intent = bool(re.search(r"\b(?:запишите|записаться)\b|\b(?:хочу|хотел\w*|можно|надо|нужно|давай\w*).{0,50}\b(?:помыть\w*|вымыть\w*|мойк\w*)\b|\b(?:помыть\w*|вымыть\w*).{0,50}\b(?:хочу|хотел\w*|надо|нужно)\b|^\s*(?:мойка|на\s+мойку|помыть(?:ся)?)\s*[.!?]*$", text, re.I))
-        negative = bool(re.search(r"\bне\s+(?:хочу|хотел\w*|буду|надо|нужно|запис\w*|мыть|помыть\w*)\b", text, re.I))
-        uncertain = bool(re.search(r"\b(?:если|или|либо|пока)\b", text, re.I))
-        vehicle_like = bool(re.match(r"^(?:(?:у меня|это|машина|авто|автомобиль)\s+)?(?:" + CAR_BRANDS + r")\b", text, re.I))
-        if (not self.config.ai_direct_actions or state.get("stage") == "uncertain" or negative or uncertain
-                or "?" in text and not intent and not state.get("booking_requested")
-                or re.search(r"\bне\b", text, re.I) and not (intent and not state.get("facts", {}).get("car"))):
-            return None
-        before = dict(state.get("facts", {}))
-        requested = intent or vehicle_like or state.pop("choice_accepted", False)
-        if requested:
-            state["booking_requested"] = True
-        if not state.get("booking_requested"):
-            return None
-        opening = {"привет", "здравствуйте", "здравствуй", "добрый", "день", "вечер", "хочу", "хотел", "хотела", "бы", "можно", "мне", "нам", "надо", "нужно", "машину", "машинку", "авто", "автомобиль", "помыть", "помыться", "вымыть", "на", "мойку", "мойка", "запишите", "записаться", "меня", "пожалуйста", "давайте", "давай", "не", "очень", "дорого", "недорого", "дешево", "подешевле"}
-        if requested and not before.get("car") and set(re.findall(r"[а-яёa-z0-9]+", folded(text))) <= opening:
-            return "Какой у вас автомобиль?"
-        patch = {}
-        previous = self._history[user.id][-1]["content"] if self._history[user.id] else ""
-        if (not before.get("client_name") and ("Как вас зовут?" in previous or "Напишите имя и телефон" in previous)
-                and re.fullmatch(r"[А-ЯЁа-яё]{2,24}(?:[ -][А-ЯЁа-яё]{2,24}){0,2}", text.strip())
-                and not re.search(r"\b(?:да|нет|не|потом|завтра|сегодня|привет|братик|брат|додик|подожди|спасибо|стандарт|экспресс|комплекс)\b", text, re.I)):
-            patch["client_name"] = text.strip()
-        phones = PHONE.findall(text)
-        if len(phones) == 1 and valid_phone(phones[0]):
-            patch["phone"] = phones[0]
-            named = re.search(r"(?:^|[.,:;]\s*)([А-ЯЁа-яё][а-яё]{1,24})\s*(?:[,;:]\s*|\s+)" + re.escape(phones[0]), text)
-            if named:
-                patch["client_name"] = named[1]
-        named = re.search(r"\b(?:меня\s+зовут|имя\s*[:—-])\s*([А-ЯЁа-яё][А-ЯЁа-яё -]{1,60}?)(?=[,;\n\d]|$)", text, re.I)
-        if named:
-            patch["client_name"] = named[1].strip()
-        for field, value in (("date", source_date(text, self.store.now(), True)), ("time", source_time(text, True))):
-            if value is not None:
-                patch[field] = str(value)
-        corrected = re.search(r"\bвместо\s+\d{1,2}[:.]\d{2}[^\n]{0,35}?\b(?:в|на)\s*(\d{1,2}[:.]\d{2})(?!\d)", text, re.I)
-        if corrected:
-            patch["time"] = parse_time(corrected[1])
-        elif len(re.findall(r"(?<!\d)\d{1,2}:\d{2}(?!\d)", text)) > 1:
-            return None
-        if "date" in patch and "time" not in patch and before.get("time"):
-            patch["time"] = before["time"]
-        if patch:
-            apply_patch(state, patch, {})
-        if not state.get("facts", {}).get("car") or not state.get("facts", {}).get("tariff"):
-            catalog = await asyncio.to_thread(self.store.price_list)
-            self._literal_catalog_facts(user, {"class_rules": catalog.get("class_rules", []),
-                                               "size_classes": catalog.get("size_classes", []),
-                                               "tariffs": [tariff["name"] for tariff in catalog.get("tariffs", [])]})
-            state["catalog_data"] = catalog
-        data = state.get("catalog_data", {})
-        facts = state.get("facts", {})
-        choices = state.get("vehicle_choices")
-        if facts.get("car"):
-            state.pop("vehicle_choices", None)
-        if choices and not facts.get("car"):
-            target = ("BMW X4" if re.search(r"\b(?:[xх]\s*4|икс\s*(?:4|четверт\w*)|втор\w*|кроссовер)\b", text, re.I)
-                      else "BMW 4 Series" if re.search(r"\b(?:4\s*series|четверт\w*\s+сери\w*|4\s*сери\w*|перв\w*)\b", text, re.I) else None)
-            if target:
-                stem = "кроссовер" if target == "BMW X4" else "легков"
-                classes = [kind for kind in data.get("size_classes", []) if folded(kind).startswith(stem)]
-                apply_patch(state, {"car": target, "car_model": target, **({"size_class": classes[0]} if len(classes) == 1 else {})}, {})
-                state.pop("vehicle_choices", None)
-                facts = state["facts"]
-        if not facts.get("car") and re.search(r"\b(?:беха|бэха|бмв|bmw)\s*(?:четверт\w*|4)\b", folded(text)):
-            state["vehicle_choices"] = True
-            return "Уточните: BMW 4 Series или BMW X4?"
-        if not facts.get("car") and vehicle_like:
-            car = re.sub(r"^(?:у меня|это|машина|авто|автомобиль)\s+", "", text.strip(), flags=re.I).split(",", 1)[0].strip(" .!?")
-            if re.fullmatch(r"(?:" + CAR_BRANDS + r")\s+(?!(?:не\s|или\s))[\w .-]{1,50}", car, re.I):
-                apply_patch(state, {"car": car, "car_model": car}, {})
-                facts = state["facts"]
-        if facts.get("car") and not facts.get("size_class"):
-            stem = ("кроссовер" if re.search(r"кроссовер|паркетник", text, re.I)
-                    else "внедорожник" if re.search(r"внедорожник|минив[еэ]н", text, re.I)
-                    else "легков" if re.search(r"седан|х[еэ]тчб[еэ]к|универсал|купе|кабриолет|легков", text, re.I) else "")
-            classes = [kind for kind in data.get("size_classes", []) if stem and folded(kind).startswith(stem)]
-            if len(classes) == 1:
-                apply_patch(state, {"size_class": classes[0]}, {})
-        if facts.get("car") and not facts.get("tariff") and not facts.get("services"):
-            selected = [item["name"] for item in data.get("services", []) if folded(item["name"]) in folded(text)]
-            if re.search(r"наружк\w*|наружн\w*\s+мойк\w*", text, re.I):
-                selected += [item["name"] for item in data.get("services", []) if "кузов" in folded(item["name"])]
-            if selected:
-                apply_patch(state, {"services": list(dict.fromkeys(selected))}, {})
-        if ((requested or facts != before) and all(facts.get(field) for field in BOOKING_REQUIRED) and (facts.get("tariff") or facts.get("services"))
-                and not state.get("tentative")):
-            result = await self._call_tool("create_booking", "{}", user)
-            if result.get("confirmation_required"):
-                return self._offer(user.id, self._pending[user.id])
-            if result.get("table_unavailable"):
-                return result["error"]
-            if not result.get("ok"):
-                days = result.get("availability", {}).get("days", [])
-                alternatives = [f"— {day['date']} в {hour}" for day in days for hour in day.get("free_times", [])]
-                return result.get("error", "Не удалось подготовить запись") + ("\n\nСвободное время:\n" + "\n".join(alternatives[:8]) if alternatives else "")
-        if state.get("booking_requested"):
-            if facts.get("car") and not facts.get("size_class"):
-                return "Какой у автомобиля кузов: седан, хэтчбек, универсал, кроссовер или внедорожник/минивэн?"
-            if facts.get("car") and (facts.get("tariff") or facts.get("services")):
-                missing = [field for field in BOOKING_REQUIRED if not facts.get(field)]
-                if "date" in missing and "time" in missing:
-                    return "На какой день и время вас записать?"
-                if "date" in missing:
-                    return "На какой день вас записать?"
-                if "time" in missing:
-                    return "Какое время вам подходит?"
-                if "client_name" in missing and "phone" in missing:
-                    return "Напишите имя и телефон для записи."
-                if "client_name" in missing:
-                    return "Как вас зовут?"
-                if "phone" in missing:
-                    return "Напишите телефон для записи."
-            if facts.get("car") and not facts.get("tariff") and not facts.get("services"):
-                tariffs = "\n".join("— " + item["name"] for item in data.get("tariffs", []))
-                return "Какую мойку хотите: тариф или отдельные услуги?" + ("\n\nТарифы:\n" + tariffs if tariffs else "")
-            if not facts.get("car"):
-                return "Уточните марку и модель автомобиля, например Toyota RAV4 или BMW 4 Series."
-        return None
-
-    async def _direct_existing(self, user, text, pending=None):
-        if not self.config.ai_direct_actions:
-            return None
-        state = self._state[user.id]
-        moving = bool(re.search(r"\b(?:перенес\w*|перен[её]с\w*|перенести|перенос\w*|сдвин\w*)\b", text, re.I))
-        cancelling = bool(re.search(r"\b(?:отмен\w*|убер\w*|удал\w*)\b.{0,35}\b(?:запис\w*|брон\w*)\b", text, re.I))
-        lookup = bool(re.search(r"\b(?:мо[яиюе]\s+запис\w*|(?:покажи\w*|когда|сколько|во\s+сколько).{0,40}запис\w*)\b", text, re.I))
-        change = state.get("pending_change", {})
-        if re.search(r"\b(?:если|не|как|почему)\b", text, re.I) and (moving or cancelling):
-            return None
-        if pending and pending["action"] == "create_booking" and cancelling and not re.search(r"[#№]\s*\d", text):
-            state.pop("booking_requested", None)
-            state.pop("review_required", None)
-            return "Предложение отменено. Новая запись не создана."
-        if pending and pending["action"] == "create_booking" and moving:
-            return None
-        if pending and pending["action"] == "reschedule_booking":
-            change = state["pending_change"] = {"action": "reschedule_booking", "booking_id": pending["args"]["booking_id"]}
-        if not (moving or cancelling or lookup or change):
-            return None
-        mine = await asyncio.to_thread(self.store.my_bookings, user.id)
-        bookings = mine.get("bookings", [])
-        if not bookings:
-            state.pop("pending_change", None)
-            return "Предстоящих записей у вас нет."
-        listing = "\n\n".join(f"Запись #{b['booking_id']}\n{b['date']} в {b['time']}\n{b['car']}\nТариф: {b['tariff'] or 'без тарифа'}\nИтого: {b['total']} {self.config.currency}" for b in bookings)
-        if lookup and not (moving or cancelling or change):
-            return listing
-        identifier = re.search(r"[#№]\s*(\d+)|запис\w*\s+(\d+)", text, re.I)
-        wanted = next((part for part in identifier.groups() if part), None) if identifier else change.get("booking_id")
-        selected = next((b for b in bookings if str(b["booking_id"]) == str(wanted)), None) if wanted else bookings[0] if len(bookings) == 1 else None
-        if not selected:
-            return "Укажите номер своей записи.\n\n" + listing
-        if state.get("stage") == "uncertain":
-            return "Результат предыдущего изменения не подтверждён. Проверьте запись и свяжитесь с администратором перед повтором.\n\n" + listing
-        if cancelling:
-            state.pop("pending_change", None)
-            result = await self._call_tool("cancel_booking", _compact_json({"booking_id": str(selected["booking_id"])}), user)
-        else:
-            date = source_date(text, self.store.now(), True)
-            time = source_time(text, True)
-            correction = re.search(r"\bвместо\s+\d{1,2}[:.]\d{2}[^\n]{0,35}?\b(?:в|на)\s*(\d{1,2}[:.]\d{2})(?!\d)", text, re.I)
-            if correction:
-                time = parse_time(correction[1])
-            if date is not None and time is None:
-                time = selected["time"]
-            state["pending_change"] = {"action": "reschedule_booking", "booking_id": str(selected["booking_id"])}
-            if not time:
-                return "На какое время перенести запись? Исходная запись пока сохранена."
-            date = str(date) if date else selected["date"]
-            result = await self._call_tool("reschedule_booking", _compact_json({"booking_id": str(selected["booking_id"]), "date": date, "time": time}), user)
-        if result.get("confirmation_required"):
-            state.pop("pending_change", None)
-            return self._offer(user.id, self._pending[user.id])
-        return result.get("error", "Не удалось подготовить изменение. Исходная запись сохранена.")
-
-    async def _load_public_catalog(self, user):
-        data = await asyncio.to_thread(self.store.price_list)
-        if not data.get("ok"):
-            return data
-        state = self._state[user.id]
-        state["catalog"] = {"size_classes": data["size_classes"], "class_rules": data.get("class_rules", []),
-                            "tariffs": [item["name"] for item in data["tariffs"]],
-                            "services": [item["name"] for item in data["services"]],
-                            "unavailable_services": data.get("unavailable_services", [])}
-        state["catalog_data"] = data
-        self._literal_catalog_facts(user, state["catalog"])
-        return data
-
-    async def _direct_prices(self, user, text):
-        if (not self.config.ai_direct_actions or re.search(r"сравн|разниц|отлича", text, re.I)
-                or not re.search(r"прайс|сколько|стоимост|стоит|поч[её]м|какие.{0,20}(?:тариф|услуг|цен)|что.{0,15}входит", text, re.I)):
-            return None
-        data = await self._load_public_catalog(user)
-        if not data.get("ok"):
-            return None
-        state = self._state[user.id]
-        size = state.get("facts", {}).get("size_class")
-        tariffs = [item for item in data["tariffs"] if re.search(r"(?<!\w)" + re.escape(item["name"]) + r"\w*", text, re.I)]
-        services = [item for item in data["services"] if folded(item["name"]) in folded(text)]
-        if not tariffs and not services and not re.search(r"прайс|какие|тарифы|услуги|цены", text, re.I):
-            return None
-        if not tariffs and not services:
-            if re.search(r"услуг", text, re.I) and not re.search(r"тариф", text, re.I):
-                services = data["services"]
-            else:
-                tariffs = data["tariffs"]
-        blocks = []
-        for item in tariffs:
-            if not size:
-                prices = "\n".join(f"— {kind}: {amount} {self.config.currency}" for kind, amount in item["prices"].items())
-                blocks.append(f"Тариф «{item['name']}»\n{prices}")
-                continue
-            quote = await asyncio.to_thread(self.store.calculate_price, size, item["name"], [])
-            if quote.get("ok"):
-                composition = [component for line in quote["lines"] for component in line.get("includes", [line["item"]])]
-                block = f"Тариф «{item['name']}» — {quote['total']} {self.config.currency}\n" + "\n".join("— " + part for part in composition)
-                removed = [part for line in quote["lines"] for part in line.get("not_included_now", [])]
-                if removed:
-                    block += "\nСейчас недоступно:\n" + "\n".join("— " + part for part in removed)
-                blocks.append(block)
-                if len(tariffs) == 1:
-                    state.update(selection={"size_class": size, "tariff": item["name"], "services": []},
-                                 quote=self._quote_state(quote))
-        for item in services:
-            if size and size in item["prices"]:
-                blocks.append(f"— {item['name']} — {item['prices'][size]} {self.config.currency}")
-            elif not size:
-                blocks.append(item["name"] + "\n" + "\n".join(f"— {kind}: {amount} {self.config.currency}" for kind, amount in item["prices"].items()))
-        if not blocks:
-            return None
-        prefix = f"Для класса «{size}»:\n\n" if size else "Цены по классам автомобилей:\n\n"
-        return prefix + "\n\n".join(blocks)
-
     async def reply(self, user: ChatUser, text: str) -> str:
         async with self._session(user.id):
             deadline = time.monotonic() + self.config.ai_request_budget_sec
@@ -604,12 +427,11 @@ car — слова клиента с исходной цитатой; car_model 
                 return "Сообщение слишком длинное. Напишите, пожалуйста, короче: автомобиль, услуга и желаемое время."
             self._turn_text[user.id] = text
             self._turn_sources[user.id] = {}
+            phones = PHONE.findall(text)
+            if (len(phones) == 1 and valid_phone(phones[0])
+                    and not re.search(r"\b(?:не|если|или|либо|возможно|может)\b", text, re.I)):
+                apply_patch(self._state[user.id], {"phone": phones[0]}, {})
             pending = self._pending.get(user.id)
-            boundary = self._direct_boundary(text) if self.config.ai_direct_actions else None
-            changing = bool(re.search(r"\b(?:отмен\w*|убер\w*|удал\w*|перенес\w*|перенести|измени\w*|вместо|зовут|телефон\w*|автомобил\w*|машин\w*)\b", text, re.I)
-                            or source_date(text, self.store.now(), True) or source_time(text, True) or PHONE.search(text))
-            if pending and boundary and not changing:
-                return self._remember(user.id, text, boundary)
             if pending and self._affirmative(text, pending["action"]):
                 if not pending.get("delivered"):
                     self._pending.pop(user.id, None)
@@ -629,7 +451,27 @@ car — слова клиента с исходной цитатой; car_model 
             state = self._state[user.id]
             clarification = vehicle_clarification(text)
             if clarification:
-                return self._remember(user.id, text, clarification)
+                state["vehicle_ambiguous"] = True
+                state.pop("vehicle_clarification_turn", None)
+            elif state.get("vehicle_ambiguous"):
+                state["vehicle_clarification_turn"] = True
+            period = re.search(r"\b(?:вечер\w*|утра|дня|ноч\w*)\b", text, re.I)
+            ambiguous_time = state.get("ambiguous_time")
+            if period and ambiguous_time and not source_time(text, True):
+                hour = int(ambiguous_time[:2])
+                if re.match(r"вечер|дня", period[0], re.I) and 1 <= hour <= 11:
+                    hour += 12
+                elif re.match(r"ноч", period[0], re.I) and hour == 12:
+                    hour = 0
+                apply_patch(state, {"time": f"{hour:02d}:{ambiguous_time[3:]}"}, {})
+                state.pop("ambiguous_time", None)
+            elif re.search(r"\bна\s+(?:час|один|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять|одиннадцать|двенадцать|[1-9]|1[0-2])\b", text, re.I) and not period:
+                clock = source_time(text, True)
+                if clock:
+                    state["ambiguous_time"] = clock
+                    state.setdefault("facts", {}).pop("time", None)
+            elif ambiguous_time and source_time(text, True) and not re.search(r"\b(?:не|если|или|либо)\b", text, re.I):
+                state.pop("ambiguous_time", None)
             action = "cancel_booking" if state.get("stage") == "cancelled" else "create_booking"
             if not pending and self._affirmative(text, action):
                 receipt = self._receipt(state)
@@ -640,7 +482,6 @@ car — слова клиента с исходной цитатой; car_model 
                 choice = state.pop("choice_offer", None)
                 if choice and not state.get("quote", {}).get("stale"):
                     apply_patch(state, choice, {})
-                    state["choice_accepted"] = True
             state.setdefault("confirmed", False)
             try:
                 if (not pending and re.search(r"\bсвободн\w*\b", text, re.I)
@@ -657,32 +498,20 @@ car — слова клиента с исходной цитатой; car_model 
                     blocks = [day["date"] + " (" + day["weekday"] + "):\n" + "\n".join("— " + hour for hour in day["free_times"]) for day in days]
                     question = "Во сколько вы заканчиваете работу?" if re.search(r"после\s+работы", text, re.I) else "Какое время вам подходит?"
                     return self._remember(user.id, text, "Свободное время:\n\n" + "\n\n".join(blocks) + "\n\n" + question)
-                direct = await asyncio.wait_for(self._direct_existing(user, text, pending), timeout=remaining())
-                if direct is not None:
-                    return self._remember(user.id, text, direct)
-                direct = await asyncio.wait_for(self._direct_prices(user, text), timeout=remaining())
-                if direct is not None:
-                    return self._remember(user.id, text, direct)
-                direct = await asyncio.wait_for(self._direct_booking(user, text), timeout=remaining())
-                if direct is not None:
-                    return self._remember(user.id, text, direct)
-                if boundary:
-                    return self._remember(user.id, text, boundary)
-                if self.config.ai_direct_actions:
-                    await asyncio.wait_for(self._load_public_catalog(user), timeout=remaining())
             except Exception as error:
-                log.warning("Прямая подготовка записи недоступна (%s)", api_error_label(error))
+                log.warning("Не удалось прочитать расписание (%s)", api_error_label(error))
             review_before = dict(state.get("facts", {})) if state.get("review_required") else None
             if (state.get("stage") not in {"booked", "cancelled"}
                     and not re.search(r"\b(?:не|если|или|либо|вроде|кажется|наверное|возможно|может)\b", text, re.I)):
-                if re.search(r"\b(?:можно|хочу|запи\w*|свобод\w*)\b", text, re.I):
+                if re.search(r"\b(?:можно|хочу|запи\w*|свобод\w*)\b|\b\d{1,2}(?:-?го)?\s+на\s+", text, re.I):
                     parsed = {"date": source_date(text, self.store.now(), True), "time": source_time(text, True)}
-                    apply_patch(state, {field: str(value) for field, value in parsed.items() if value is not None}, {})
+                    apply_patch(state, {field: str(value) for field, value in parsed.items() if value is not None and not (field == "time" and state.get("ambiguous_time"))}, {})
             messages = [{"role": "system", "content": self._system_prompt()}]
-            projected = model_state(state)
-            if len(text) + sum(map(len, state.get("context", []))) > self.config.ai_history_chars:
-                projected.pop("context", None)
-            customer = {field_name: projected.pop(field_name) for field_name in ("facts", "tentative", "missing", "invalidated", "context") if field_name in projected}
+            if clarification:
+                messages.append({"role": "system", "content": "Автомобиль неоднозначен. Сохрани остальные данные клиента, не выбирай модель и класс, не оформляй запись. Задай уточнение: " + clarification})
+            if state.get("ambiguous_time"):
+                messages.append({"role": "system", "content": "Время неоднозначно: уточни утро или вечер, не выбирай время и не оформляй запись. Сохрани остальные данные."})
+            customer, projected = self._model_context(user.id)
             if customer:
                 messages.append({"role": "system", "content": "CUSTOMER " + _compact_json(customer)})
             if projected.keys() - {"confirmed"}:
@@ -695,6 +524,10 @@ car — слова клиента с исходной цитатой; car_model 
                 await asyncio.wait_for(self._remember_choice(user, state.get("facts", {})), timeout=remaining())
                 answer = _clean_text(await asyncio.wait_for(
                     self._run(messages, user, review_before), timeout=remaining()))
+                if user.id not in self._pending and re.search(r"\bподтвердите\s+(?:запись|заказ)\b", answer, re.I):
+                    result = await asyncio.wait_for(self._call_tool("create_booking", "{}", user), timeout=remaining())
+                    answer = (self._offer(user.id, self._pending[user.id]) if result.get("confirmation_required")
+                              else self._clarification(user.id, result.get("field")))
                 if self.config.ai_proofread_enabled and user.id not in self._pending:
                     answer = await self._proofread(answer)
                 if user.id not in self._pending:
@@ -726,7 +559,10 @@ car — слова клиента с исходной цитатой; car_model 
                                 answer = (f"Какую мойку хотите для {car}: тариф или отдельные услуги?" if car
                                           else "Уточните марку и модель автомобиля, пожалуйста.")
             except Exception as error:
-                log.error("Ошибка AI (%s)", api_error_label(error))
+                trace = error.__traceback__
+                while trace.tb_next:
+                    trace = trace.tb_next
+                log.error("Ошибка AI (%s), %s:%d", api_error_label(error), trace.tb_frame.f_code.co_name, trace.tb_lineno)
                 self._pending.pop(user.id, None)
                 self._state[user.id].pop("pending", None)
                 phone = f" или позвоните нам: {self.config.carwash_phone}" if self.config.carwash_phone else ""
@@ -735,6 +571,11 @@ car — слова клиента с исходной цитатой; car_model 
                 self._pending.pop(user.id, None)
                 self._state.pop(user.id, None)
                 return "Диалог сброшен. Уточните, чем помочь."
+            if user.id not in self._pending and not answer.startswith("Сейчас не получилось"):
+                if clarification:
+                    answer = clarification
+                elif state.get("ambiguous_time"):
+                    answer = "Уточните, пожалуйста, это утро или вечер?"
             return self._remember(user.id, text, answer)
 
     async def proposal_action(self, user: ChatUser, offer_id: str, action: str) -> str:
@@ -742,6 +583,8 @@ car — слова клиента с исходной цитатой; car_model 
             if not self.config.ai_enabled:
                 return "Автоматический помощник сейчас отключён. Для записи свяжитесь с администратором."
             pending = self._pending.get(user.id)
+            if offer_id in self._state[user.id].get("consumed_offers", []):
+                return ""
             if action not in {"confirm", "edit"} or not isinstance(offer_id, str) or not pending or pending.get("offer_id") != offer_id:
                 return "Эта сводка уже не действует. Проверьте последнее сообщение с данными записи."
             if not pending.get("delivered"):
@@ -753,6 +596,8 @@ car — слова клиента с исходной цитатой; car_model 
                 state.pop("outstanding", None)
                 state.update(stage="collecting", confirmed=False)
                 return "Предложение устарело. Уточните желаемую дату и время, я проверю их заново."
+            consumed = [*state.get("consumed_offers", [])[-7:], offer_id]
+            state["consumed_offers"] = consumed
             self._pending.pop(user.id, None)
             state.pop("pending", None)
             if action == "edit":
@@ -763,6 +608,7 @@ car — слова клиента с исходной цитатой; car_model 
                 return self._remember(user.id, "Нажата кнопка «Изменить».", "Напишите, что изменить. Остальные данные сохраню и покажу новую сводку.")
             generation = self._generation[user.id]
             answer = await self._confirm(user, pending)
+            self._state[user.id]["consumed_offers"] = consumed
             if generation != self._generation[user.id]:
                 self._pending.pop(user.id, None)
                 self._state.pop(user.id, None)
@@ -790,7 +636,7 @@ car — слова клиента с исходной цитатой; car_model 
                     raise ValueError("conflicting_memory_sources")
             reply = other_reply or reply
             changes, tentative = {**changes, **other_changes}, {**tentative, **other_tentative}
-        if not isinstance(changes, dict) or not isinstance(tentative, dict) or changes.keys() & tentative.keys():
+        if not isinstance(changes, dict) or not isinstance(tentative, dict):
             raise ValueError("contradictory_fact_status")
         source = self._turn_text.get(user.id, "")
         changes = literal_car_patch(changes, source)
@@ -813,7 +659,33 @@ car — слова клиента с исходной цитатой; car_model 
             catalog = await asyncio.to_thread(self.store.get_catalog)
         validator = salvage_patch if partial else validate_patch
         changes = validator(changes, source, self.store.now(), catalog, known=self._state[user.id].get("facts"))
+        state = self._state[user.id]
+        if state.get("vehicle_ambiguous") and not state.get("vehicle_clarification_turn"):
+            changes.pop("car_model", None)
+            changes.pop("size_class", None)
+        elif state.get("vehicle_clarification_turn") and changes.get("car_model"):
+            state.pop("vehicle_ambiguous", None)
+            state.pop("vehicle_clarification_turn", None)
+        if state.get("ambiguous_time"):
+            changes.pop("time", None)
         tentative = validator(tentative, source, self.store.now(), catalog, tentative=True)
+        for field in {"date", "time", "phone"} & tentative.keys() - changes.keys():
+            if tentative[field] is None or field == "time" and state.get("ambiguous_time"):
+                continue
+            try:
+                resolved = validate_patch({field: sources[1][field]}, source, self.store.now())
+            except (ValueError, TypeError):
+                continue
+            changes.update(resolved)
+            tentative.pop(field)
+            sources[0][field] = sources[1][field]
+        conflicts = []
+        for field in changes.keys() & tentative.keys():
+            if tentative[field] is None or same(field, changes[field], tentative[field]):
+                tentative.pop(field)
+            else:
+                changes.pop(field)
+                conflicts.append(field)
         positions = {}
         for values, entries, current in ((changes, sources[0], self._state[user.id].get("facts", {})),
                                          (tentative, sources[1], self._state[user.id].get("tentative", {}))):
@@ -833,6 +705,12 @@ car — слова клиента с исходной цитатой; car_model 
             self._state[user.id].pop("selection", None)
         apply_patch(self._state[user.id], changes, tentative)
         self._turn_sources.setdefault(user.id, {}).update(positions)
+        if conflicts:
+            labels = {"car": "автомобиль", "car_model": "модель автомобиля", "size_class": "класс автомобиля",
+                      "date": "дату", "time": "время", "phone": "телефон", "client_name": "имя",
+                      "tariff": "тариф", "services": "услуги", "requested_service": "услугу",
+                      "requested_datetime": "дату и время", "comment": "пожелания"}
+            return "Уточните, пожалуйста, " + ", ".join(dict.fromkeys(labels[field] for field in sorted(conflicts))) + ". Остальные данные сохранила."
         return reply
 
     async def _remember_choice(self, user, selection):
@@ -864,6 +742,8 @@ car — слова клиента с исходной цитатой; car_model 
         facts = state.get("facts", {})
         guesses = state.get("tentative", {})
         result = dict(args)
+        if state.get("vehicle_ambiguous") or state.get("ambiguous_time"):
+            raise ValueError("customer_clarification_required")
         selection, quote = state.get("selection", {}), state.get("quote", {})
         if ("services" in result and facts.get("tariff") and selection.get("tariff") == facts["tariff"]
                 and selection.get("size_class") == facts.get("size_class") and not quote.get("stale")):
@@ -964,47 +844,6 @@ car — слова клиента с исходной цитатой; car_model 
     def _quote_state(self, quote):
         return {**{field_name: quote[field_name] for field_name in ("total", "currency", "lines")},
                 "checked_at": self.store.now().isoformat(timespec="seconds")}
-
-    def _literal_catalog_facts(self, user, catalog):
-        source = self._turn_text.get(user.id, "")
-        matches = []
-        aliases = {
-            "Toyota RAV4": ("кроссовер", {"toyotarav4", "тойотарав4", "тойотараф4", "тойотаrav4", "rav4", "рав4", "раф4"}, r"(?:(?:тойота|та[её]та|toyota)\s+)?(?:[рr][аa][вфv]\s*4|rav\s*4|рафчик\s+(?:четв[её]ртый|4))"),
-            "BMW X5": ("кроссовер", {"bmwx5", "бмвх5", "бмвx5", "bmwх5", "x5", "х5"}, r"(?:(?:bmw|бмв)\s*)?[xх]\s*5"),
-            "BMW X4": ("кроссовер", {"bmwx4", "бмвх4", "бмвx4", "bmwх4", "x4", "х4"}, r"(?:(?:bmw|бмв|беха|бэха)\s*)?(?:[xх]|икс)\s*4"),
-            "BMW 4 Series": ("легков", {"bmw4series", "бмв4серия", "бмвчетвертаясерия"}, r"(?:(?:bmw|бмв|беха|бэха)\s*)?(?:4\s*series|4(?:-я)?\s*сери\w*|четверт\w*\s+сери\w*)"),
-            "Mitsubishi Lancer": ("легков", {"mitsubishilancer", "митсубисилансер", "лансер"}, r"(?:(?:mitsubishi|митсубиси)\s+)?(?:lancer|лансер)(?:\s+(?:девятый|9|ix))?"),
-            "Ford Focus": ("легков", {"fordfocus", "фордфокус"}, r"(?:ford\s*focus|форд\s*фокус)"),
-            "Toyota Camry": ("легков", {"toyotacamry", "тойотакамри"}, r"(?:(?:toyota|тойота)\s*)?(?:camry|камри)"),
-            "Lada Vesta": ("легков", {"ladavesta", "ладавеста"}, r"(?:(?:lada|лада)\s*)?(?:vesta|веста)"),
-        }
-        key = lambda value: re.sub(r"[\s-]+", "", folded(value))
-        rules = list(catalog.get("class_rules", []))
-        for model, (stem, keys, pattern) in aliases.items():
-            if any(key(rule["car"]) in keys for rule in rules):
-                continue
-            classes = [name for name in catalog.get("size_classes", []) if folded(name).startswith(stem)]
-            if len(classes) == 1:
-                rules.append({"car": model, "class": classes[0]})
-        for rule in rules:
-            model = rule["car"]
-            pattern = r"(?<!\w)" + r"\s*".join(map(re.escape, model.split())) + r"(?!\w)"
-            found = re.search(pattern, source, re.I)
-            if not found:
-                family = next((entry for entry in aliases.values() if key(model) in entry[1]), None)
-                if family:
-                    found = re.search(r"(?<!\w)(?:" + family[2] + r")(?!\w)", source, re.I)
-            if found and not re.search(r"\b(?:не|если|вместо)\s*$", source[max(0, found.start()-15):found.start()], re.I):
-                matches.append((model, rule["class"], found.group()))
-        if len(matches) == 1:
-            model, size_class, literal = matches[0]
-            apply_patch(self._state[user.id], {"car": literal, "car_model": model, "size_class": size_class}, {})
-        if (re.search(r"\b(?:запишите|записаться)\b", source, re.I)
-                or self._state[user.id].get("booking_requested") and len(source.split()) <= 3) and not re.search(r"\b(?:не|если|или|либо|может|возможно|наверное)\b", source, re.I):
-            chosen = [name for name in catalog.get("tariffs", [])
-                      if re.search(r"(?<!\w)" + re.escape(name) + r"\w*(?!\w)", source, re.I)]
-            if len(chosen) == 1:
-                apply_patch(self._state[user.id], {"tariff": chosen[0]}, {})
 
     def _failed_read(self, name, user):
         fields = {"calculate_price": ("quote",), "get_free_slots": ("availability",),
@@ -1158,9 +997,10 @@ car — слова клиента с исходной цитатой; car_model 
             log.error("Ошибка при вычитке ответа (%s)", type(error).__name__)
             return text
 
-    def _update_context(self, messages, user, sent_fields, redact):
-        projected = model_state(self._state[user.id])
-        if len(self._turn_text.get(user.id, "")) + sum(map(len, self._state[user.id].get("context", []))) > self.config.ai_history_chars:
+    def _model_context(self, user_id, sent_fields=()):
+        state = self._state[user_id]
+        projected = model_state(state)
+        if len(self._turn_text.get(user_id, "")) + sum(map(len, state.get("context", []))) > self.config.ai_history_chars:
             projected.pop("context", None)
         for field in sent_fields:
             projected.pop(field, None)
@@ -1169,6 +1009,10 @@ car — слова клиента с исходной цитатой; car_model 
             for field_name in ("facts", "tentative", "missing", "invalidated", "context")
             if field_name in projected
         }
+        return customer, projected
+
+    def _update_context(self, messages, user, sent_fields, redact):
+        customer, projected = self._model_context(user.id, sent_fields)
         for message in messages:
             if message["role"] == "system" and message["content"].startswith("CUSTOMER "):
                 message["content"] = "CUSTOMER " + _compact_json(customer)
@@ -1262,9 +1106,7 @@ car — слова клиента с исходной цитатой; car_model 
             key = self._cache_key(tool_call.function.name, normalized, user)
             cached = key in tool_cache
             if key in tool_cache and not tool_cache[key].get("ok"):
-                return "Повторный запрос с теми же неверными данными остановлен. " + tool_cache[key].get(
-                    "error", "Уточните данные."
-                )
+                return self._clarification(user.id, tool_cache[key].get("field"))
             if key not in tool_cache:
                 tool_cache[key] = await self._call_tool(tool_call.function.name, raw, user)
                 tool_cache[self._cache_key(tool_call.function.name, normalized, user)] = tool_cache[key]
@@ -1329,13 +1171,14 @@ car — слова клиента с исходной цитатой; car_model 
                 raise ValueError("empty_choices")
             choice = response.choices[0]
             if getattr(choice, "finish_reason", None) in {"length", "content_filter"}:
-                raise ValueError("incomplete_response")
+                log.warning("Ответ AI оборван: %s", choice.finish_reason)
+                return self._clarification(user.id)
             message, calls = choice.message, choice.message.tool_calls or []
             tool_count += len(calls)
             if tool_count > self.config.ai_max_tool_calls:
                 return "Слишком много запросов к таблице. Уточните, пожалуйста, услугу или желаемую дату."
             if not self._valid_tool_calls(calls):
-                return "Некорректные аргументы инструмента. Уточните, пожалуйста, запрос."
+                return self._clarification(user.id)
             for call in calls:
                 try:
                     arguments = strict_json(call.function.arguments or "{}")
@@ -1356,9 +1199,13 @@ car — слова клиента с исходной цитатой; car_model 
                     self._repair_memory(messages, message, calls, user, reason)
                     continue
                 self._state[user.id].update(stage="needs_correction", confirmed=False)
-                return "Не удалось однозначно сохранить уточнение. Назовите исправленные данные или точное название из прайса."
+                return self._clarification(user.id)
             if not calls or len(calls) == 1 and calls[0].function.name == "respond":
                 if not answer.strip():
+                    if calls:
+                        await self._run_tools(messages, message, calls, user, tool_cache, sent_fields)
+                        force_reply = False
+                        continue
                     raise ValueError("empty_content")
                 if (proposal and proposal[1] != self._state[user.id].get("facts", {})
                         and all(self._state[user.id].get("facts", {}).get(field) for field in BOOKING_REQUIRED)):
@@ -1388,7 +1235,7 @@ car — слова клиента с исходной цитатой; car_model 
                             and any(call.function.name == "get_price_list" for call in calls))
             proposal = next(((call.function.arguments, dict(self._state[user.id].get("facts", {})))
                              for call in calls if call.function.name == "create_booking"), proposal)
-        return "Не удалось завершить запрос за отведённое число шагов. Уточните услугу или дату."
+        return self._clarification(user.id)
 
     async def _call_tool(self, name: str, raw_args: str | None, user: ChatUser) -> dict:
         schema = SCHEMAS.get(name)
@@ -1465,8 +1312,6 @@ car — слова клиента с исходной цитатой; car_model 
                     "tariffs": [tariff["name"] for tariff in result["tariffs"]],
                     "services": [service["name"] for service in result["services"]],
                     "unavailable_services": result["unavailable_services"]}
-                if self.config.ai_direct_actions:
-                    self._literal_catalog_facts(user, state["catalog"])
                 result = dict(result, tariffs=[{field_name: field_value for field_name, field_value in tariff.items() if field_name != "note"} for tariff in result["tariffs"]])
             if not result.get("ok"):
                 self._failed_read(name, user)
@@ -1529,16 +1374,20 @@ car — слова клиента с исходной цитатой; car_model 
 
     @staticmethod
     def _proposal_text(pending):
+        def day(value):
+            date = parse_date(value)
+            return f"{date:%d.%m.%Y}, {WEEKDAYS_RU[date.weekday()]}" if date else str(value)
+
         if pending["action"] == "reschedule_booking":
             booking, target = pending["booking"], pending["args"]
             return (f"Перенос записи #{booking['booking_id']}:\n"
-                    f"Было: {booking['date']} в {booking['time']}\nСтанет: {target['date']} в {target['time']}\n"
+                    f"Было: {day(booking['date'])} в {booking['time']}\nСтанет: {day(target['date'])} в {target['time']}\n"
                     f"Автомобиль: {booking['car']}\nТариф: {booking['tariff'] or 'без тарифа'}\n"
                     f"Сумма сохранится: {booking['total']} {booking['currency']}\n\n"
                     "Для переноса нажмите «Подтвердить». До нажатия исходная запись сохраняется. Правки напишите в чат.")
         if pending["action"] == "cancel_booking":
             booking = pending["booking"]
-            return (f"Отмена записи #{booking['booking_id']}:\nДата: {booking['date']}\nВремя: {booking['time']}\n"
+            return (f"Отмена записи #{booking['booking_id']}:\nДата: {day(booking['date'])}\nВремя: {booking['time']}\n"
                     f"Автомобиль: {booking['car']}\nТариф: {booking.get('tariff') or 'без тарифа'}\n"
                     f"Дополнительные услуги: {booking.get('extras') or 'нет'}\nИтого: {booking['total']} {booking['currency']}\n\n"
                     "Для отмены нажмите «Подтвердить». Если данные неверны, напишите в чат.")
@@ -1552,11 +1401,9 @@ car — слова клиента с исходной цитатой; car_model 
                 value += "\nСейчас недоступно:\n" + "\n".join("— " + item for item in line["not_included_now"])
             lines.append(value)
         composition = "\n".join(lines)
-        extras = "\n" + "\n".join("— " + item for item in quote["extras"]) if quote["extras"] else "нет"
-        return (f"Предлагаю запись:\nДата: {arguments['date']}\nВремя: {arguments['time']}\n"
+        return (f"Предлагаю запись:\nДата: {day(arguments['date'])}\nВремя: {arguments['time']}\n"
                 f"Автомобиль: {arguments['car']}, класс «{quote['size_class']}»\n"
                 f"Тариф: {quote['tariff'] or 'без тарифа'}\nСостав:\n{composition}\n"
-                f"Дополнительные услуги: {extras}\n"
                 f"Итого: {quote['total']} {quote['currency']}\nИмя: {arguments['client_name']}\n"
                 f"Телефон: {arguments['phone']}\nПожелания: {arguments.get('comment') or 'нет'}\n\n"
                 "Проверьте данные и выберите кнопку «Подтвердить». Если что-то неверно, напишите правильные данные в чат.")
@@ -1615,7 +1462,7 @@ car — слова клиента с исходной цитатой; car_model 
     async def _notify(self, text, user):
         if self.reporter:
             try:
-                await self.reporter.send(text, username=user.username)
+                await self.reporter.send(plain_text(text), username=user.username)
             except Exception as error:
                 log.error("Ошибка уведомления (%s)", type(error).__name__)
 

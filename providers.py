@@ -50,30 +50,34 @@ def client_options(config, *, mapping: bool = False) -> dict:
         key = (config.sheets_ai_api_key if mapping else "") or config.ai_api_key
     if not key:
         raise RuntimeError("Для выбранного адреса AI нужен отдельный AI_API_KEY или SHEETS_AI_API_KEY")
-    options = dict(api_key=key, base_url=url,
-                   timeout=config.ai_timeout_sec, max_retries=0)
-    return options
+    return dict(api_key=key, base_url=url, timeout=config.ai_timeout_sec, max_retries=0)
 
 
 def completion_options(config, *, mapping: bool = False) -> dict:
     model = (config.sheets_ai_model if mapping else "") or config.ai_model
     url = (config.sheets_ai_base_url if mapping else "") or config.ai_base_url
-    options = {"model": model, config.ai_token_limit_parameter: 1500 if mapping else config.ai_max_output_tokens}
+    hostname = urlsplit(url).hostname
+    options = {"model": model}
+    limit = 1500 if mapping else config.ai_max_output_tokens
+    if limit:
+        options[config.ai_token_limit_parameter] = limit
     if config.ai_temperature is not None:
         options["temperature"] = 0 if mapping else config.ai_temperature
     if config.ai_reasoning_effort and not mapping:
         options["reasoning_effort"] = config.ai_reasoning_effort
-    if urlsplit(url).hostname == "polza.ai" and not mapping:
+    if hostname in {"polza.ai", "api.polza.ai"} and not mapping:
         polza = {}
         effort = options.pop("reasoning_effort", None)
         canonical, marker, aliases = model.partition("@")
         if marker:
             seen = set()
-            for key, value in parse_qsl(aliases, strict_parsing=True):
-                if key in seen or key not in {"provider", "allow_fallbacks", "reasoning_effort"}:
-                    raise RuntimeError("LLM_MODEL: неизвестный или повторный параметр Polza")
+            for key, value in parse_qsl(aliases, strict_parsing=True, keep_blank_values=True):
+                if not value.strip() or key in seen or key not in {"provider", "allow_fallbacks", "reasoning_effort"}:
+                    raise RuntimeError("LLM_MODEL: пустой, неизвестный или повторный параметр Polza")
                 seen.add(key)
                 if key == "reasoning_effort":
+                    if value not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
+                        raise RuntimeError("LLM_MODEL: неизвестный уровень рассуждений Polza")
                     if effort is None:
                         effort = value
                 elif key == "provider":
@@ -83,18 +87,15 @@ def completion_options(config, *, mapping: bool = False) -> dict:
                         raise RuntimeError("LLM_MODEL: allow_fallbacks должен быть true или false")
                     polza.setdefault("provider", {})[key] = value == "true"
             options["model"] = canonical
-        if effort:
+        if effort == "none":
+            polza["reasoning"] = {"enabled": False}
+        elif effort:
             polza["reasoning"] = {"effort": effort}
-        ceilings = {key: value for key, value in (
-            ("prompt", config.ai_max_prompt_price_rub),
-            ("completion", config.ai_max_completion_price_rub),
-        ) if value is not None}
-        if ceilings:
-            polza.setdefault("provider", {})["max_price"] = ceilings
         if polza:
             options["extra_body"] = polza
-    if urlsplit(url).hostname == "api.cloudflare.com":
-        options["max_completion_tokens"] = options.pop(config.ai_token_limit_parameter)
+    if hostname == "api.cloudflare.com":
+        if config.ai_token_limit_parameter in options:
+            options["max_completion_tokens"] = options.pop(config.ai_token_limit_parameter)
         if model in {"@cf/zai-org/glm-4.7-flash", "@cf/google/gemma-4-26b-a4b-it", "@cf/qwen/qwen3.8-27b"}:
             effort = options.pop("reasoning_effort", "")
             options["extra_body"] = {"chat_template_kwargs": {"enable_thinking": effort not in {"", "none"}}}
@@ -109,7 +110,14 @@ def api_error_label(error) -> str:
     nested = body.get("error", body) if isinstance(body, dict) else {}
     code = str(nested.get("code", "")) if isinstance(nested, dict) else ""
     code = code if re.fullmatch(r"[A-Za-z0-9_.-]{1,60}", code) else ""
-    return " ".join(filter(None, (type(error).__name__, f"HTTP {status}" if isinstance(status, int) else "", f"code={code}" if code else "")))
+    param = str(nested.get("param", "")) if isinstance(nested, dict) else ""
+    message = str(nested.get("message", "")) if isinstance(nested, dict) else ""
+    if not param and status == 400:
+        fields = re.findall(r"\b(?:max_price|reasoning_effort|reasoning|provider|tool_choice|tools|messages|max_tokens|temperature)\b", message)
+        param = ",".join(dict.fromkeys(fields))
+    param = param if re.fullmatch(r"[A-Za-z0-9_.,\[\]-]{1,100}", param) else ""
+    return " ".join(filter(None, (type(error).__name__, f"HTTP {status}" if isinstance(status, int) else "",
+                                  f"code={code}" if code else "", f"param={param}" if param else "")))
 
 
 def request_arguments(config, arguments) -> dict:

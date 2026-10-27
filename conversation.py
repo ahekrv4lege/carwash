@@ -65,6 +65,12 @@ def source_date(source, now, embedded=False):
     relative = {"сегодня": 0, "завтра": 1, "послезавтра": 2}
     if text in relative:
         return now.date() + timedelta(days=relative[text])
+    day_only = re.fullmatch(r"(\d{1,2})(?:-?го)?", text)
+    if day_only:
+        try:
+            return date(now.year, now.month, int(day_only[1]))
+        except ValueError:
+            return None
     short = re.fullmatch(r"(\d{1,2})\.(\d{1,2})", text)
     if short:
         try:
@@ -81,6 +87,9 @@ def source_date(source, now, embedded=False):
         except ValueError:
             return None
     if embedded:
+        day_time = re.search(r"(?<![\d.])(\d{1,2})(?:-?го)?\s+на\s+(?:\d{1,2}|[а-яё]+)\b", text)
+        if day_time:
+            return source_date(day_time[1], now)
         month_names = "|".join(month + r"\w*" for month in months)
         dates = re.findall(rf"\b(?:сегодня|завтра|послезавтра|{pattern}|\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}\.\d{{1,2}}(?:\.\d{{4}})?|\d{{1,2}}(?:-?го)?\s+(?:{month_names})(?:\s+\d{{4}})?)\b", text)
         dates = [value for value in dates if source_date(value, now) is not None]
@@ -95,20 +104,40 @@ def source_date(source, now, embedded=False):
 
 def source_time(source, embedded=False):
     text = folded(source)
+    words = {"час": 1, "один": 1, "два": 2, "две": 2, "три": 3, "четыре": 4,
+             "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9,
+             "десять": 10, "одиннадцать": 11, "двенадцать": 12}
+    token = r"(?:\d{1,2}(?:[:.]\d{2})?|" + "|".join(words) + r")"
     if embedded:
-        clocks = re.findall(r"\b(?:в|к)\s*(\d{1,2}(?:[:.]\d{2})?)(?!\d)", text)
-        if (re.fullmatch(r"(?:на\s*)?\d{1,2}:\d{2}", text)
-                or re.search(r"\b(?:на|завтра|сегодня|послезавтра|запиш\w*|перенес\w*|перенос\w*|тогда|вместо)\b|\d{1,2}\.\d{1,2}", text)
-                or PHONE.search(text)):
+        clocks = re.findall(r"\b(?:в|к|на)\s+(" + token + r")(?![\w:])", text)
+        if re.search(r"\b(?:на|завтра|сегодня|послезавтра|запиш\w*|перенес\w*|перенос\w*|тогда|вместо)\b|\d{1,2}\.\d{1,2}", text) or PHONE.search(text):
             clocks += re.findall(r"(?<![\w:.])(\d{1,2}:\d{2})(?![\d:])", text)
         clocks = list(dict.fromkeys(value for clock in clocks if (value := source_time(clock)) is not None))
-        return clocks[0] if len(clocks) == 1 else source_time(text)
-    clock = re.fullmatch(r"(?:в\s*|к\s*|на\s*(?=\d{1,2}:))?(\d{1,2})(?:[:.](\d{2})(?::00)?)?(?:\s*(?:час(?:а|ов)?|ч))?", text)
-    return parse_time(f"{clock[1]}:{clock[2] or '00'}") if clock else None
+        if len(clocks) == 1:
+            hour, minute = map(int, clocks[0].split(":"))
+            if re.search(r"\b(?:вечер\w*|дня)\b", text) and 1 <= hour <= 11:
+                hour += 12
+            elif re.search(r"\bноч\w*\b", text) and hour == 12:
+                hour = 0
+            return f"{hour:02d}:{minute:02d}"
+        return source_time(text)
+    clock = re.fullmatch(r"(?:в\s*|к\s*|на\s*)?(" + token + r")(?:\s*(?:час(?:а|ов)?|ч))?(?:\s+(?:утра|дня|вечера|ночи))?", text)
+    if not clock:
+        return None
+    raw = clock[1]
+    value = parse_time(f"{words[raw]}:00") if raw in words else parse_time(raw if ":" in raw or "." in raw else f"{raw}:00")
+    if value and re.search(r"\b(?:вечера|дня)\b", text) and 1 <= int(value[:2]) <= 11:
+        value = f"{int(value[:2]) + 12:02d}:{value[3:]}"
+    return value
 
 
 def literal_car_patch(patch, text):
     entry = patch.get("car") if isinstance(patch, dict) else None
+    model = patch.get("car_model") if isinstance(patch, dict) else None
+    if (isinstance(entry, list) and len(entry) == 2 and all(isinstance(value, str) and value.strip() for value in entry)
+            and isinstance(model, list) and len(model) == 2 and entry == model
+            and folded(entry[1]) in folded(text) and folded(entry[0]) not in folded(entry[1])):
+        return dict(patch, car=[entry[1], entry[1]])
     if (not isinstance(entry, list) or len(entry) != 2 or not all(isinstance(value, str) for value in entry)
             or folded(entry[0]) != folded(entry[1]) or folded(entry[1]) in folded(text)):
         return patch
@@ -226,20 +255,11 @@ def apply_patch(state, changes, tentative):
     if "requested_service" in changed and not ({"tariff", "services"} & changes.keys()):
         changes = dict(changes, tariff=None, services=None)
         changed.update({"tariff", "services"})
-    if "requested_datetime" in changed and not ({"date", "time"} & changes.keys()):
-        changes = dict(changes, date=None, time=None)
-        changed.update({"date", "time"})
     if "car" in changed and facts.get("car") and "size_class" not in changes:
         changes = dict(changes, size_class=None)
         changed.add("size_class")
     if "car" in changed and facts.get("car_model") and "car_model" not in changes:
         changes = dict(changes, car_model=None)
-    if "date" in changed and facts.get("date") and "time" not in changes:
-        changes = dict(changes, time=None)
-        changed.add("time")
-    if "services" in changed and "tariff" not in changes:
-        changes = dict(changes, tariff=None)
-        changed.add("tariff")
     if "tariff" in changed and facts.get("tariff") and "services" not in changes:
         changes = dict(changes, services=[])
         changed.add("services")
@@ -294,7 +314,7 @@ def redact_phone(text, known=None):
 
 
 def model_state(state):
-    result = {field_name: field_value for field_name, field_value in state.items() if field_name not in {"details", "facts", "tentative", "outstanding"}}
+    result = {field_name: field_value for field_name, field_value in state.items() if field_name not in {"details", "facts", "tentative", "outstanding", "consumed_offers"}}
     for key in ("facts", "tentative"):
         values = {field_name: field_value for field_name, field_value in state.get(key, {}).items() if field_name != "phone"}
         if state.get(key, {}).get("phone"):
@@ -313,6 +333,10 @@ def model_state(state):
     if state.get("unavailable_time") == {field_name: facts.get(field_name) for field_name in ("date", "time")}:
         result["missing"].append("available_time")
     return result
+
+
+def plain_text(text):
+    return text.translate(str.maketrans({"—": "-", "–": "-", "«": '"', "»": '"', "“": '"', "”": '"'}))
 
 
 def safe_reply(text):

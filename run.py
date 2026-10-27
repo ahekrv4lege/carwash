@@ -10,10 +10,14 @@ import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import time
 import venv
+import uuid
+from dataclasses import replace
+import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(__file__).resolve().parent
@@ -133,6 +137,60 @@ def validate_config(sheets_only: bool = False):
     return config
 
 
+def prepare_new_table(config, store_factory=None):
+    from config import table_mapping_path
+    from sheets import Store
+    target = Path(table_mapping_path(config.spreadsheet_id))
+    old_path = Path(config.sheets_mapping_file)
+    old_journal = old_path.with_name(old_path.stem + "-operations.json")
+    if not target.exists() and old_path != target and old_path.exists():
+        try:
+            old_document = json.loads(old_path.read_text(encoding="utf-8"))
+            old_id = old_document["spreadsheet_id"]
+        except (OSError, ValueError, KeyError, TypeError):
+            if old_journal.exists():
+                raise StartupError("Нельзя определить таблицу старой карты с журналом операций; проверьте её вручную") from None
+            old_id = None
+        if old_id == config.spreadsheet_id:
+            target = old_path
+    existing = target.exists()
+    original = None
+    if existing:
+        try:
+            original = target.read_bytes()
+            if json.loads(original)["spreadsheet_id"] != config.spreadsheet_id:
+                raise ValueError
+        except (OSError, ValueError, KeyError, TypeError):
+            raise StartupError("Существующая карта повреждена или принадлежит другой таблице; проверьте её вручную") from None
+    candidate = target.with_name(f"{target.stem}-candidate-{uuid.uuid4().hex}{target.suffix}")
+    temporary = replace(config, sheets_adaptive_enabled=True, sheets_mapping_file=str(candidate))
+    store = (store_factory or Store)(temporary)
+    try:
+        document = store.refresh_schema(force=True)
+        if document["validation_status"] != "valid" or not document["writes_enabled"]:
+            raise StartupError(f"Таблица требует настройки; карта: {candidate}")
+        with store.fresh_tables():
+            store.get_catalog(fresh=True)
+            store._get_slots()
+            store._get_bookings()
+        if existing:
+            if target.read_bytes() != original:
+                raise StartupError("Карта изменилась во время проверки; повторите запуск")
+            os.replace(candidate, target)
+        else:
+            # Не заменяем карту, если её успел создать другой процесс.
+            try:
+                os.link(candidate, target)
+            except FileExistsError:
+                raise StartupError(f"Карта уже появилась; проверьте её: {target}") from None
+            candidate.unlink()
+    except Exception:
+        if candidate.exists():
+            print(f"Карта для проверки сохранена: {candidate}", file=sys.stderr)
+        raise
+    return str(target)
+
+
 def run_forever(output=None) -> None:
     print("Запускаю бота. Остановка — Ctrl+C.", flush=True)
     process = None
@@ -171,6 +229,175 @@ def run_forever(output=None) -> None:
         signal.signal(signal.SIGTERM, previous)
 
 
+def systemd_quote(value):
+    value = str(value)
+    if "\n" in value or "\r" in value:
+        raise RuntimeError("Путь или настройка автозапуска содержит перевод строки")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
+
+
+def linux_unit(root: Path, proxy_environment: dict) -> str:
+    directory = str(root).replace("%", "%%")
+    if "\n" in directory or "\r" in directory:
+        raise RuntimeError("Путь автозапуска содержит перевод строки")
+    environment = "\n".join("Environment=" + systemd_quote(key + "=" + value)
+                            for key, value in proxy_environment.items())
+    return f"""[Unit]
+Description=Carwash Telegram bot
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory={directory}
+ExecStart={systemd_quote(root / '.venv/bin/python')} {systemd_quote(root / 'run.py')} --no-install
+Environment=PYTHONUNBUFFERED=1
+{environment}
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def windows_task(root: Path, username: str) -> str:
+    namespace = "http://schemas.microsoft.com/windows/2004/02/mit/task"
+    ET.register_namespace("", namespace)
+    def add(parent, tag, value=None):
+        element = ET.SubElement(parent, "{" + namespace + "}" + tag)
+        element.text = value
+        return element
+    task = ET.Element("{" + namespace + "}Task", version="1.2")
+    trigger = add(add(task, "Triggers"), "LogonTrigger")
+    add(trigger, "UserId", username)
+    add(trigger, "Enabled", "true")
+    principal = add(add(task, "Principals"), "Principal")
+    principal.set("id", "Author")
+    add(principal, "UserId", username)
+    add(principal, "LogonType", "InteractiveToken")
+    add(principal, "RunLevel", "LeastPrivilege")
+    settings = add(task, "Settings")
+    for key, value in (("MultipleInstancesPolicy", "IgnoreNew"), ("DisallowStartIfOnBatteries", "false"),
+                       ("StopIfGoingOnBatteries", "false"), ("StartWhenAvailable", "true"),
+                       ("ExecutionTimeLimit", "PT0S")):
+        add(settings, key, value)
+    restart = add(settings, "RestartOnFailure")
+    add(restart, "Interval", "PT1M")
+    add(restart, "Count", "999")
+    actions = add(task, "Actions")
+    actions.set("Context", "Author")
+    action = add(actions, "Exec")
+    add(action, "Command", str(root / ".venv/Scripts/pythonw.exe"))
+    add(action, "Arguments", subprocess.list2cmdline([str(root / "run.py"), "--no-install", "--host-worker"]))
+    add(action, "WorkingDirectory", str(root))
+    return ET.tostring(task, encoding="unicode", xml_declaration=True)
+
+
+def manage_host(action: str, root: Path, bot_id: str) -> int:
+    if not re.fullmatch(r"\d+", bot_id):
+        raise RuntimeError("Для автозапуска нужен корректный BOT_TOKEN")
+    name = "carwash-" + bot_id
+    if sys.platform.startswith("linux"):
+        if not shutil.which("systemctl"):
+            raise RuntimeError("Для фонового хостинга нужен systemd; обычный запуск: ./start.sh")
+        unit = name + ".service"
+        if action == "host":
+            folder = Path.home() / ".config/systemd/user"
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / unit
+            accepted = {"WorkingDirectory=" + str(root).replace("%", "%%"), "WorkingDirectory=" + systemd_quote(root)}
+            if path.exists() and not accepted.intersection(path.read_text().splitlines()):
+                raise RuntimeError("Автозапуск этого бота уже привязан к другой папке; сначала остановите прежнюю копию")
+            variables = {key: value for key, value in os.environ.items()
+                         if key.lower() in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}}
+            path.write_text(linux_unit(root, variables), encoding="utf-8")
+            path.chmod(0o600)
+            if shutil.which("systemd-analyze"):
+                subprocess.run(["systemd-analyze", "--user", "verify", str(path)], check=True)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+            subprocess.run(["systemctl", "--user", "enable", unit], check=True)
+            subprocess.run(["systemctl", "--user", "restart", unit], check=True)
+            subprocess.run(["systemctl", "--user", "is-active", unit], check=True)
+            print("Фоновая служба включена. Автозапуск — при входе в систему.")
+            print("Состояние: ./start.sh --status; журнал: ./start.sh --logs; остановка: ./start.sh --stop")
+            return 0
+        if action == "stop":
+            return subprocess.run(["systemctl", "--user", "disable", "--now", unit], check=False).returncode
+        if action == "logs":
+            return subprocess.run(["journalctl", "--user", "-u", unit, "-n", "60", "--no-pager"], check=False).returncode
+        return subprocess.run(["systemctl", "--user", "status", unit, "--no-pager"], check=False).returncode
+    if os.name == "nt":
+        if action == "host":
+            username = subprocess.check_output(["whoami"], text=True).strip()
+            existing = subprocess.run(["schtasks", "/Query", "/TN", name, "/XML"],
+                                      capture_output=True, text=True, check=False)
+            replace = []
+            if existing.returncode == 0:
+                try:
+                    task = ET.fromstring(existing.stdout)
+                    namespace = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+                    directory = task.findtext("./t:Actions/t:Exec/t:WorkingDirectory", namespaces=namespace)
+                    command = task.findtext("./t:Actions/t:Exec/t:Command", namespaces=namespace)
+                    if not directory or not command or Path(directory).resolve() != root.resolve() or Path(command).resolve() != (root / ".venv/Scripts/pythonw.exe").resolve():
+                        raise ValueError
+                except (ET.ParseError, ValueError, OSError):
+                    raise RuntimeError("Автозапуск этого бота уже привязан к другой папке или его нельзя проверить") from None
+                replace = ["/F"]
+            folder = root / ".runtime"
+            folder.mkdir(exist_ok=True)
+            path = folder / "host-task.xml"
+            path.write_text(windows_task(root, username), encoding="utf-16")
+            subprocess.run(["schtasks", "/Create", "/TN", name, "/XML", str(path), *replace], check=True)
+            subprocess.run(["schtasks", "/Run", "/TN", name], check=True)
+            print("Задача запущена в фоне и будет запускаться при входе в Windows.")
+            print("Журнал: start.bat --logs; остановка: start.bat --stop")
+            return 0
+        if action == "stop":
+            subprocess.run(["schtasks", "/End", "/TN", name], check=False)
+            return subprocess.run(["schtasks", "/Change", "/TN", name, "/DISABLE"], check=False).returncode
+        if action == "logs":
+            path = root / ".runtime/host.log"
+            print("\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-60:]) if path.exists() else "Журнал ещё не создан")
+            return 0
+        return subprocess.run(["schtasks", "/Query", "/TN", name, "/V", "/FO", "LIST"], check=False).returncode
+    raise RuntimeError("Фоновый хостинг поддержан для Linux с systemd и Windows; обычный запуск: python run.py")
+
+
+async def diagnose(config) -> bool:
+    from aiogram import Bot
+    from bot import telegram_session
+    from providers import api_error_label
+    from sheets import Store
+
+    ok = True
+    bot = Bot(config.bot_token, session=telegram_session())
+    try:
+        identity = await bot.get_me(request_timeout=12)
+        webhook = await bot.get_webhook_info(request_timeout=12)
+        print(f"Telegram: @{identity.username}; авторизация работает; ожидает сообщений: {webhook.pending_update_count}")
+        if webhook.url:
+            print("При запуске polling бот переключит существующий webhook.")
+    except Exception as error:
+        ok = False
+        print("Telegram недоступен: " + api_error_label(error) + ". Проверьте токен, сеть и TELEGRAM_PROXY.")
+    finally:
+        await bot.session.close()
+    try:
+        store = Store(config)
+        catalog = await asyncio.wait_for(asyncio.to_thread(store.price_list), timeout=30)
+        slots = await asyncio.wait_for(asyncio.to_thread(store.free_slots), timeout=30)
+        print(f"Google Sheets: прайс прочитан; услуг: {len(catalog.get('services', []))}; тарифов: {len(catalog.get('tariffs', []))}; дней в ответе слотов: {len(slots.get('days', []))}")
+    except Exception as error:
+        ok = False
+        print("Google Sheets недоступна: " + api_error_label(error) + ". Проверьте credentials.json, доступ и названия листов.")
+    print("AI: " + config.ai_model + "; платный запрос не выполнялся.")
+    return ok
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_mutually_exclusive_group()
@@ -181,13 +408,17 @@ def main() -> int:
                               ("status", "Состояние фонового бота"), ("logs", "Последние сообщения журнала")):
         modes.add_argument("--" + mode, action="store_true", help=description)
     parser.add_argument("--host-worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--profile", choices=("cheap", "demo"), help="Профиль модели; ключи остаются в .env")
+    # Совместимость с уже установленными службами; настройки теперь берутся из .env.
+    parser.add_argument("--profile", choices=("cheap", "demo"), help=argparse.SUPPRESS)
     parser.add_argument("--no-install", action="store_true", help="Запретить установку зависимостей")
+    parser.add_argument("--new-table", action="store_true", help="Проверить новую таблицу и запустить бота с её отдельной картой")
     modes.add_argument("--refresh-schema", action="store_true", help="Принудительно перечитать структуру без запуска бота")
     modes.add_argument("--validate-mappings", action="store_true", help="Проверить вручную исправленную конфигурацию без записи в Sheets")
     modes.add_argument("--suggest-mappings", action="store_true", help="Сохранить AI-подсказки по заголовкам; без применения")
     args = parser.parse_args()
     try:
+        if args.new_table and (args.check or args.setup_only or args.doctor or args.host or args.stop or args.status or args.logs or args.refresh_schema or args.validate_mappings or args.suggest_mappings or args.host_worker):
+            raise StartupError("--new-table используется только для обычного запуска бота")
         os.chdir(ROOT)
         if args.host_worker:
             folder = ROOT / ".runtime"
@@ -197,32 +428,19 @@ def main() -> int:
                 path.replace(folder / "host.previous.log")
             sys.stdout = sys.stderr = path.open("a", encoding="utf-8", buffering=1)
         prepare_environment(args.no_install)
-        if args.profile:
-            from dotenv import dotenv_values
-            path = ROOT / "profiles" / (args.profile + ".env")
-            if not path.is_file():
-                raise StartupError("Профиль модели не найден")
-            allowed = {"LLM_BASE_URL", "LLM_MODEL", "LLM_MAX_INPUT_RUB", "LLM_MAX_OUTPUT_RUB", "AI_TIMEOUT_SEC",
-                       "AI_REQUEST_BUDGET_SEC", "AI_REQUEST_RETRIES", "AI_MAX_OUTPUT_TOKENS", "AI_DIRECT_ACTIONS"}
-            values = dotenv_values(path)
-            if values.keys() - allowed or any(value is None for value in values.values()):
-                raise StartupError("В профиле есть недопустимые настройки")
-            os.environ.update(values)
         if args.setup_only:
             print("Виртуальное окружение и зависимости готовы")
             return 0
         sheets_only = args.refresh_schema or args.validate_mappings or args.suggest_mappings
         config = validate_config(sheets_only=sheets_only)
         if args.doctor or args.host:
-            from healthcheck import diagnose
             if not asyncio.run(diagnose(config)):
                 raise StartupError("Подключения не готовы; исправьте указанную выше ошибку")
             if args.doctor:
                 return 0
         if any(getattr(args, action) for action in ("host", "stop", "status", "logs")):
-            from hosting import manage
             action = next(action for action in ("host", "stop", "status", "logs") if getattr(args, action))
-            return manage(action, ROOT, config.bot_token.split(":", 1)[0], profile=args.profile)
+            return manage_host(action, ROOT, config.bot_token.split(":", 1)[0])
         # Общая блокировка по bot id защищает также копии проекта на этом компьютере.
         lock_key = config.bot_token.split(":", 1)[0] if not sheets_only else hashlib.sha256(config.spreadsheet_id.encode()).hexdigest()[:24]
         import tempfile
@@ -245,6 +463,11 @@ def main() -> int:
             if args.check:
                 print("Локальная конфигурация корректна; сетевые подключения не выполнялись")
                 return 0
+            if args.new_table:
+                mapping = prepare_new_table(config)
+                os.environ["SHEETS_ADAPTIVE_ENABLED"] = "true"
+                os.environ["SHEETS_MAPPING_FILE"] = mapping
+                print(f"Таблица проверена; карта: {mapping}", flush=True)
             run_forever(sys.stdout if args.host_worker else None)
         return 0
     except KeyboardInterrupt:
