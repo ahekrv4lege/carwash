@@ -27,7 +27,11 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["confirmation_required"])
         self.assertNotIn("size_class", self.agent._state[111].get("tentative", {}))
         self.assertEqual(self.agent._pending[111]["args"]["size_class"], "Легковой")
-        self.assertIn('класс «Легковой»', self.agent._proposal_text(self.agent._pending[111]))
+        text = self.agent._proposal_text(self.agent._pending[111])
+        # В сводке — распознанное название, без внутреннего класса прайса.
+        self.assertIn("Toyota Camry", text)
+        self.assertNotIn("Fixture car", text)
+        self.assertNotIn("класс", text)
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
 
     async def test_class_resolution_does_not_bypass_other_uncertainty_or_catalog_validation(self):
@@ -400,6 +404,19 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(rejected["ok"])
         rejected = await self.agent._call_tool("create_booking", '{"requested_datetime":"tomorrow"}', self.user)
         self.assertFalse(rejected["ok"])
+
+    async def test_summary_and_sheet_show_recognized_car_not_customer_typos(self):
+        # «бив м5» — слова клиента; сводка и таблица получают распознанное «BMW M5».
+        self.agent._state[111] = {"facts": dict(ARGS, car="бив м5", car_model="BMW M5")}
+        text = await self.say("Записывайте, пожалуйста", calls=[("create_booking", {})])
+        self.assertIn("BMW M5", text)
+        self.assertNotIn("бив м5", text)
+        self.assertNotIn("класс", text)
+        answer = await self.confirm()
+        self.assertIn("Записала", answer)
+        created = self.spreadsheet.worksheet("Записи").values[-1]
+        self.assertIn("BMW M5", created)
+        self.assertNotIn("бив м5", str(created))
 
     async def test_repaired_class_completes_existing_proposal_without_another_ai_call(self):
         self.agent._state[111] = {"facts": {key: value for key, value in ARGS.items() if key != "size_class"},
