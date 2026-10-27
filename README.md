@@ -357,15 +357,13 @@ TLS-проверка сертификатов остаётся включённ�
 ./.venv/bin/python checks/run.py              # Linux
 ```
 
-- **Офлайн-набор: 446 тестов** (сейчас; см. `CHANGES.md`). Ни сети, ни ключей, ни квот —
+- **Офлайн-набор: 465 тестов** (сейчас; см. `CHANGES.md`). Ни сети, ни ключей, ни квот —
   таблица и модель синтетические (`checks/tests/fakes.py`).
 - `checks/tests/test_conversation.py` + `test_phase2.py` — диалог, память, подтверждения.
 - `checks/tests/test_adaptive.py` + `test_corrupted_tables.py` — испорченные таблицы:
   пустые поля, дубли, формулы, битые цены/даты — 28 сценариев (задача «испорченные таблицы»).
 - `checks/tests/test_class_rules.py` — правила классов (BMW X5 → Кроссовер без уточнений).
 - `checks/tests/test_providers.py` — переключение провайдеров и бюджет запроса.
-- `checks/debug_tables.py` — отчёт «вход → результат» по всем сценариям порчи
-  (`checks/debug_tables_report.txt`).
 - `checks/live.py` — тот же набор против настоящих API и таблицы; **расходует квоту**, запускать
   только по решению. `checks/booking_dialog.py` — живой прогон диалога до записи.
 - Развёрнутая памятка — `checks/USAGE.txt`. Журнал изменений — `CHANGES.md`, планы — `TODO.md`.
