@@ -145,9 +145,6 @@ def vehicle_clarification(text):
     return None
 
 
-PROOFREAD_PROMPT = "Ты — корректор. Исправь только ошибки русского языка, о себе — женский род. Сохрани все имена, числа, смысл. Верни только исправленный текст."
-
-
 class Agent:
     def __init__(self, config: Config, store: Store, reporter=None):
         self.config, self.store, self.reporter = config, store, reporter
@@ -528,8 +525,6 @@ car — слова клиента с исходной цитатой; car_model 
                     result = await asyncio.wait_for(self._call_tool("create_booking", "{}", user), timeout=remaining())
                     answer = (self._offer(user.id, self._pending[user.id]) if result.get("confirmation_required")
                               else self._clarification(user.id, result.get("field")))
-                if self.config.ai_proofread_enabled and user.id not in self._pending:
-                    answer = await self._proofread(answer)
                 if user.id not in self._pending:
                     checked = safe_reply(answer)
                     if checked != answer:
@@ -984,18 +979,6 @@ car — слова клиента с исходной цитатой; car_model 
             finally:
                 self._provider_probes.discard(index)
         raise RuntimeError("Настроенные AI API временно недоступны; повторите позже")
-
-    async def _proofread(self, text: str) -> str:
-        try:
-            response = await self._request(
-                messages=[{"role": "system", "content": PROOFREAD_PROMPT}, {"role": "user", "content": text}]
-            )
-            if not response.choices or getattr(response.choices[0], "finish_reason", None) == "length":
-                return text
-            return _clean_text(response.choices[0].message.content or "") or text
-        except Exception as error:
-            log.error("Ошибка при вычитке ответа (%s)", type(error).__name__)
-            return text
 
     def _model_context(self, user_id, sent_fields=()):
         state = self._state[user_id]

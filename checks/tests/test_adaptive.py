@@ -2,10 +2,9 @@ from copy import deepcopy
 from dataclasses import replace
 import tempfile
 import unittest
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import patch
 
 from adaptive import AdaptiveSheets, MappingError, atomic_json
-from tests.fakes import suggest_mappings
 from sheets import BOOKING_HEADERS, Store
 from tests.fakes import Worksheet, fixture, booking
 
@@ -307,35 +306,17 @@ class AdaptiveTests(unittest.TestCase):
         self.assertTrue(store.cancel_booking(1, 111)["ok"])
         self.assertFalse(self.a.path.exists())
 
-    def test_ai_disabled_and_no_startup_calls(self):
-        client = Mock()
-        self.a.refresh()
-        with self.assertRaisesRegex(MappingError, "отключены"):
-            suggest_mappings(self.a, client)
-        client.chat.completions.create.assert_not_called()
-        self.store.create_booking(**booking())
-        client.chat.completions.create.assert_not_called()
-
-    def test_ai_suggestions_cached_and_incremental_without_customer_data(self):
-        self.a.config = replace(self.store.config, sheets_ai_mapping_enabled=True)
-        client = MagicMock()
-        client.chat.completions.create.return_value.choices[0].message.content = '{"suggestions": []}'
-        self.store.create_booking(**booking())
-        suggest_mappings(self.a, client)
-        client.chat.completions.create.assert_not_called()
-        self.worksheet.values[0][3] = "Arrival window"
+    def test_restart_uses_validated_mapping_without_any_ai_requests(self):
+        self.spreadsheet.worksheet("Записи").values[0][3] = "Время"
         self.a.refresh(force=True)
-        suggest_mappings(self.a, client)
-        suggest_mappings(self.a, client)
-        self.assertEqual(client.chat.completions.create.call_count, 1)
-        self.worksheet.values[0][3] = "Arrival hour"
-        self.a.refresh(force=True)
-        suggest_mappings(self.a, client)
-        payload = client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
-        self.assertIn("Arrival hour", payload)
-        self.assertNotIn('"header": "Телефон"', payload)
-        self.assertNotIn("Synthetic", payload)
-        self.assertEqual(client.chat.completions.create.call_count, 2)
+        rule = next(r for r in self.a.document["regions"] if r["role"] == "bookings")
+        rule["columns"]["Время"] = 4
+        atomic_json(self.a.path, self.a.document)
+        self.a.refresh(validate=True)
+        with patch("openai.OpenAI", side_effect=AssertionError("No AI during startup")):
+            for _ in range(3):
+                restored = AdaptiveSheets(self.store.config, lambda: self.spreadsheet)
+                self.assertEqual(restored.table("bookings")[1], [])
 
     def test_transform_custom_date_and_serial_time(self):
         self.a.refresh()

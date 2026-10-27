@@ -432,17 +432,6 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
             await self.say("Вопрос", error, error)
         self.assertEqual(self.transport.call_count - before, 2)
 
-    async def test_proofreading_is_opt_in_and_skips_proposals_and_receipts(self):
-        await self.say("Привет", response("Здравствуйте!"))
-        self.assertEqual(self.transport.call_count, 1)
-        self.agent.config = replace(self.agent.config, ai_proofread_enabled=True)
-        await self.offer()
-        before = self.transport.call_count
-        await self.confirm()
-        self.assertEqual(self.transport.call_count, before)
-        await self.say("Спасибо", response("Пожалуйста."), response("Пожалуйста!", raw=True))
-        self.assertEqual(self.transport.call_count - before, 2)
-
     async def test_long_history_is_bounded_and_only_whole_pairs_are_removed(self):
         for i in range(35):
             await self.say(f"Вопрос {i} " + "сведения " * 30, response("Подскажу по услугам."))

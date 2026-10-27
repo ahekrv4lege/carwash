@@ -131,12 +131,3 @@ def booking(**kwargs):
                 size_class="Легковой", tariff="Базовый", services=[], comment="", telegram_id=111, username=None)
     args.update(kwargs)
     return args
-
-
-def suggest_mappings(adaptive, client=None):
-    from mapping_ai import suggest_mappings as suggest
-    if client is None:
-        return suggest(adaptive)
-    from unittest.mock import patch
-    with patch("openai.OpenAI", return_value=client):
-        return suggest(adaptive)

@@ -655,17 +655,13 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(read.call_count, 1)
         self.assertEqual(self.transport.call_count, 2)
 
-    async def test_success_claims_are_blocked_in_plain_json_and_proofread_responses(self):
+    async def test_success_claims_are_blocked_in_plain_responses(self):
         claims = ["Вы записаны.", "Бронирование создано.", "Запись отменена.", "Записала вас на завтра.",
                   "Я оформила запись.", "Место забронировано.", "Уже записан!", "Запись успешно создана.",
                   "Я отменила вашу запись."]
         for text in claims:
             answer = await self.say("Оформить?", reply=text)
             self.assertIn("не подтверждён", answer, text)
-        self.agent.config = replace(self.agent.config, ai_proofread_enabled=True)
-        self.transport.side_effect = [response(envelope("Проверим данные.")), response("Вы записаны.", raw=True)]
-        answer = await self.agent.reply(self.user, "Проверить?")
-        self.assertIn("не подтверждён", answer)
         self.assertEqual(sum(len(s.writes) for s in self.spreadsheet.sheets), 0)
 
     async def test_plain_response_needs_one_request_and_keeps_customer_words(self):
