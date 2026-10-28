@@ -4,6 +4,7 @@ import asyncio
 import time
 import tempfile
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import unittest
 from dataclasses import replace
 from unittest.mock import AsyncMock, patch
@@ -27,6 +28,22 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("size_class", self.agent._state[111].get("tentative", {}))
         self.assertEqual(self.agent._pending[111]["args"]["size_class"], "Легковой")
         self.assertIn('класс «Легковой»', self.agent._proposal_text(self.agent._pending[111]))
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_full_message_creates_python_proposal(self):
+        self.spreadsheet.worksheet("Слоты").values.append(["29.10.2026", "18:00", "1"])
+        facts = {"car": ["бив м5", "бив м5"], "car_model": ["BMW M5", "бив м5"],
+                 "size_class": ["Легковой", "бив м5"], "requested_service": ["мойка кузова", "МОЙКА кузова"],
+                 "client_name": ["Иван", "иван"], "phone": ["89994994944", "89994994944"]}
+        self.transport.side_effect = [response(calls=[("get_price_list", {})]),
+                                      response("Проверю свободное время.", facts=facts)]
+        with patch.object(self.store, "now", return_value=datetime(2026, 10, 28, 12, tzinfo=ZoneInfo("Europe/Moscow"))):
+            answer = await self.agent.reply(self.user, "МОЙКА кузова НА 6 вечера завтра у меня бив м5 иван 89994994944")
+        self.assertIn("Предлагаю запись:", answer)
+        self.assertIn("29.10.2026", answer)
+        self.assertIn("BMW M5", answer)
+        self.assertNotIn("Проверю свободное время", answer)
+        self.assertIn(111, self.agent._pending)
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
 
     async def test_recognized_car_model_in_proposal_and_sheet(self):

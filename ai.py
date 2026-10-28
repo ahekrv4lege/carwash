@@ -12,6 +12,7 @@ import time
 from collections import defaultdict, OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
 from typing import Any
 
 from openai import AsyncOpenAI, APIConnectionError, APIStatusError, RateLimitError
@@ -524,7 +525,7 @@ car — слова клиента с исходной цитатой; car_model 
                 await asyncio.wait_for(self._remember_choice(user, state.get("facts", {})), timeout=remaining())
                 answer = _clean_text(await asyncio.wait_for(
                     self._run(messages, user, review_before), timeout=remaining()))
-                if user.id not in self._pending and re.search(r"\bподтвердите\s+(?:запись|заказ)\b", answer, re.I):
+                if user.id not in self._pending and re.search(r"\b(?:подтвердите\s+(?:запись|заказ)|записать\s+вас|оформить\s+запись)\b", answer, re.I):
                     result = await asyncio.wait_for(self._call_tool("create_booking", "{}", user), timeout=remaining())
                     answer = (self._offer(user.id, self._pending[user.id]) if result.get("confirmation_required")
                               else self._clarification(user.id, result.get("field")))
@@ -912,7 +913,7 @@ car — слова клиента с исходной цитатой; car_model 
         if self._provider_clients[index] is None:
             self._provider_clients[index] = AsyncOpenAI(**client_options(config))
         client = self._provider_clients[index]
-        for attempt in range(retries + 1):
+        for attempt in range(max(1, retries) + 1):
             try:
                 return await client.chat.completions.create(**completion_options(config), **arguments)
             except (APIConnectionError, APIStatusError) as error:
@@ -923,8 +924,10 @@ car — слова клиента с исходной цитатой; car_model 
                     return await client.chat.completions.create(**completion_options(config), **dict(
                         arguments, tools=[tool for tool in arguments["tools"] if tool["function"]["name"] == "respond"],
                         tool_choice={"type": "function", "function": {"name": "respond"}}))
-                if not self._retryable_api_error(error) or attempt == retries or retry_after(error) is not None:
+                connection_retry = isinstance(error, APIConnectionError) and attempt == 0
+                if not self._retryable_api_error(error) or (attempt >= retries and not connection_retry) or retry_after(error) is not None:
                     raise
+                log.warning("Повтор AI-запроса после %s", type(error).__name__)
                 await asyncio.sleep(0.25 * (attempt + 1))
 
     async def _request(self, **kwargs):
@@ -1218,15 +1221,41 @@ car — слова клиента с исходной цитатой; car_model 
                     if result.get("confirmation_required"):
                         return self._offer(user.id, self._pending[user.id])
                 source = self._turn_text.get(user.id, "")
+                auto_date = source_date(source, self.store.now(), True)
+                auto_time = source_time(source, True)
                 if (self._state[user.id].get("stage") not in {"booked", "cancelled", "uncertain"}
-                        and all(self._state[user.id].get("facts", {}).get(field) for field in BOOKING_REQUIRED)
-                        and re.search(r"\b(?:подготов\w*\s+запис\w*|оформ(?:и|ите)\s+запис\w*|запишите\s+меня)\b", source, re.I)
+                        and (re.search(r"\b(?:подготов\w*\s+запис\w*|оформ(?:и|ите)\s+запис\w*|запишите\s+меня)\b", source, re.I)
+                             or PHONE.search(source) and auto_date is not None
+                             and auto_time is not None)
                         and not re.search(r"\b(?:не|если|или|либо|пока|возможно|может|ли)\b", source, re.I)):
-                    result = await self._call_tool("create_booking", "{}", user)
-                    if result.get("confirmation_required"):
-                        return self._offer(user.id, self._pending[user.id])
-                    if result.get("table_unavailable"):
-                        return result["error"]
+                    if auto_date and auto_time:
+                        apply_patch(self._state[user.id], {"date": auto_date.isoformat(), "time": auto_time}, {})
+                    facts_now = self._state[user.id].get("facts", {})
+                    if not (facts_now.get("tariff") or facts_now.get("services")) and facts_now.get("requested_service"):
+                        # Слова клиента («мойка кузова») -> точное название из прайса.
+                        catalog = self._state[user.id].get("catalog") or {}
+                        wanted = folded(facts_now["requested_service"])
+                        names = list(dict.fromkeys([*(catalog.get("tariffs") or []), *(catalog.get("services") or [])]))
+                        candidates = [name for name in names
+                                      if wanted and (folded(name) == wanted or folded(name) in wanted)]
+                        exact = [name for name in candidates if folded(name) == wanted]
+                        chosen = exact[0] if len(exact) == 1 else (candidates[0] if len(candidates) == 1 else None)
+                        if not chosen and names:
+                            scored = sorted(((SequenceMatcher(None, wanted, folded(name)).ratio(), name)
+                                             for name in names), reverse=True)
+                            if scored[0][0] >= 0.55 and scored[0][0] - (scored[1][0] if len(scored) > 1 else 0.0) > 0.05:
+                                chosen = scored[0][1]
+                        if chosen:
+                            field = "tariff" if chosen in (catalog.get("tariffs") or []) else "services"
+                            apply_patch(self._state[user.id], {field: [chosen] if field == "services" else chosen}, {})
+                    if all(self._state[user.id].get("facts", {}).get(field) for field in BOOKING_REQUIRED):
+                        result = await self._call_tool("create_booking", "{}", user)
+                        if result.get("confirmation_required"):
+                            return self._offer(user.id, self._pending[user.id])
+                        if result.get("table_unavailable"):
+                            return result["error"]
+                        if not result.get("ok") and "available_tariffs" in result:
+                            return self._clarification(user.id, "tariff_or_services")
                 if first_catalog and re.search(rf"\d+\s*(?:{re.escape(self.config.currency)}|руб)", answer):
                     raise ValueError("price_without_verified_catalog")
                 return answer.strip()
