@@ -47,6 +47,20 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(111, self.agent._pending)
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
 
+    async def test_claim_after_offered_slots_resolves_evening_time_and_proposes(self):
+        self.spreadsheet.worksheet("Слоты").values.append(["29.10.2026", "17:00", "1"])
+        self.agent._state[111] = {"facts": dict(ARGS, car="логан", car_model="Renault Logan",
+                                                date="2026-10-29", time="18:00"),
+                                  "availability": {"days": [{"date": "2026-10-29", "free_times": ["17:00", "19:00"]}]}}
+        self.transport.side_effect = [response("Записываю вас на 29 октября, 17:00, Renault Logan, 700 ₽.", raw=True)]
+        answer = await self.agent.reply(self.user, "дава в 5 и логан бартік")
+        self.assertIn("Предлагаю запись:", answer)
+        self.assertIn("17:00", answer)
+        self.assertIn("Renault Logan", answer)
+        self.assertEqual(self.agent._pending[111]["args"]["time"], "17:00")
+        self.assertEqual(self.agent._pending[111]["args"]["car"], "Renault Logan")
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
     async def test_recognized_car_model_in_proposal_and_sheet(self):
         self.agent._state[111] = {"facts": dict(ARGS, car="бив м5", car_model="BMW M5")}
         result = await self.agent._call_tool("create_booking", "{}", self.user)

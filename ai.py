@@ -525,7 +525,19 @@ car — слова клиента с исходной цитатой; car_model 
                 await asyncio.wait_for(self._remember_choice(user, state.get("facts", {})), timeout=remaining())
                 answer = _clean_text(await asyncio.wait_for(
                     self._run(messages, user, review_before), timeout=remaining()))
-                if user.id not in self._pending and re.search(r"\b(?:подтвердите\s+(?:запись|заказ)|записать\s+вас|оформить\s+запись)\b", answer, re.I):
+                if user.id not in self._pending and re.search(r"\b(?:подтвердите\s+(?:запись|заказ)|записать\s+вас|оформить\s+запись|записыва\w*|запиш\w*|оформл\w*)\b", answer, re.I):
+                    facts_net = state.setdefault("facts", {})
+                    parsed_net = source_time(text, True)
+                    if parsed_net and facts_net.get("date"):
+                        hour = int(parsed_net.split(":")[0])
+                        if hour <= 11:
+                            # «Давай в 5» после предложения 17:00/19:00 — вечерний слот из контекста.
+                            offered = [slot for day in (state.get("availability") or {}).get("days", [])
+                                       if day.get("date") == facts_net["date"] for slot in day.get("free_times", [])]
+                            evening = [slot for slot in offered if slot.startswith(f"{hour + 12:02d}:")]
+                            if evening:
+                                facts_net["time"] = evening[0]
+                                state.pop("unavailable_time", None)
                     result = await asyncio.wait_for(self._call_tool("create_booking", "{}", user), timeout=remaining())
                     answer = (self._offer(user.id, self._pending[user.id]) if result.get("confirmation_required")
                               else self._clarification(user.id, result.get("field")))
