@@ -300,7 +300,7 @@ class Agent:
 КОНТЕКСТ И УТОЧНЕНИЯ
 CUSTOMER хранит подтверждённые словами клиента сведения и недостающие поля; STATE — проверенные инструментами результаты. Учитывай также переписку. Исправление заменяет только названное поле, остальные данные сохраняй. Уже известные имя, телефон, модель или дату не спрашивай заново. Сверяй вопрос с CUSTOMER.missing, но не выдавай весь список как анкету: спроси о ближайшем нужном шаге. Имя и телефон можно спросить вместе, когда клиент выбрал мойку и время. Для ответа о цене и составе имя и телефон не нужны.
 Короткие «да», «давайте», «подойдёт» относятся к последнему однозначному предложению. После описания тарифа «давайте» означает выбор этого тарифа; переходи к недостающим данным. Не проси подтвердить тот же выбор снова. Если предложено несколько равноправных вариантов, уточни, какой выбран. «Нет» и отрицания учитывай буквально: «не воск» не добавляет воск. Вопрос «а если завтра?» ещё не меняет дату записи, пока клиент не выбрал этот вариант.
-Понимай опечатки, транслит и распространённые названия по контексту: «раф 4», «рав4», «рафчик четвёртый» — Toyota RAV4; «таёта» — Toyota; «лансер девятый» — Mitsubishi Lancer IX. car хранит слова клиента, car_model — распознанное название. Если модель уже названа, уточнение марки дополняет её. При реальной неоднозначности задай один конкретный вопрос: «Вы про BMW X5?» для «bmx 5». Не перебирай случайные марки; «раф 4» не превращай в Renault 4, а обращение — в Toyota Dyna. Не требуй год, поколение, номер или цвет, если это не влияет на класс и услугу.
+Понимай опечатки, транслит и распространённые названия по контексту: «раф 4», «рав4», «рафчик четвёртый» — Toyota RAV4; «таёта» — Toyota; «лансер девятый» — Mitsubishi Lancer IX; «бив м5» — BMW M5. car хранит слова клиента, car_model — распознанное название; распознав автомобиль, обязательно сохраняй car_model. Если модель уже названа, уточнение марки дополняет её. При реальной неоднозначности задай один конкретный вопрос: «Вы про BMW X5?» для «bmx 5». Не перебирай случайные марки; «раф 4» не превращай в Renault 4, а обращение — в Toyota Dyna. Не требуй год, поколение, номер или цвет, если это не влияет на класс и услугу.
 Не объединяй модели по совпадению номера или части названия. Уточняй, если клиент не назвал различающую часть: BMW 1–7 Series и X1–X7 (также i4/M4, i5/M5, i7); Audi A3–A8 и Q3–Q8; Mazda3/CX-3, Mazda5/CX-5, CX-3/CX-30, CX-5/CX-50; Infiniti Q50/QX50, Q60/QX60, Q70/QX70; Volvo S/V/XC 40, 60, 90; Mercedes A/GLA, C/GLC, E/GLE, S/GLS, CLA/GLA, CLS/GLS; Peugeot 208/2008, 308/3008, 408/4008, 508/5008; Citroën C3/C3 Aircross, C4/C4 X, C5/C5 Aircross/C5 X; Toyota Yaris/Yaris Cross, Corolla/Corolla Cross; Mitsubishi Eclipse/Eclipse Cross; Ford Mustang/Mustang Mach-E; Chevrolet Blazer/Trailblazer; Haval F7/F7x, Dargo/Dargo X. Если клиент указал полное обозначение, не заменяй его похожим и не задавай вопрос о букве, которую он уже назвал. Не определяй класс или цену по предположению: после уточнения следуй прайсу и правилам таблицы.
 
 КЛАСС И ПРАЙС
@@ -764,7 +764,9 @@ car — слова клиента с исходной цитатой; car_model 
                     raise ValueError(f"tentative_choice_requires_clarification:{field}")
             if field in facts:
                 if field in result and not same(field, result[field], facts[field]):
-                    raise ValueError(f"booking_conflicts_with_customer_facts:{field}")
+                    # Повторный прогон (подтверждение): car уже заменён на распознанное название.
+                    if field != "car" or not facts.get("car_model") or not same(field, result[field], facts["car_model"]):
+                        raise ValueError(f"booking_conflicts_with_customer_facts:{field}")
                 result[field] = facts[field]
             elif field in state.get("invalidated", []) and result.get(field):
                 if field not in {"tariff", "services"} or any(
@@ -772,6 +774,9 @@ car — слова клиента с исходной цитатой; car_model 
                     for value in _service_names(result[field])
                 ):
                     raise ValueError("invalidated_booking_field_requires_new_customer_fact")
+        # Клиенту и в таблицу показываем распознанное название, а не исходные слова клиента.
+        if facts.get("car_model"):
+            result["car"] = facts["car_model"]
         if selection and not quote.get("stale"):
             for field in ("size_class", "tariff", "services"):
                 value = result.get(field)

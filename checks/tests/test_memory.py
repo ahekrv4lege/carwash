@@ -29,6 +29,20 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('класс «Легковой»', self.agent._proposal_text(self.agent._pending[111]))
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
 
+    async def test_recognized_car_model_in_proposal_and_sheet(self):
+        self.agent._state[111] = {"facts": dict(ARGS, car="бив м5", car_model="BMW M5")}
+        result = await self.agent._call_tool("create_booking", "{}", self.user)
+        self.assertTrue(result.get("confirmation_required"), result)
+        self.assertEqual(self.agent._pending[111]["args"]["car"], "BMW M5")
+        text = self.agent._offer(111, self.agent._pending[111])
+        self.assertIn("Автомобиль: BMW M5, класс «Легковой»", text)
+        self.assertNotIn("бив м5", text)
+        self.agent.mark_delivered(111, self.agent.delivery_token(111, text))
+        await self.confirm()
+        rows = self.spreadsheet.worksheet("Записи").values
+        self.assertTrue(any("BMW M5" in row for row in rows))
+        self.assertFalse(any("бив м5" in row for row in rows))
+
     async def test_class_resolution_does_not_bypass_other_uncertainty_or_catalog_validation(self):
         for guesses, supplied in (({"size_class": "Легковой", "car": "Toyota Camry"}, "Легковой"),
                                   ({"size_class": "Легковой", "car_model": "Toyota Camry"}, "Легковой"),
