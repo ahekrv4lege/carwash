@@ -714,6 +714,7 @@ class Store:
                 row = [data.get(header.strip().lower(), "") for header in headers]
                 worksheet.append_row(row, value_input_option="RAW")
             self._invalidate("bookings")
+            self.refresh_bookings_sheet()
 
             return {
                 "ok": True,
@@ -730,6 +731,67 @@ class Store:
             }
 
     # ---------- записи клиента ----------
+    def refresh_bookings_sheet(self) -> None:
+        """«Записи»: сортировка по дате и времени + цветовая разметка строк."""
+        with self._lock:
+            worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
+            if not hasattr(worksheet, "update"):
+                return  # синтетический лист в тестах не умеет перезапись и цвета
+            values = worksheet.get_all_values()
+            if len(values) < 2:
+                return
+            headers, body = values[0], values[1:]
+            width = len(headers)
+            last_col = chr(ord("A") + width - 1) if width <= 26 else "Z"
+
+            def sort_key(row):
+                booking_date = parse_date(str(row[2])) if len(row) > 2 else None
+                booking_time = parse_time(str(row[3])) if len(row) > 3 else ""
+                return (booking_date or date(9999, 12, 31), booking_time or "99:99")
+
+            body.sort(key=sort_key)
+            body = [row + [""] * (width - len(row)) for row in body]
+            if headers and headers[0].strip().lower() == "id":
+                # ID перенумеровываем по хронологии, чтобы колонка не выглядела перемешанной.
+                body = [[str(index)] + list(row[1:]) for index, row in enumerate(body, start=1)]
+            worksheet.update(f"A2:{last_col}{len(body) + 1}", body, value_input_option="RAW")
+            self._paint_bookings(worksheet, headers, body)
+            self._invalidate("bookings")
+
+    def _paint_bookings(self, worksheet, headers, rows) -> None:
+        if not hasattr(worksheet, "format"):
+            return
+        now_value = self.now()
+        today = now_value.date()
+        created_idx = headers.index("Создано") if "Создано" in headers else None
+        status_idx = headers.index("Статус") if "Статус" in headers else None
+        date_idx = headers.index("Дата") if "Дата" in headers else 2
+        last_col = chr(ord("A") + len(headers) - 1) if len(headers) <= 26 else "Z"
+        for offset, row in enumerate(rows):
+            sheet_row = offset + 2
+            status = str(row[status_idx]).strip().lower() if status_idx is not None and status_idx < len(row) else ""
+            booking_date = parse_date(str(row[date_idx])) if date_idx < len(row) else None
+            created = None
+            if created_idx is not None and created_idx < len(row):
+                try:
+                    created = datetime.strptime(str(row[created_idx]).strip(), "%d.%m.%Y %H:%M")
+                except ValueError:
+                    created = None
+            if created is not None and created.tzinfo is None:
+                created = created.replace(tzinfo=self.timezone)
+            if status.startswith("отмен"):
+                color = (0.98, 0.80, 0.80)  # отмена - красноватый
+            elif status.startswith("архив") or (booking_date and booking_date < today):
+                color = (0.93, 0.93, 0.93)  # прошлое - серый
+            elif created and (now_value - created) <= timedelta(hours=24):
+                color = (0.85, 0.94, 0.82)  # новая за сутки - зелёный
+            elif booking_date and booking_date >= today:
+                color = (1.0, 0.97, 0.78)  # предстоящая - жёлтый
+            else:
+                color = (0.93, 0.93, 0.93)
+            worksheet.format(f"A{sheet_row}:{last_col}{sheet_row}",
+                             {"backgroundColor": {"red": color[0], "green": color[1], "blue": color[2]}})
+
     def archive_old_bookings(self) -> int:
         """Прошедшие даты со статусом «Новая» помечаем «Архив»."""
         today = self.now().date()
