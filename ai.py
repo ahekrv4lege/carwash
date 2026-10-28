@@ -128,7 +128,7 @@ def vehicle_clarification(text):
                 if re.search(r"\b(?:a|q|qx|xc|cx|s|v|x|i|m)[-\s]*" + str(number) + r"\b", text, re.I):
                     continue
                 display = options if options.startswith(label) else f"{label} {options}"
-                return f"Уточните, пожалуйста, какую модель вы имеете в виду: {display}?"
+                return f"Уточните, пожалуйста, какую модель вы имеете в виду:\n{display}?"
     named = (
         (r"(?:mercedes(?:-benz)?|мерседес)\s+([acesаес])(?:-?class|\s+класс)?\b", {"a": "A-Class / GLA", "а": "A-Class / GLA", "c": "C-Class / GLC", "с": "C-Class / GLC", "e": "E-Class / GLE", "е": "E-Class / GLE", "s": "S-Class / GLS"}, r"\b(?:gla|glc|gle|gls)\b"),
         (r"(?:citro[eё]n|ситроен|ситро[её]н)\s+c\s*([345])\b", {"3": "C3 / C3 Aircross", "4": "C4 / C4 X", "5": "C5 / C5 Aircross / C5 X"}, r"\b(?:aircross|аиркросс|x|х)\b"),
@@ -143,7 +143,7 @@ def vehicle_clarification(text):
         if match and not re.search(specific, text, re.I):
             options = choices.get(re.sub(r"\s+", "", match.group(1).lower()))
             if options:
-                return f"Уточните, пожалуйста: {options}?"
+                return f"Уточните, пожалуйста:\n{options}?"
     return None
 
 
