@@ -108,7 +108,7 @@ class AdaptiveTests(unittest.TestCase):
         self.assertEqual(len(self.store.my_bookings(111)["bookings"]), 1)
         self.assertFalse(self.store.create_booking(**booking())["ok"])
         self.assertTrue(self.store.cancel_booking(1, 111)["ok"])
-        self.assertEqual(self.worksheet.values[1][-1], "Отменена")
+        self.assertEqual(self.worksheet.values[1][-1], "Отмена")
         self.assertEqual(self.store.my_bookings(111)["bookings"], [])
 
     def test_alternative_sheet_and_column_names(self):

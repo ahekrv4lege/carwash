@@ -59,8 +59,8 @@ READ_REQUIRED = {
     "tariffs": {"Тариф", "Состав"},
 }
 STATUS_MAP = {"новая": "Новая", "new": "Новая", "confirmed": "Подтверждена",
-              "подтверждена": "Подтверждена", "cancelled": "Отменена", "canceled": "Отменена",
-              "отменена": "Отменена", "отмена": "Отменена", "выполнена": "Выполнена", "done": "Выполнена"}
+              "подтверждена": "Подтверждена", "cancelled": "Отмена", "canceled": "Отмена",
+              "отменена": "Отмена", "отмена": "Отмена", "выполнена": "Выполнена", "done": "Выполнена"}
 
 
 class MappingError(RuntimeError):
@@ -244,7 +244,7 @@ def discover(snapshot: dict, expected: dict[str, str]) -> tuple[list[dict], list
             rule = {"role": role, "sheet_id": snapshot["id"], "sheet_title": snapshot["title"],
                     "header_row": row_no, "first_data_row": row_no + 1, "end_row": None,
                     "columns": columns, "transforms": {"Дата": "date", "Время": "time"},
-                    "status_map": dict(STATUS_MAP), "write_statuses": {"new": "Новая", "cancelled": "Отменена"},
+                    "status_map": dict(STATUS_MAP), "write_statuses": {"new": "Новая", "cancelled": "Отмена"},
                     "date_source": source, "permissions": {"read": True, "write": role == "bookings"},
                     "validation": {"read": False, "write": False, "issues": []}}
             if role == "services":
@@ -567,7 +567,7 @@ class AdaptiveSheets:
         }
         if rule["role"] == "bookings" and (
             status_map.get(normalize_header(statuses.get("new", ""))) != "Новая"
-            or status_map.get(normalize_header(statuses.get("cancelled", ""))) != "Отменена"
+            or status_map.get(normalize_header(statuses.get("cancelled", ""))) != "Отмена"
         ):
             write_errors.append("Не подтверждены значения статусов записи/отмены")
         return write_errors

@@ -93,13 +93,13 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         sheet.values.append(["1", "27.10.2026 10:00", "27.10.2026", "18:00", "Иван", "89994994944",
                              "Lada Priora", "Легковой", "", "", "", "700", "", "111", "", "Новая"])
         sheet.values.append(["2", "27.10.2026 11:00", "27.10.2026", "12:00", "Иван", "89994994944",
-                             "Lada Priora", "Легковой", "", "", "", "700", "", "111", "", "Отменена"])
+                             "Lada Priora", "Легковой", "", "", "", "700", "", "111", "", "Отмена"])
         sheet.values.append(["3", "01.01.2099 10:00", "01.01.2099", "10:00", "Иван", "89994994944",
                              "BMW M5", "Легковой", "", "", "", "700", "", "111", "", "Новая"])
         self.assertEqual(self.store.archive_old_bookings(), 1)
         values = sheet.values
         self.assertEqual(values[1][-1], "Архив")
-        self.assertEqual(values[2][-1], "Отменена")
+        self.assertEqual(values[2][-1], "Отмена")
         self.assertEqual(values[3][-1], "Новая")
         self.assertEqual(self.store.archive_old_bookings(), 0)
 

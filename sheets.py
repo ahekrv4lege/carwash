@@ -904,7 +904,7 @@ class Store:
                     matches = [row for row in current_rows if pick(row, "ID") == str(booking_id).strip()]
                     if current_headers != headers or len(matches) != 1 or matches[0] != record:
                         return _failure("Запись изменилась. Проверьте её и подтвердите отмену заново")
-                    worksheet.update_cell(record["__row__"], column, "Отменена")
+                    worksheet.update_cell(record["__row__"], column, "Отмена")
                 self._invalidate("bookings")
                 self.refresh_bookings_sheet()
                 return {
