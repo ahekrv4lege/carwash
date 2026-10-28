@@ -876,6 +876,7 @@ class Store:
                         return _failure("Запись изменилась. Проверьте её и подтвердите отмену заново")
                     worksheet.update_cell(record["__row__"], column, "Отменена")
                 self._invalidate("bookings")
+                self.refresh_bookings_sheet()
                 return {
                     "ok": True,
                     "booking_id": str(booking_id),
@@ -944,4 +945,5 @@ class Store:
                     {"range": cell_name(record["__row__"], columns["время"]), "values": [[new_time]]},
                 ], value_input_option="RAW")
             self._invalidate("bookings")
+            self.refresh_bookings_sheet()
             return result
