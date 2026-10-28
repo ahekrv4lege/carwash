@@ -61,6 +61,21 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.agent._pending[111]["args"]["car"], "Renault Logan")
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
 
+    def test_old_bookings_get_archived_but_fresh_and_cancelled_stay(self):
+        sheet = self.spreadsheet.worksheet("Записи")
+        sheet.values.append(["1", "27.10.2026 10:00", "27.10.2026", "18:00", "Иван", "89994994944",
+                             "Lada Priora", "Легковой", "", "", "", "700", "", "111", "", "Новая"])
+        sheet.values.append(["2", "27.10.2026 11:00", "27.10.2026", "12:00", "Иван", "89994994944",
+                             "Lada Priora", "Легковой", "", "", "", "700", "", "111", "", "Отменена"])
+        sheet.values.append(["3", "01.01.2099 10:00", "01.01.2099", "10:00", "Иван", "89994994944",
+                             "BMW M5", "Легковой", "", "", "", "700", "", "111", "", "Новая"])
+        self.assertEqual(self.store.archive_old_bookings(), 1)
+        values = sheet.values
+        self.assertEqual(values[1][-1], "Архив")
+        self.assertEqual(values[2][-1], "Отменена")
+        self.assertEqual(values[3][-1], "Новая")
+        self.assertEqual(self.store.archive_old_bookings(), 0)
+
     async def test_recognized_car_model_in_proposal_and_sheet(self):
         self.agent._state[111] = {"facts": dict(ARGS, car="бив м5", car_model="BMW M5")}
         result = await self.agent._call_tool("create_booking", "{}", self.user)

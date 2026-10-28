@@ -730,6 +730,27 @@ class Store:
             }
 
     # ---------- записи клиента ----------
+    def archive_old_bookings(self) -> int:
+        """Прошедшие даты со статусом «Новая» помечаем «Архив»."""
+        today = self.now().date()
+        with self._lock:
+            headers, rows = self._table(self.config.sheet_bookings)
+            if not rows or "Статус" not in headers:
+                return 0
+            status_col = headers.index("Статус") + 1
+            worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
+            changed = 0
+            for record in rows:
+                booking_date = parse_date(str(record.get("Дата", "")))
+                status = str(record.get("Статус", "")).strip()
+                if (booking_date and booking_date < today
+                        and (not status or status.lower().startswith("нов"))):
+                    worksheet.update_cell(record["__row__"], status_col, "Архив")
+                    changed += 1
+            if changed:
+                self._invalidate("bookings")
+            return changed
+
     def my_bookings(self, telegram_id: int) -> dict:
         with self._lock:
             self._invalidate("bookings")

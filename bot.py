@@ -241,6 +241,18 @@ async def maintain_sessions(agent: Agent) -> None:
         agent.cleanup_sessions()
 
 
+async def archive_old_bookings(store: Store) -> None:
+    """Раз в 6 часов помечаем прошедшие заявки как «Архив»."""
+    while True:
+        try:
+            archived = await asyncio.to_thread(store.archive_old_bookings)
+            if archived:
+                log.info("Архивировано устаревших записей: %d", archived)
+        except Exception as error:
+            log.warning("Не удалось архивировать старые записи (%s)", type(error).__name__)
+        await asyncio.sleep(6 * 3600)
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     config = load_config()
@@ -257,16 +269,18 @@ async def main() -> None:
         router.callback_query.outer_middleware(batcher)
         dispatcher.include_router(router)
         maintenance = asyncio.create_task(maintain_sessions(agent))
+        archiver = asyncio.create_task(archive_old_bookings(store))
         if config.sheets_adaptive_enabled and config.sheets_discover_on_start:
             await asyncio.to_thread(store.refresh_schema, force=config.sheets_force_schema_refresh)
         await bot.delete_webhook(drop_pending_updates=False)
         log.info("Бот запущен. Модель: %s", config.ai_model if config.ai_enabled else "AI отключён")
         await dispatcher.start_polling(bot, close_bot_session=False)
     finally:
-        if maintenance is not None:
-            maintenance.cancel()
-            with suppress(asyncio.CancelledError):
-                await maintenance
+        for task in (maintenance, archiver):
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
         try:
             if agent is not None:
                 await agent.close()
