@@ -68,9 +68,9 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Предлагаю запись:", answer)
         self.assertEqual(self.agent._pending[111]["args"]["time"], "17:00")
 
-        self.transport.side_effect = [response("Записываю вас в 22.", raw=True)]
-        answer = await self.agent.reply(self.user, "дава в 22")
-        self.assertIn("с 9:00 до 21:00", answer)
+        self.transport.side_effect = [response("Записываю вас в 21.", raw=True)]
+        answer = await self.agent.reply(self.user, "дава в 21")
+        self.assertIn("с 9:00 до 19:00", answer)
         self.assertNotIn(111, self.agent._pending)
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
 

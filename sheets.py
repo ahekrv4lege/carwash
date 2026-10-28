@@ -31,8 +31,8 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 WORK_START_HOUR = 9
-WORK_END_HOUR = 21
-WORK_HOURS_HINT = "Мы работаем ежедневно с 9:00 до 21:00. Выберите время в этом интервале."
+WORK_END_HOUR = 19
+WORK_HOURS_HINT = "Мы работаем ежедневно с 9:00 до 19:00. Выберите время в этом интервале."
 
 
 def to_work_time(value: str) -> str:
