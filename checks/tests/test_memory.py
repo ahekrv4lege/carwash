@@ -36,7 +36,8 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
                  "size_class": ["Легковой", "бив м5"], "requested_service": ["мойка кузова", "МОЙКА кузова"],
                  "client_name": ["Иван", "иван"], "phone": ["89994994944", "89994994944"]}
         self.transport.side_effect = [response(calls=[("get_price_list", {})]),
-                                      response("Проверю свободное время.", facts=facts)]
+                                      response(calls=[("respond", {"reply": "Какой у вас автомобиль?"})]),
+                                      response(calls=[("respond", {"reply": "", "facts": facts})])]
         with patch.object(self.store, "now", return_value=datetime(2026, 10, 28, 12, tzinfo=ZoneInfo("Europe/Moscow"))):
             answer = await self.agent.reply(self.user, "МОЙКА кузова НА 6 вечера завтра у меня бив м5 иван 89994994944")
         self.assertIn("Предлагаю запись:", answer)

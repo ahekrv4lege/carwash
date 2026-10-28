@@ -1231,6 +1231,33 @@ car — слова клиента с исходной цитатой; car_model 
                     if auto_date and auto_time:
                         apply_patch(self._state[user.id], {"date": auto_date.isoformat(), "time": auto_time}, {})
                     facts_now = self._state[user.id].get("facts", {})
+                    facts_now = self._state[user.id].get("facts", {})
+                    missing = [field for field in ("car", "size_class", "date", "time") if not facts_now.get(field)]
+                    if not (facts_now.get("tariff") or facts_now.get("services")):
+                        missing.append("tariff_or_services")
+                    if missing and missing != ["date", "time"]:
+                        # Нейронка не сохранила машину/контакты — принудительно вытаскиваем факты из сообщения.
+                        log.info("Авто-предложение: дозапрос памяти, нет %s", missing)
+                        respond_tool = next(tool for tool in self._tools(user, only="respond"))
+                        repair = [*messages, {"role": "assistant", "content": answer},
+                                  {"role": "system", "content": (
+                                      "В сообщении клиента названы данные записи. Сохрани через respond всё, что есть: "
+                                      "car - дословные слова клиента об автомобиле; car_model - распознанные марка и модель; "
+                                      "size_class - по прайсу и правилам таблицы (седаны, хэтчбеки и универсалы - Легковой); "
+                                      "requested_service - слова клиента об услуге; date и time - дата и время записи; "
+                                      "client_name и phone - если названы. Ничего не выдумывай. reply=\"\".")}]
+                        try:
+                            response = await asyncio.wait_for(self._request(
+                                messages=repair, tools=[respond_tool],
+                                tool_choice={"type": "function", "function": {"name": "respond"}}),
+                                timeout=self.config.ai_timeout_sec)
+                            memory = response.choices[0].message
+                            content = (memory.tool_calls[0].function.arguments if memory.tool_calls else memory.content) or ""
+                            if content.strip():
+                                await self._ingest(user, content)
+                            facts_now = self._state[user.id].get("facts", {})
+                        except Exception as error:
+                            log.warning("Дозапрос памяти не удался (%s)", api_error_label(error))
                     if not (facts_now.get("tariff") or facts_now.get("services")) and facts_now.get("requested_service"):
                         # Слова клиента («мойка кузова») -> точное название из прайса.
                         catalog = self._state[user.id].get("catalog") or {}
