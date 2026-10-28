@@ -19,7 +19,8 @@ from openai import AsyncOpenAI, APIConnectionError, APIStatusError, RateLimitErr
 
 from config import ROOT, Config
 from providers import api_error_label, client_options, completion_options, invalid_tool_output, request_arguments, retry_after
-from sheets import WEEKDAYS_RU, Store, parse_date, parse_time, digits, valid_phone
+from sheets import (WEEKDAYS_RU, Store, parse_date, parse_time, digits, valid_phone,
+                    to_work_time, within_work_hours, WORK_HOURS_HINT)
 from conversation import (CATALOG_FIELDS, FIELDS, PHONE, apply_patch, folded, literal_car_patch, model_state,
                           plain_text, redact_phone, safe_reply, same, strict_json, unpack, validate_patch, salvage_patch, source_date, source_time)
 
@@ -525,22 +526,25 @@ car — слова клиента с исходной цитатой; car_model 
                 await asyncio.wait_for(self._remember_choice(user, state.get("facts", {})), timeout=remaining())
                 answer = _clean_text(await asyncio.wait_for(
                     self._run(messages, user, review_before), timeout=remaining()))
-                if user.id not in self._pending and re.search(r"\b(?:подтвердите\s+(?:запись|заказ)|записать\s+вас|оформить\s+запись|записыва\w*|запиш\w*|оформл\w*)\b", answer, re.I):
+                if user.id not in self._pending and re.search(r"\b(?:подтвердите\s+(?:запись|заказ)|записать\s+вас|оформить\s+запись|записыва\w*|запиш\w*|оформл\w*|подготовлен\w*|подготов\w*\s+запис\w*)\b", answer, re.I):
                     facts_net = state.setdefault("facts", {})
-                    parsed_net = source_time(text, True)
-                    if parsed_net and facts_net.get("date"):
-                        hour = int(parsed_net.split(":")[0])
-                        if hour <= 11:
-                            # «Давай в 5» после предложения 17:00/19:00 — вечерний слот из контекста.
-                            offered = [slot for day in (state.get("availability") or {}).get("days", [])
-                                       if day.get("date") == facts_net["date"] for slot in day.get("free_times", [])]
-                            evening = [slot for slot in offered if slot.startswith(f"{hour + 12:02d}:")]
-                            if evening:
-                                facts_net["time"] = evening[0]
-                                state.pop("unavailable_time", None)
+                    parsed_net_time = source_time(text, True) or source_time(text)
+                    if parsed_net_time:
+                        facts_net["time"] = to_work_time(parsed_net_time)
+                        state.pop("unavailable_time", None)
+                    if not facts_net.get("date"):
+                        parsed_net_date = source_date(text, self.store.now(), True)
+                        if parsed_net_date:
+                            facts_net["date"] = parsed_net_date.isoformat()
+                            state.pop("unavailable_time", None)
                     result = await asyncio.wait_for(self._call_tool("create_booking", "{}", user), timeout=remaining())
-                    answer = (self._offer(user.id, self._pending[user.id]) if result.get("confirmation_required")
-                              else self._clarification(user.id, result.get("field")))
+                    if result.get("confirmation_required"):
+                        return self._offer(user.id, self._pending[user.id])
+                    if result.get("table_unavailable"):
+                        return result["error"]
+                    if not result.get("ok") and "работаем" in str(result.get("error", "")):
+                        return result["error"]
+                    answer = self._clarification(user.id, result.get("field"))
                 if self.config.ai_proofread_enabled and user.id not in self._pending:
                     answer = await self._proofread(answer)
                 if user.id not in self._pending:
@@ -1254,7 +1258,7 @@ car — слова клиента с исходной цитатой; car_model 
                              and auto_time is not None)
                         and not re.search(r"\b(?:не|если|или|либо|пока|возможно|может|ли)\b", source, re.I)):
                     if auto_date and auto_time:
-                        apply_patch(self._state[user.id], {"date": auto_date.isoformat(), "time": auto_time}, {})
+                        apply_patch(self._state[user.id], {"date": auto_date.isoformat(), "time": to_work_time(auto_time)}, {})
                     facts_now = self._state[user.id].get("facts", {})
                     facts_now = self._state[user.id].get("facts", {})
                     missing = [field for field in ("car", "size_class", "date", "time") if not facts_now.get(field)]
@@ -1305,6 +1309,8 @@ car — слова клиента с исходной цитатой; car_model 
                         if result.get("confirmation_required"):
                             return self._offer(user.id, self._pending[user.id])
                         if result.get("table_unavailable"):
+                            return result["error"]
+                        if not result.get("ok") and "работаем" in str(result.get("error", "")):
                             return result["error"]
                         if not result.get("ok") and "available_tariffs" in result:
                             return self._clarification(user.id, "tariff_or_services")
@@ -1422,9 +1428,11 @@ car — слова клиента с исходной цитатой; car_model 
                 pending["booking"] = dict(result["booking"], currency=self.config.currency)
         else:
             supplied = dict(args)
-            booking_date, booking_time = parse_date(args["date"]), parse_time(args["time"])
-            if not booking_date or not booking_time or not re.fullmatch(r"\d{1,2}[:.]\d{2}(?::00)?", args["time"].strip()) or not valid_phone(args["phone"]) or not args["car"].strip() or not args["client_name"].strip():
+            booking_date, booking_time = parse_date(args["date"]), parse_time(to_work_time(args["time"]))
+            if not booking_date or not booking_time or not re.fullmatch(r"\d{1,2}[:.]\d{2}(?::00)?", to_work_time(args["time"]).strip()) or not valid_phone(args["phone"]) or not args["car"].strip() or not args["client_name"].strip():
                 return {"ok": False, "error": "Проверьте дату, время, имя, автомобиль и телефон"}
+            if not within_work_hours(booking_time):
+                return {"ok": False, "field": "available_time", "error": WORK_HOURS_HINT}
             if not self.store._is_future(booking_date, booking_time):
                 return {"ok": False, "error": "Это время уже прошло или слишком близко. Выберите предстоящую дату и время."}
             args = dict(args, date=booking_date.isoformat(), time=booking_time)

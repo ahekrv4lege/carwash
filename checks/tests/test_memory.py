@@ -47,6 +47,33 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(111, self.agent._pending)
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
 
+    async def test_prepared_record_claim_uses_time_from_answer_message(self):
+        self.spreadsheet.worksheet("Слоты").values.append(["29.10.2026", "19:00", "1"])
+        self.agent._state[111] = {"facts": dict(ARGS, car="рено дастер", car_model="Renault Duster",
+                                                size_class="Кроссовер", services=["Мойка"], date="2026-10-29")}
+        self.transport.side_effect = [response(
+            "На 29 октября 19:00 свободно. Подготовлено запись на мойку кузова для Renault Duster, 700 ₽.", raw=True)]
+        answer = await self.agent.reply(self.user, "19")
+        self.assertIn("Предлагаю запись:", answer)
+        self.assertIn("19:00", answer)
+        self.assertEqual(self.agent._pending[111]["args"]["time"], "19:00")
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
+    async def test_five_oclock_means_evening_slot_and_night_time_is_rejected(self):
+        self.spreadsheet.worksheet("Слоты").values.append(["29.10.2026", "17:00", "1"])
+        self.agent._state[111] = {"facts": dict(ARGS, car="рено дастер", car_model="Renault Duster",
+                                                size_class="Кроссовер", services=["Мойка"], date="2026-10-29")}
+        self.transport.side_effect = [response("Записываю вас в 5.", raw=True)]
+        answer = await self.agent.reply(self.user, "дава в 5")
+        self.assertIn("Предлагаю запись:", answer)
+        self.assertEqual(self.agent._pending[111]["args"]["time"], "17:00")
+
+        self.transport.side_effect = [response("Записываю вас в 22.", raw=True)]
+        answer = await self.agent.reply(self.user, "дава в 22")
+        self.assertIn("с 9:00 до 21:00", answer)
+        self.assertNotIn(111, self.agent._pending)
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
+
     async def test_claim_after_offered_slots_resolves_evening_time_and_proposes(self):
         self.spreadsheet.worksheet("Слоты").values.append(["29.10.2026", "17:00", "1"])
         self.agent._state[111] = {"facts": dict(ARGS, car="логан", car_model="Renault Logan",

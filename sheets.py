@@ -30,6 +30,34 @@ log = logging.getLogger(__name__)
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+WORK_START_HOUR = 9
+WORK_END_HOUR = 21
+WORK_HOURS_HINT = "Мы работаем ежедневно с 9:00 до 21:00. Выберите время в этом интервале."
+
+
+def to_work_time(value: str) -> str:
+    """«5» - это 17:00: утренние часы сдвигаем на вечер, если попадаем в график."""
+    parts = str(value).strip().split(":")
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        return str(value)
+    if hour < WORK_START_HOUR:
+        hour += 12
+    if WORK_START_HOUR <= hour <= WORK_END_HOUR:
+        return f"{hour:02d}:{minute:02d}"
+    return f"{hour:02d}:{minute:02d}" if len(parts) > 1 else str(value)
+
+
+def within_work_hours(value: str) -> bool:
+    parts = str(value).strip().split(":")
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1]) if len(parts) > 1 else 0
+    except (ValueError, IndexError):
+        return False
+    return WORK_START_HOUR <= hour <= WORK_END_HOUR and 0 <= minute <= 59
 
 # Служебные колонки листа «Услуги». ВСЕ остальные колонки — это классы (габариты) автомобилей.
 SERVICE_FIXED_COLS = {"услуга", "описание", "доступна"}
@@ -624,9 +652,11 @@ class Store:
         telegram_id: int, username: str | None,
         expected_quote: dict | None = None,
     ) -> dict:
-        booking_date, booking_time = parse_date(date_str), parse_time(time_str)
+        booking_date, booking_time = parse_date(date_str), parse_time(to_work_time(time_str))
         if not booking_date or not booking_time:
             return _failure("Неверная дата или время. Нужно: дата ГГГГ-ММ-ДД, время ЧЧ:ММ")
+        if not within_work_hours(booking_time):
+            return _failure(WORK_HOURS_HINT)
         name, car = (name or "").strip(), (car or "").strip()
         if not name:
             return _failure("Не указано имя клиента")
@@ -888,9 +918,11 @@ class Store:
 
     def reschedule_booking(self, booking_id: Any, telegram_id: int, date_str: str, time_str: str,
                            *, expected_booking: dict | None = None, dry_run: bool = False) -> dict:
-        new_date, new_time = parse_date(date_str), parse_time(time_str)
+        new_date, new_time = parse_date(date_str), parse_time(to_work_time(time_str))
         if not new_date or not new_time or not self._is_future(new_date, new_time):
             return _failure("Укажите предстоящую дату и время с учётом минимального интервала до записи")
+        if not within_work_hours(new_time):
+            return _failure(WORK_HOURS_HINT)
         with self.fresh_tables():
             self._invalidate("slots", "bookings")
             slots = self._get_slots()
