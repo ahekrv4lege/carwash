@@ -113,7 +113,7 @@ def vehicle_clarification(text):
         bmw[n] += f" / i{n} / M{n}"
     bmw[7] += " / i7"
     families = (
-        (r"bmw|бмв|беха|бэха", "BMW", bmw, r"series|сери\w*"),
+        (r"bmw|бмв|бвм|беха|бэха|бумв", "BMW", bmw, r"series|сери\w*"),
         (r"audi|ауди", "Audi", {n: f"A{n} / Q{n}" for n in (3, 4, 5, 6, 7, 8)}, ""),
         (r"mazda|мазда", "Mazda", {3: "Mazda3 / CX-3", 5: "Mazda5 / CX-5"}, ""),
         (r"infiniti|инфинити", "Infiniti", {n: f"Q{n} / QX{n}" for n in (50, 60, 70)}, ""),
@@ -128,8 +128,7 @@ def vehicle_clarification(text):
                 if re.search(r"\b(?:a|q|qx|xc|cx|s|v|x|i|m)[-\s]*" + str(number) + r"\b", text, re.I):
                     continue
                 display = options if options.startswith(label) else f"{label} {options}"
-                listing = "\n- ".join(display.split(" / "))
-                return f"Уточните, пожалуйста, какую модель вы имеете в виду:\n- {listing}?"
+                return f"Уточните, пожалуйста, какую модель вы имеете в виду: {display}?"
     named = (
         (r"(?:mercedes(?:-benz)?|мерседес)\s+([acesаес])(?:-?class|\s+класс)?\b", {"a": "A-Class / GLA", "а": "A-Class / GLA", "c": "C-Class / GLC", "с": "C-Class / GLC", "e": "E-Class / GLE", "е": "E-Class / GLE", "s": "S-Class / GLS"}, r"\b(?:gla|glc|gle|gls)\b"),
         (r"(?:citro[eё]n|ситроен|ситро[её]н)\s+c\s*([345])\b", {"3": "C3 / C3 Aircross", "4": "C4 / C4 X", "5": "C5 / C5 Aircross / C5 X"}, r"\b(?:aircross|аиркросс|x|х)\b"),
@@ -144,8 +143,7 @@ def vehicle_clarification(text):
         if match and not re.search(specific, text, re.I):
             options = choices.get(re.sub(r"\s+", "", match.group(1).lower()))
             if options:
-                listing = "\n- ".join(options.split(" / "))
-                return f"Уточните, пожалуйста:\n- {listing}?"
+                return f"Уточните, пожалуйста: {options}?"
     return None
 
 
