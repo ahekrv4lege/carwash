@@ -634,10 +634,23 @@ car — слова клиента с исходной цитатой; car_model 
             return None
         if state.get("stage") == "booked":
             booking = state["booking"]
-            return f"Подтверждённая запись #{booking['booking_id']}: {booking['date']} в {booking['time']}, {booking['car']}. Итого {booking['total']} {booking['currency']}."
+            number = f" {booking['user_no']}" if booking.get("user_no") else ""
+            return f"Подтверждённая запись{number}: {booking['date']} в {booking['time']}, {booking['car']}. Итого {booking['total']} {booking['currency']}."
         if state.get("stage") == "cancelled":
             booking = state["cancelled"]
-            return f"Подтверждена отмена записи #{booking['booking_id']} на {booking['date']} в {booking['time']}."
+            number = f" {booking['user_no']}" if booking.get("user_no") else ""
+            return f"Подтверждена отмена записи{number} на {booking['date']} в {booking['time']}."
+        return None
+
+    def _user_booking_no(self, user_id: int, booking_id) -> str | None:
+        """Порядковый номер записи клиента (его собственный, без внутренних id)."""
+        try:
+            mine = self.store.my_bookings(user_id).get("bookings", [])
+        except Exception:
+            return None
+        for index, item in enumerate(mine, start=1):
+            if str(item.get("booking_id")) == str(booking_id):
+                return str(index)
         return None
 
     async def _ingest(self, user, content, extra=None, partial=False):
@@ -1453,14 +1466,14 @@ car — слова клиента с исходной цитатой; car_model 
 
         if pending["action"] == "reschedule_booking":
             booking, target = pending["booking"], pending["args"]
-            return (f"Перенос записи #{booking['booking_id']}:\n"
+            return (f"Перенос записи:\n"
                     f"Было: {day(booking['date'])} в {booking['time']}\nСтанет: {day(target['date'])} в {target['time']}\n"
                     f"Автомобиль: {booking['car']}\nТариф: {booking['tariff'] or 'без тарифа'}\n"
                     f"Сумма сохранится: {booking['total']} {booking['currency']}\n\n"
                     "Для переноса нажмите «Подтвердить». До нажатия исходная запись сохраняется. Правки напишите в чат.")
         if pending["action"] == "cancel_booking":
             booking = pending["booking"]
-            return (f"Отмена записи #{booking['booking_id']}:\nДата: {day(booking['date'])}\nВремя: {booking['time']}\n"
+            return (f"Отмена записи:\nДата: {day(booking['date'])}\nВремя: {booking['time']}\n"
                     f"Автомобиль: {booking['car']}\nТариф: {booking.get('tariff') or 'без тарифа'}\n"
                     f"Дополнительные услуги: {booking.get('extras') or 'нет'}\nИтого: {booking['total']} {booking['currency']}\n\n"
                     "Для отмены нажмите «Подтвердить». Если данные неверны, напишите в чат.")
@@ -1499,26 +1512,32 @@ car — слова клиента с исходной цитатой; car_model 
                     return self._offer(user.id, pending, "Цена или состав услуги изменились. ")
                 if result.get("ok"):
                     facts = state.get("facts", {})
+                    user_no = await asyncio.to_thread(self._user_booking_no, user.id, result["booking_id"])
                     state.clear()
-                    state.update(facts=facts, stage="booked", confirmed=True, booking={field_name: result[field_name] for field_name in ("booking_id", "date", "time", "car", "total", "currency")})
-                    return f"Записала вас! Запись #{result['booking_id']}: {result['date']} в {result['time']}, {result['car']}. Итого {result['total']} {result['currency']}. Ждём вас!"
+                    state.update(facts=facts, stage="booked", confirmed=True, booking={**{field_name: result[field_name] for field_name in ("booking_id", "date", "time", "car", "total", "currency")}, "user_no": user_no})
+                    number = f" Запись {user_no}." if user_no else ""
+                    return f"Записала вас!{number} {result['date']} в {result['time']}, {result['car']}. Итого {result['total']} {result['currency']}. Ждём вас!"
             elif pending["action"] == "reschedule_booking":
                 result = await self._execute("reschedule_booking", pending["args"], user, expected=pending["booking"])
                 if result.get("ok"):
                     facts = state.get("facts", {})
                     facts.update(date=result["date"], time=result["time"])
                     state.clear()
+                    user_no = await asyncio.to_thread(self._user_booking_no, user.id, result["booking_id"])
                     state.update(facts=facts, stage="booked", confirmed=True,
-                                 booking={key: result[key] for key in ("booking_id", "date", "time", "car", "total", "currency")})
-                    return f"Запись #{result['booking_id']} перенесена на {result['date']} в {result['time']}. Остальные данные сохранены."
+                                 booking={**{key: result[key] for key in ("booking_id", "date", "time", "car", "total", "currency")}, "user_no": user_no})
+                    number = f" Запись {user_no}" if user_no else " Запись"
+                    return f"{number} перенесена на {result['date']} в {result['time']}. Остальные данные сохранены."
             else:
                 result = await self._execute("cancel_booking", pending["args"], user, expected=pending["booking"])
                 if result.get("ok"):
                     facts = state.get("facts", {})
                     state.clear()
+                    user_no = await asyncio.to_thread(self._user_booking_no, user.id, result["booking_id"])
                     state.update(facts=facts, stage="cancelled", confirmed=True,
-                                 cancelled={field_name: result[field_name] for field_name in ("booking_id", "date", "time")})
-                    return f"Запись #{result['booking_id']} на {result['date']} в {result['time']} отменена."
+                                 cancelled={**{field_name: result[field_name] for field_name in ("booking_id", "date", "time")}, "user_no": user_no})
+                    number = f" Запись {user_no}" if user_no else " Запись"
+                    return f"{number} на {result['date']} в {result['time']} отменена."
             state.update(stage="needs_correction", confirmed=False)
             return result.get("error", "Операция отклонена. Проверьте свои записи и уточните детали.")
         except asyncio.CancelledError:
