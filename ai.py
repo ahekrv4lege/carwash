@@ -1254,10 +1254,10 @@ car — слова клиента с исходной цитатой; car_model 
                             memory = response.choices[0].message
                             content = (memory.tool_calls[0].function.arguments if memory.tool_calls else memory.content) or ""
                             if content.strip():
-                                await self._ingest(user, content)
+                                await self._ingest(user, content, partial=True)
                             facts_now = self._state[user.id].get("facts", {})
                         except Exception as error:
-                            log.warning("Дозапрос памяти не удался (%s)", api_error_label(error))
+                            log.warning("Дозапрос памяти не удался (%s: %s)", type(error).__name__, str(error)[:120])
                     if not (facts_now.get("tariff") or facts_now.get("services")) and facts_now.get("requested_service"):
                         # Слова клиента («мойка кузова») -> точное название из прайса.
                         catalog = self._state[user.id].get("catalog") or {}
