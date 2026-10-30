@@ -122,6 +122,7 @@ class Config:
     ai_request_retries: int = 1
     ai_history_chars: int = 6000
     ai_recent_turns: int = 4
+    ai_proofread_enabled: bool = False
     reply_min_delay_sec: float = 1.5
     reply_batch_sec: float = 0.4
     ai_session_ttl_sec: int = 3600
@@ -177,6 +178,7 @@ def _generation_settings() -> dict:
         ai_request_retries=retries,
         ai_history_chars=_integer("AI_HISTORY_CHARS", "6000", 1000),
         ai_recent_turns=_integer("AI_RECENT_TURNS", "4", 1),
+        ai_proofread_enabled=_bool("AI_PROOFREAD_ENABLED"),
         ai_session_ttl_sec=_integer("AI_SESSION_TTL_SEC", "3600", 600),
         ai_max_sessions=_integer("AI_MAX_SESSIONS", "1000", 1),
     )
