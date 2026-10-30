@@ -105,7 +105,6 @@ class Config:
     sheets_adaptive_enabled: bool = False
     sheets_discover_on_start: bool = False
     sheets_schema_check_interval_hours: float = 24.0
-    sheets_ai_mapping_enabled: bool = False
     sheets_force_schema_refresh: bool = False
     sheets_mapping_file: str = str(ROOT / ".runtime/sheets-mapping.json")
     ai_enabled: bool = True
@@ -123,15 +122,10 @@ class Config:
     ai_request_retries: int = 1
     ai_history_chars: int = 6000
     ai_recent_turns: int = 4
-    ai_proofread_enabled: bool = False
     reply_min_delay_sec: float = 1.5
     reply_batch_sec: float = 0.4
     ai_session_ttl_sec: int = 3600
     ai_max_sessions: int = 1000
-    sheets_ai_base_url: str = ""
-    sheets_ai_api_key: str = ""
-    sheets_ai_model: str = ""
-    sheets_ai_json_mode: bool = True
     llm_fallbacks: tuple[ProviderConfig, ...] = ()
 
 def _fallbacks(primary_url: str, primary_model: str) -> tuple[ProviderConfig, ...]:
@@ -183,7 +177,6 @@ def _generation_settings() -> dict:
         ai_request_retries=retries,
         ai_history_chars=_integer("AI_HISTORY_CHARS", "6000", 1000),
         ai_recent_turns=_integer("AI_RECENT_TURNS", "4", 1),
-        ai_proofread_enabled=_bool("AI_PROOFREAD_ENABLED"),
         ai_session_ttl_sec=_integer("AI_SESSION_TTL_SEC", "3600", 600),
         ai_max_sessions=_integer("AI_MAX_SESSIONS", "1000", 1),
     )
@@ -233,9 +226,6 @@ def _sheet_settings() -> dict:
     }
     if any(not name for name in names.values()) or len(set(names.values())) != len(names):
         raise RuntimeError("SHEET_*: нужны непустые разные имена ролей")
-    mapping_url = os.getenv("SHEETS_AI_BASE_URL", "").strip()
-    if mapping_url:
-        mapping_url = _api_url("SHEETS_AI_BASE_URL", mapping_url)
     table_mapping = table_mapping_path(os.getenv("SPREADSHEET_ID", "").strip())
     has_table_mapping = Path(table_mapping).is_file()
     return dict(
@@ -243,13 +233,8 @@ def _sheet_settings() -> dict:
         sheets_adaptive_enabled=_bool("SHEETS_ADAPTIVE_ENABLED", has_table_mapping),
         sheets_discover_on_start=_bool("SHEETS_DISCOVER_ON_START"),
         sheets_schema_check_interval_hours=_number("SHEETS_SCHEMA_CHECK_INTERVAL_HOURS", "24", 0.001),
-        sheets_ai_mapping_enabled=_bool("SHEETS_AI_MAPPING_ENABLED"),
         sheets_force_schema_refresh=_bool("SHEETS_FORCE_SCHEMA_REFRESH"),
         sheets_mapping_file=table_mapping if has_table_mapping else _path("SHEETS_MAPPING_FILE", ".runtime/sheets-mapping.json"),
-        sheets_ai_base_url=mapping_url,
-        sheets_ai_api_key=os.getenv("SHEETS_AI_API_KEY", "").strip(),
-        sheets_ai_model=os.getenv("SHEETS_AI_MODEL", "").strip(),
-        sheets_ai_json_mode=_bool("SHEETS_AI_JSON_MODE", True),
     )
 
 

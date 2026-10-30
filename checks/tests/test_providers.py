@@ -1,4 +1,4 @@
-"""Параметры совместимых API, старые переменные и независимый mapping-клиент."""
+"""Параметры совместимых API и старые переменные."""
 import json
 import os
 import tempfile
@@ -9,11 +9,9 @@ from dataclasses import replace
 from types import SimpleNamespace as N
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
-from adaptive import MappingError
 from config import ProviderConfig, load_config
 from ai import Agent
 from openai import APIConnectionError, APIStatusError
-from tests.fakes import suggest_mappings
 from providers import client_options, completion_options, invalid_tool_output, request_arguments, retry_after
 from tests.fakes import config, fixture
 
@@ -60,14 +58,15 @@ class ProviderTests(unittest.TestCase):
 
     def test_cloudflare_thinking_is_explicit_and_token_limit_is_singular(self):
         cfg = self.load(AI_BASE_URL="https://api.cloudflare.com/client/v4/accounts/synthetic/ai/v1",
-                        AI_API_KEY="synthetic", AI_MODEL="@cf/zai-org/glm-4.7-flash")
+                        AI_API_KEY="synthetic", AI_MODEL="@cf/zai-org/glm-4.7-flash",
+                        AI_MAX_OUTPUT_TOKENS="1024")
         options = completion_options(cfg)
         self.assertEqual(options["extra_body"], {"chat_template_kwargs": {"enable_thinking": False}})
         self.assertEqual(options["max_completion_tokens"], 1024)
         self.assertNotIn("max_tokens", options)
-        self.assertNotIn("extra_body", completion_options(self.load()))
+        # Дефолт Polza переводит алиасы модели в extra_body; чистый URL без алиасов — без него.
+        self.assertNotIn("extra_body", completion_options(self.load(AI_MODEL="plain-model")))
         self.assertTrue(completion_options(replace(cfg, ai_reasoning_effort="low"))["extra_body"]["chat_template_kwargs"]["enable_thinking"])
-        self.assertFalse(completion_options(replace(cfg, ai_reasoning_effort="low"), mapping=True)["extra_body"]["chat_template_kwargs"]["enable_thinking"])
 
     def test_cloudflare_thinking_controls_do_not_leak_to_other_endpoints_or_models(self):
         cfg = self.load(AI_BASE_URL="https://api.cloudflare.com/client/v4/accounts/synthetic/ai/v1",
@@ -106,17 +105,22 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn("synthetic-first", repr(cfg.llm_fallbacks))
         self.assertEqual(client_options(cfg)["api_key"], ENV["LLM_API_KEY"])
 
-    def test_existing_xkiro_defaults_are_preserved(self):
+    def test_default_polza_route_and_alias_translation(self):
         cfg = self.load()
-        self.assertEqual(cfg.ai_model, "minimax/minimax-m3.1-flash")
+        self.assertEqual(cfg.ai_model,
+                         "deepseek/deepseek-v4.1-flash@provider=open-inference/fp4&allow_fallbacks=false&reasoning_effort=low")
         options = client_options(cfg)
-        self.assertEqual(options["base_url"], "https://api.xkiro.com/v1")
+        self.assertEqual(options["base_url"], "https://polza.ai/api/v1")
         self.assertEqual(options["api_key"], ENV["LLM_API_KEY"])
         self.assertEqual(options["max_retries"], 0)
         request = completion_options(cfg)
+        self.assertEqual(request["model"], "deepseek/deepseek-v4.1-flash")
+        self.assertEqual(request["extra_body"], {"provider": {"only": ["open-inference/fp4"],
+                                                             "allow_fallbacks": False},
+                                                 "reasoning": {"effort": "low"}})
         self.assertNotIn("reasoning_effort", request)
         self.assertEqual(request["temperature"], 0.3)
-        self.assertEqual(request["max_tokens"], 1024)
+        self.assertNotIn("max_tokens", request)
 
     def test_generic_provider_overrides_without_legacy_key(self):
         cfg = self.load(LLM_API_KEY="", AI_API_KEY="new-key", AI_MODEL="selected-later",
@@ -149,7 +153,10 @@ class ProviderTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "AI_REASONING_SUPPORTED"):
                     self.load(AI_REASONING_EFFORT=effort)
                 cfg = self.load(AI_REASONING_EFFORT=effort, AI_REASONING_SUPPORTED="true")
-                self.assertEqual(completion_options(cfg)["reasoning_effort"], effort)
+                request = completion_options(cfg)
+                self.assertNotIn("reasoning_effort", request)
+                expected = {"enabled": False} if effort == "none" else {"effort": effort}
+                self.assertEqual(request["extra_body"]["reasoning"], expected)
         with self.assertRaisesRegex(RuntimeError, "AI_REASONING_EFFORT"):
             self.load(AI_REASONING_EFFORT="invented")
 
@@ -160,13 +167,11 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn("max_tokens", options)
         with self.assertRaisesRegex(RuntimeError, "AI_TOKEN_LIMIT_PARAMETER"):
             self.load(AI_TOKEN_LIMIT_PARAMETER="max_output_tokens")
-        with self.assertRaisesRegex(RuntimeError, "AI_MAX_OUTPUT_TOKENS"):
-            self.load(AI_MAX_OUTPUT_TOKENS="300")
+        self.assertEqual(self.load(AI_MAX_OUTPUT_TOKENS="300").ai_max_output_tokens, 300)
 
     def test_temperature_can_be_omitted_for_unsupported_models(self):
         cfg = self.load(AI_TEMPERATURE="")
         self.assertNotIn("temperature", completion_options(cfg))
-        self.assertNotIn("temperature", completion_options(cfg, mapping=True))
         with self.assertRaisesRegex(RuntimeError, "AI_TEMPERATURE"):
             self.load(AI_TEMPERATURE="3")
 
@@ -198,58 +203,6 @@ class ProviderTests(unittest.TestCase):
             self.assertNotIn("SECRET", str(raised.exception))
         cfg = self.load(AI_BASE_URL="http://127.0.0.1:7777/v1", AI_API_KEY="local", AI_MODEL="local")
         self.assertEqual(client_options(cfg)["base_url"], "http://127.0.0.1:7777/v1")
-
-    def test_mapping_model_and_endpoint_can_be_independent(self):
-        cfg = self.load(AI_MODEL="conversation", SHEETS_AI_MODEL="mapping",
-                        SHEETS_AI_BASE_URL="https://mapping.invalid/v1", SHEETS_AI_API_KEY="mapping-key")
-        self.assertEqual(completion_options(cfg, mapping=True)["model"], "mapping")
-        self.assertEqual(client_options(cfg, mapping=True)["api_key"], "mapping-key")
-        self.assertEqual(completion_options(cfg)["model"], "conversation")
-        self.assertNotIn("reasoning_effort", completion_options(cfg, mapping=True))
-        self.assertEqual(completion_options(cfg, mapping=True)["max_tokens"], 1500)
-
-    def test_separate_mapping_host_requires_its_own_key(self):
-        cfg = self.load(SHEETS_AI_BASE_URL="https://mapping.invalid/v1")
-        with self.assertRaisesRegex(RuntimeError, "SHEETS_AI_API_KEY"):
-            client_options(cfg, mapping=True)
-
-    def test_owned_mapping_transport_uses_configured_options_and_no_write_tools(self):
-        with tempfile.TemporaryDirectory() as temp:
-            store, spreadsheet = fixture(temp, sheets_ai_mapping_enabled=True, sheets_ai_model="mapping-model",
-                sheets_ai_base_url="https://mapping.invalid/v1", sheets_ai_api_key="mapping-key",
-                sheets_ai_json_mode=False, ai_token_limit_parameter="max_completion_tokens")
-            a = store._adaptive
-            a.refresh()
-            spreadsheet.worksheet("Записи").values[0][3] = "Arrival window"
-            a.refresh(force=True)
-            client = MagicMock()
-            client.chat.completions.create.return_value = N(choices=[N(finish_reason="stop", message=N(content='{"suggestions":[]}'))])
-            with patch("openai.OpenAI", return_value=client) as factory:
-                suggest_mappings(a)
-                suggest_mappings(a)
-            self.assertEqual(factory.call_count, 1)
-            self.assertEqual(factory.call_args.kwargs["base_url"], "https://mapping.invalid/v1")
-            request = client.chat.completions.create.call_args.kwargs
-            self.assertEqual(request["model"], "mapping-model")
-            self.assertNotIn("tools", request)
-            self.assertNotIn("response_format", request)
-            self.assertEqual(request["max_completion_tokens"], 1500)
-            self.assertNotIn("00000000000", json.dumps(request, ensure_ascii=False))
-            client.close.assert_called_once()
-            self.assertFalse(any(worksheet.writes for worksheet in spreadsheet.sheets))
-
-    def test_truncated_mapping_result_is_not_cached(self):
-        with tempfile.TemporaryDirectory() as temp:
-            store, spreadsheet = fixture(temp, sheets_ai_mapping_enabled=True)
-            a = store._adaptive
-            a.refresh()
-            spreadsheet.worksheet("Записи").values[0][3] = "Arrival window"
-            a.refresh(force=True)
-            client = MagicMock()
-            client.chat.completions.create.return_value = N(choices=[N(finish_reason="length", message=N(content='{"suggestions":[]}'))])
-            with self.assertRaises(MappingError):
-                suggest_mappings(a, client)
-            self.assertFalse(a.path.with_name("mapping-suggestions.json").exists())
 
 
 class Fallback(unittest.IsolatedAsyncioTestCase):

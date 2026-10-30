@@ -113,7 +113,7 @@ class ClassRulesAgentTests(unittest.IsolatedAsyncioTestCase):
                                 response(calls=[("get_price_list", {})]),
                                 response(calls=[("create_booking", X5_ARGS)]))
         # Запись предложена прямо по правилу прайса, без переспроса категории.
-        self.assertIn("Подтверждаете", answer)
+        self.assertIn("«Подтвердить»", answer)
         self.assertNotIn("уточните", answer.lower())
         self.assertNotIn("кроссовер или внедорожник", answer.lower())
         self.assertTrue(self.agent._pending)
@@ -123,7 +123,9 @@ class ClassRulesAgentTests(unittest.IsolatedAsyncioTestCase):
         await self.say("Хочу обсудить запись: " + json.dumps(X5_ARGS, ensure_ascii=False),
                        response(calls=[("get_price_list", {})]),
                        response(calls=[("create_booking", X5_ARGS)]))
-        answer = await self.say("Да, подтверждаю запись")
+        # Подтверждает только кнопка на доставленной сводке.
+        offer_id = self.agent._pending[self.user.id]["offer_id"]
+        answer = await self.agent.proposal_action(self.user, offer_id, "confirm")
         self.assertIn("Записала", answer)
         created = self.spreadsheet.worksheet("Записи").values[-1]
         self.assertIn("BMW X5", created)

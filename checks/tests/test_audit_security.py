@@ -22,7 +22,7 @@ class AuditSecurityTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("SYNTHETIC_", "\n".join(captured.output))
             self.assertIn("RuntimeError", "\n".join(captured.output))
 
-    async def test_provider_and_proofreader_errors_are_sanitized_in_logs(self):
+    async def test_provider_errors_are_sanitized_in_logs(self):
         with tempfile.TemporaryDirectory() as temp:
             store, _ = fixture(temp)
             with patch("ai.AsyncOpenAI"):
@@ -30,10 +30,6 @@ class AuditSecurityTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(agent, "_run", new=AsyncMock(side_effect=RuntimeError("PRIVATE_SENTINEL"))), \
                  self.assertLogs("ai", level="ERROR") as captured:
                 await agent.reply(ChatUser(111, None, "Synthetic"), "synthetic")
-            self.assertNotIn("PRIVATE_SENTINEL", "\n".join(captured.output))
-            agent.client.chat.completions.create = AsyncMock(side_effect=RuntimeError("PRIVATE_SENTINEL"))
-            with self.assertLogs("ai", level="ERROR") as captured:
-                self.assertEqual(await agent._proofread("synthetic"), "synthetic")
             self.assertNotIn("PRIVATE_SENTINEL", "\n".join(captured.output))
 
     async def test_admin_delivery_errors_do_not_log_message_or_exception_body(self):

@@ -18,7 +18,7 @@ polling не запускается, production Sheets не меняются. Р
 
 -v показывает каждый тест. При провале: FAIL/ERROR, имя, файл:строка, причина.
 Отдельный изолированный тест:
-python3 checks/run.py tests.test_providers.ProviderTests.test_existing_xkiro_defaults_are_preserved
+python3 checks/run.py tests.test_providers.ProviderTests.test_llm_configuration_keeps_default_route
 Коды возврата: 0 — успех, 1 — провал теста, 2 — ошибка запуска.
 
 Весь проверочный код находится внутри checks/: приложение её не импортирует.

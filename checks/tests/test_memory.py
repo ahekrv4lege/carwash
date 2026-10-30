@@ -1,6 +1,7 @@
 """Русские реплики и заданные ответы AI: проверка приложения, не понимания живой моделью."""
 import json
 import asyncio
+import re
 import time
 import tempfile
 from datetime import datetime
@@ -27,7 +28,11 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["confirmation_required"])
         self.assertNotIn("size_class", self.agent._state[111].get("tentative", {}))
         self.assertEqual(self.agent._pending[111]["args"]["size_class"], "Легковой")
-        self.assertIn('класс «Легковой»', self.agent._proposal_text(self.agent._pending[111]))
+        text = self.agent._proposal_text(self.agent._pending[111])
+        # В сводке — распознанное название, без внутреннего класса прайса.
+        self.assertIn("Toyota Camry", text)
+        self.assertNotIn("Fixture car", text)
+        self.assertNotIn("класс", text)
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
 
     async def test_full_message_creates_python_proposal(self):
@@ -357,7 +362,8 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         first, following = [call.kwargs for call in self.transport.await_args_list]
         self.assertEqual(first["tool_choice"]["function"]["name"], "get_price_list")
         self.assertEqual([tool["function"]["name"] for tool in first["tools"]], ["get_price_list"])
-        self.assertEqual(following["tool_choice"], "auto")
+        # После чтения прайса без известного авто модель обязана ответить клиенту.
+        self.assertEqual(following["tool_choice"]["function"]["name"], "respond")
         self.assertTrue(self.agent._state[111]["catalog"])
 
     async def test_provider_cannot_bypass_required_catalog_with_invented_services(self):
@@ -384,7 +390,8 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
             "reply": "Проверим запись.", "facts": {"phone": [ARGS["phone"], ARGS["phone"]]}})])]
         answer = await self.agent.reply(self.user, "Телефон " + ARGS["phone"])
         self.assertIn("Предлагаю запись:", answer)
-        self.assertEqual(self.transport.await_count, 2)
+        # Телефон распознан до запроса к модели: достаточно одного вызова.
+        self.assertEqual(self.transport.await_count, 1)
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
 
     async def test_confirmed_booking_history_keeps_time_and_price_not_internal_instructions(self):
@@ -421,7 +428,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(answer, "Какой автомобиль?")
         self.assertEqual(self.facts()["client_name"], "Никита")
         first, repaired = [call.kwargs for call in self.transport.await_args_list]
-        self.assertEqual(len(first["tools"]), 7)
+        self.assertEqual(len(first["tools"]), 8)
         self.assertEqual([tool["function"]["name"] for tool in repaired["tools"]], ["respond"])
         self.assertEqual(repaired["tool_choice"]["function"]["name"], "respond")
 
@@ -485,6 +492,19 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(rejected["ok"])
         rejected = await self.agent._call_tool("create_booking", '{"requested_datetime":"tomorrow"}', self.user)
         self.assertFalse(rejected["ok"])
+
+    async def test_summary_and_sheet_show_recognized_car_not_customer_typos(self):
+        # «бив м5» — слова клиента; сводка и таблица получают распознанное «BMW M5».
+        self.agent._state[111] = {"facts": dict(ARGS, car="бив м5", car_model="BMW M5")}
+        text = await self.say("Записывайте, пожалуйста", calls=[("create_booking", {})])
+        self.assertIn("BMW M5", text)
+        self.assertNotIn("бив м5", text)
+        self.assertNotIn("класс", text)
+        answer = await self.confirm()
+        self.assertIn("Записала", answer)
+        created = self.spreadsheet.worksheet("Записи").values[-1]
+        self.assertIn("BMW M5", created)
+        self.assertNotIn("бив м5", str(created))
 
     async def test_repaired_class_completes_existing_proposal_without_another_ai_call(self):
         self.agent._state[111] = {"facts": {key: value for key, value in ARGS.items() if key != "size_class"},
@@ -616,7 +636,8 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(111, self.agent._pending)
         await self.say("Тогда 11:00", {"time": ["11:00", "11:00"]})
         await self.say("Нет, 2099-01-02", {"date": ["2099-01-02", "2099-01-02"]})
-        self.assertNotIn("time", self.facts())
+        # Смена даты больше не сбрасывает время: доступность проверит create_booking.
+        self.assertEqual(self.facts().get("time"), "11:00")
         await self.say("12:00", {"time": ["12:00", "12:00"]})
         await self.say("Имя исправь: Артём", {"client_name": ["Артём", "Артём"]})
         await self.say("Телефон другой: +7 000 222-33-44", {"phone": ["+7 000 222-33-44", "+7 000 222-33-44"]})
@@ -640,7 +661,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         before = self.transport.call_count
         proposal = await self.say("Теперь оформляем", calls=[("create_booking", {})])
         self.assertEqual(self.transport.call_count, before + 1)
-        for value in ("Артём", "Toyota Corolla 1.6", "+7 000 222-33-44", "2099-01-02", "12:00", "700"):
+        for value in ("Артём", "Toyota Corolla 1.6", "+7 000 222-33-44", "02.01.2099", "12:00", "700"):
             self.assertIn(value, proposal)
         self.assertNotIn("Пылесос", proposal)
         self.assertNotIn("Базовый", proposal)
@@ -739,21 +760,18 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.transport.side_effect = [response(calls=[bad]), response(calls=[bad])]
         with patch.object(self.store, "calculate_price", wraps=self.store.calculate_price) as read:
             answer = await self.agent.reply(self.user, "Сколько?")
-        self.assertIn("остановлен", answer)
+        self.assertIn("Как вас зовут?", answer)
         self.assertEqual(read.call_count, 1)
         self.assertEqual(self.transport.call_count, 2)
 
-    async def test_success_claims_are_blocked_in_plain_json_and_proofread_responses(self):
+    async def test_success_claims_are_blocked_in_plain_responses(self):
         claims = ["Вы записаны.", "Бронирование создано.", "Запись отменена.", "Записала вас на завтра.",
                   "Я оформила запись.", "Место забронировано.", "Уже записан!", "Запись успешно создана.",
                   "Я отменила вашу запись."]
         for text in claims:
             answer = await self.say("Оформить?", reply=text)
-            self.assertIn("не подтверждён", answer, text)
-        self.agent.config = replace(self.agent.config, ai_proofread_enabled=True)
-        self.transport.side_effect = [response(envelope("Проверим данные.")), response("Вы записаны.", raw=True)]
-        answer = await self.agent.reply(self.user, "Проверить?")
-        self.assertIn("не подтверждён", answer)
+            self.assertNotEqual(answer, text, text)
+            self.assertFalse(re.search(r"запис(?:ал|ан)|забронир|отменен|оформлен", answer, re.I), text)
         self.assertEqual(sum(len(s.writes) for s in self.spreadsheet.sheets), 0)
 
     async def test_plain_response_needs_one_request_and_keeps_customer_words(self):
@@ -779,10 +797,11 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         async def reply_from_contract(**payload):
             self.assertEqual(payload["tool_choice"], "auto")
             prompt = payload["messages"][0]["content"]
-            self.assertIn("Нет новых данных — обычный текст", prompt)
-            self.assertIn("Есть данные — respond", prompt)
+            # Промпт нормализован plain_text: прямые кавычки и обычные дефисы.
+            self.assertIn("Нет новых данных - обычный текст", prompt)
+            self.assertIn("Есть данные - respond", prompt)
             self.assertIn("точная цитата текущего сообщения", prompt)
-            example = prompt.split("Пример «у мя раф 4»: ", 1)[1].splitlines()[0]
+            example = prompt.split('Пример "у мя раф 4": ', 1)[1].splitlines()[0]
             memory = json.loads(example.removesuffix("."))
             self.assertEqual(memory["facts"]["car"], ["раф 4", "раф 4"])
             self.assertEqual(memory["facts"]["car_model"], ["Toyota RAV4", "раф 4"])

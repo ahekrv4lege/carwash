@@ -414,10 +414,9 @@ def main() -> int:
     parser.add_argument("--new-table", action="store_true", help="Проверить новую таблицу и запустить бота с её отдельной картой")
     modes.add_argument("--refresh-schema", action="store_true", help="Принудительно перечитать структуру без запуска бота")
     modes.add_argument("--validate-mappings", action="store_true", help="Проверить вручную исправленную конфигурацию без записи в Sheets")
-    modes.add_argument("--suggest-mappings", action="store_true", help="Сохранить AI-подсказки по заголовкам; без применения")
     args = parser.parse_args()
     try:
-        if args.new_table and (args.check or args.setup_only or args.doctor or args.host or args.stop or args.status or args.logs or args.refresh_schema or args.validate_mappings or args.suggest_mappings or args.host_worker):
+        if args.new_table and (args.check or args.setup_only or args.doctor or args.host or args.stop or args.status or args.logs or args.refresh_schema or args.validate_mappings or args.host_worker):
             raise StartupError("--new-table используется только для обычного запуска бота")
         os.chdir(ROOT)
         if args.host_worker:
@@ -431,7 +430,7 @@ def main() -> int:
         if args.setup_only:
             print("Виртуальное окружение и зависимости готовы")
             return 0
-        sheets_only = args.refresh_schema or args.validate_mappings or args.suggest_mappings
+        sheets_only = args.refresh_schema or args.validate_mappings
         config = validate_config(sheets_only=sheets_only)
         if args.doctor or args.host:
             if not asyncio.run(diagnose(config)):
@@ -450,13 +449,6 @@ def main() -> int:
                 from sheets import Store
                 store = Store(config)
                 document = store.refresh_schema(force=args.refresh_schema, validate=args.validate_mappings)
-                if args.suggest_mappings:
-                    from mapping_ai import suggest_mappings
-                    if not store._adaptive:
-                        raise StartupError("Включите SHEETS_ADAPTIVE_ENABLED")
-                    suggest_mappings(store._adaptive)
-                    print("Разбор подсказок завершён; результат применяется только вручную")
-                    return 0
                 print(f"Структура: {document['validation_status']}; запись разрешена: {document['writes_enabled']}")
                 print("Конфигурация сохранена локально; Google Sheets не изменялась")
                 return 0 if document["validation_status"] == "valid" else 2

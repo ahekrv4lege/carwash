@@ -41,31 +41,24 @@ def private_sdk_logging() -> None:
             logging.getLogger(name).setLevel(logging.CRITICAL + 1)
 
 
-def client_options(config, *, mapping: bool = False) -> dict:
+def client_options(config) -> dict:
     private_sdk_logging()
-    url = (config.sheets_ai_base_url if mapping else "") or config.ai_base_url
-    if mapping and config.sheets_ai_base_url and urlsplit(url)[:2] != urlsplit(config.ai_base_url)[:2]:
-        key = config.sheets_ai_api_key
-    else:
-        key = (config.sheets_ai_api_key if mapping else "") or config.ai_api_key
-    if not key:
-        raise RuntimeError("Для выбранного адреса AI нужен отдельный AI_API_KEY или SHEETS_AI_API_KEY")
-    return dict(api_key=key, base_url=url, timeout=config.ai_timeout_sec, max_retries=0)
+    if not config.ai_api_key:
+        raise RuntimeError("Для выбранного адреса AI нужен AI_API_KEY")
+    return dict(api_key=config.ai_api_key, base_url=config.ai_base_url, timeout=config.ai_timeout_sec, max_retries=0)
 
 
-def completion_options(config, *, mapping: bool = False) -> dict:
-    model = (config.sheets_ai_model if mapping else "") or config.ai_model
-    url = (config.sheets_ai_base_url if mapping else "") or config.ai_base_url
-    hostname = urlsplit(url).hostname
+def completion_options(config) -> dict:
+    model = config.ai_model
+    hostname = urlsplit(config.ai_base_url).hostname
     options = {"model": model}
-    limit = 1500 if mapping else config.ai_max_output_tokens
-    if limit:
-        options[config.ai_token_limit_parameter] = limit
+    if config.ai_max_output_tokens:
+        options[config.ai_token_limit_parameter] = config.ai_max_output_tokens
     if config.ai_temperature is not None:
-        options["temperature"] = 0 if mapping else config.ai_temperature
-    if config.ai_reasoning_effort and not mapping:
+        options["temperature"] = config.ai_temperature
+    if config.ai_reasoning_effort:
         options["reasoning_effort"] = config.ai_reasoning_effort
-    if hostname in {"polza.ai", "api.polza.ai"} and not mapping:
+    if hostname in {"polza.ai", "api.polza.ai"}:
         polza = {}
         effort = options.pop("reasoning_effort", None)
         canonical, marker, aliases = model.partition("@")

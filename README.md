@@ -110,7 +110,6 @@ Google-таблицы. Модель только понимает клиента
 | `providers.py` | OpenAI-совместимые провайдеры: основной + запасные, общий бюджет запроса |
 | `sheets.py` | Google Sheets и вся бизнес-логика: прайс, тарифы, свободные слоты, создание/отмена |
 | `adaptive.py` | «адаптер» таблиц: карта областей (mappings), переоткрытие при сдвигах, валидация данных, правила записи |
-| `mapping_ai.py` | необязательные AI-подсказки по заголовкам, когда автораспознанка не справилась |
 | `admin.py` | лента диалогов и событий для админ-чата (карточка «клиент → бот», кнопка профиля) |
 | `config.py` | чтение/валидация `.env` в объект `Config` |
 | `run.py` | запуск: виртуальное окружение, зависимости, проверка настроек, блокировка и самовосстановление |
@@ -334,21 +333,18 @@ TLS-проверка сертификатов остаётся включённ�
 | `SHEETS_FORCE_SCHEMA_REFRESH` | false | принудительная перенастройка областей |
 | `SHEETS_SCHEMA_CHECK_INTERVAL_HOURS` | `24` | период полной перепроверки карты |
 | `SHEETS_MAPPING_FILE` | `.runtime/sheets-mapping.json` | файл карты |
-| `SHEETS_AI_MAPPING_ENABLED` (+ `SHEETS_AI_BASE_URL/_API_KEY/_MODEL/_JSON_MODE`) | false | AI-подсказки по заголовкам |
 | `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | Polza: DeepSeek V4.1 Flash, `open-inference/fp4` | основной AI-маршрут |
-| `LLM_MAX_INPUT_RUB` / `LLM_MAX_OUTPUT_RUB` | пусто; в рабочем `.env` — `5.1` / `1.2` | предел цены Polza в ₽ за миллион токенов |
 | `TELEGRAM_PROXY` | `auto` | системный прокси; `direct` — прямое соединение |
 | `LLM_API_KEY_2` | пусто | второй ключ тем же API |
 | `LLM_FALLBACK_N_BASE_URL/_API_KEY/_MODEL` (N=1..3) | пусто | резервные провайдеры |
 | `AI_ENABLED` | true | общий выключатель диалогов |
 | `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` | от LLM_* | явные переопределения API |
 | `AI_TIMEOUT_SEC` / `AI_REQUEST_BUDGET_SEC` | `60` / ×2 | таймаут запроса и бюджет цикла |
-| `AI_TEMPERATURE` / `AI_MAX_OUTPUT_TOKENS` | `0.3` / `1024` | параметры генерации |
+| `AI_TEMPERATURE` / `AI_MAX_OUTPUT_TOKENS` | `0.3` / `0` | параметры генерации; токены: `0` — без лимита |
 | `AI_REQUEST_RETRIES` | `1` | повторов при временном сбое (0–2) |
 | `AI_MAX_TOOL_ITERATIONS` / `AI_MAX_TOOL_CALLS` | `6` / `12` | лимиты петли инструментов |
 | `AI_HISTORY_CHARS` / `AI_RECENT_TURNS` | `6000` / `4` | бюджет истории диалога |
 | `AI_SESSION_TTL_SEC` / `AI_MAX_SESSIONS` | `3600` / `1000` | TTL и максимум диалогов |
-| `AI_PROOFREAD_ENABLED` | false | вычитка ответа отдельным запросом |
 | `AI_REASONING_EFFORT` (+ `AI_REASONING_SUPPORTED`) | — | уровень размышлений модели |
 | `AI_TOKEN_LIMIT_PARAMETER` | `max_tokens` | имя параметра лимита токенов |
 
@@ -361,15 +357,13 @@ TLS-проверка сертификатов остаётся включённ�
 ./.venv/bin/python checks/run.py              # Linux
 ```
 
-- **Офлайн-набор: 446 тестов** (сейчас; см. `CHANGES.md`). Ни сети, ни ключей, ни квот —
+- **Офлайн-набор: 465 тестов** (сейчас; см. `CHANGES.md`). Ни сети, ни ключей, ни квот —
   таблица и модель синтетические (`checks/tests/fakes.py`).
 - `checks/tests/test_conversation.py` + `test_phase2.py` — диалог, память, подтверждения.
 - `checks/tests/test_adaptive.py` + `test_corrupted_tables.py` — испорченные таблицы:
   пустые поля, дубли, формулы, битые цены/даты — 28 сценариев (задача «испорченные таблицы»).
 - `checks/tests/test_class_rules.py` — правила классов (BMW X5 → Кроссовер без уточнений).
 - `checks/tests/test_providers.py` — переключение провайдеров и бюджет запроса.
-- `checks/debug_tables.py` — отчёт «вход → результат» по всем сценариям порчи
-  (`checks/debug_tables_report.txt`).
 - `checks/live.py` — тот же набор против настоящих API и таблицы; **расходует квоту**, запускать
   только по решению. `checks/booking_dialog.py` — живой прогон диалога до записи.
 - Развёрнутая памятка — `checks/USAGE.txt`. Журнал изменений — `CHANGES.md`, планы — `TODO.md`.

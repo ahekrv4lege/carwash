@@ -148,7 +148,8 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
     async def test_russian_booking_requires_delivered_explicit_confirmation(self):
         answer = await self.offer()
         self.assertIn("630", answer)
-        self.assertIn("без: Воск", answer)
+        self.assertIn("Сейчас недоступно:", answer)
+        self.assertIn("Воск", answer)
         self.assertIn(ARGS["phone"], answer)
         self.assertEqual(self.writes(), 0)
         before = self.transport.call_count
@@ -265,22 +266,33 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.writes(), 0)
         self.assertNotIn(111, self.agent._pending)
 
-    async def test_reset_and_restart_reject_old_buttons_without_model(self):
+    async def test_reset_rejects_old_buttons_and_restart_keeps_delivered_offer(self):
         await self.offer()
         offer_id = self.agent._pending[111]["offer_id"]
         self.agent.reset(111)
         before = self.transport.call_count
-        await self.agent.proposal_action(self.user, offer_id, "confirm")
+        self.assertIn("не действует", await self.agent.proposal_action(self.user, offer_id, "confirm"))
         self.assertEqual(self.transport.call_count, before)
         self.assertEqual(self.writes(), 0)
+        # Перезапуск восстанавливает доставленную сводку: кнопка продолжает действовать.
         await self.offer()
         offer_id = self.agent._pending[111]["offer_id"]
         with patch("ai.AsyncOpenAI"):
             restarted = Agent(self.store.config, self.store)
         restarted.client.chat.completions.create = AsyncMock()
-        await restarted.proposal_action(self.user, offer_id, "confirm")
+        answer = await restarted.proposal_action(self.user, offer_id, "confirm")
         restarted.client.chat.completions.create.assert_not_called()
-        self.assertFalse(restarted._pending)
+        self.assertIn("Записала", answer)
+        self.assertEqual(self.writes(), 1)
+
+    async def test_undelivered_offer_confirmation_is_rejected_without_model(self):
+        self.transport.side_effect = [response(calls=[("create_booking", ARGS)])]
+        await self.agent.reply(self.user, json.dumps(ARGS, ensure_ascii=False))  # без mark_delivered
+        before = self.transport.call_count
+        answer = await self.agent.reply(self.user, "Да, подтверждаю запись")
+        self.assertIn("ещё не доставлено", answer)
+        self.assertEqual(self.transport.call_count, before)
+        self.assertNotIn(111, self.agent._pending)
         self.assertEqual(self.writes(), 0)
 
     async def test_separate_users_cannot_confirm_each_others_proposals(self):
@@ -386,7 +398,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(s.reads for s in self.spreadsheet.sheets), 0)
         self.agent.config = replace(self.agent.config, ai_max_tool_iterations=1, ai_max_tool_calls=12)
         answer = await self.say("Цена", response(calls=[("get_price_list", {})]))
-        self.assertIn("число шагов", answer)
+        self.assertIn("Как вас зовут?", answer)
 
     async def test_truncated_tool_arguments_never_execute(self):
         for reason in ("length", "content_filter"):
@@ -430,17 +442,6 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         with patch("ai.asyncio.sleep", new=AsyncMock()):
             before = self.transport.call_count
             await self.say("Вопрос", error, error)
-        self.assertEqual(self.transport.call_count - before, 2)
-
-    async def test_proofreading_is_opt_in_and_skips_proposals_and_receipts(self):
-        await self.say("Привет", response("Здравствуйте!"))
-        self.assertEqual(self.transport.call_count, 1)
-        self.agent.config = replace(self.agent.config, ai_proofread_enabled=True)
-        await self.offer()
-        before = self.transport.call_count
-        await self.confirm()
-        self.assertEqual(self.transport.call_count, before)
-        await self.say("Спасибо", response("Пожалуйста."), response("Пожалуйста!", raw=True))
         self.assertEqual(self.transport.call_count - before, 2)
 
     async def test_long_history_is_bounded_and_only_whole_pairs_are_removed(self):

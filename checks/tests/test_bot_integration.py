@@ -10,7 +10,7 @@ from tests.fakes import fixture
 
 
 class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_edit_button_then_text_requires_new_summary_and_new_button(self):
+    async def test_old_button_then_text_requires_new_summary_and_new_button(self):
         import bot
         from dataclasses import replace
         from aiogram.types import CallbackQuery, Message
@@ -21,7 +21,7 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
             transport = Mock(close=AsyncMock())
             transport.chat.completions.create = AsyncMock(side_effect=[
                 response(calls=[("create_booking", ARGS)]),
-                response("Поменяла время."),
+                response(calls=[("create_booking", {**ARGS, "time": "12:00"})]),
             ])
             with patch("ai.AsyncOpenAI", return_value=transport):
                 agent = Agent(replace(store.config, reply_min_delay_sec=0), store)
@@ -44,16 +44,14 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(CallbackQuery, "answer", new_callable=AsyncMock), \
                  patch("bot.ChatActionSender.typing", return_value=sender):
                 await queue(text_handler, message, {"agent": agent})
-                old = answer.await_args.kwargs["reply_markup"].inline_keyboard[0]
-                await click(old[1].callback_data)
-                self.assertFalse(spreadsheet.worksheet("Записи").writes)
+                old = answer.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
                 await queue(text_handler, message.model_copy(update={"text": "Хочу в 12:00"}), {"agent": agent})
-                new = answer.await_args.kwargs["reply_markup"].inline_keyboard[0]
-                self.assertNotEqual(old[0].callback_data, new[0].callback_data)
+                new = answer.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
+                self.assertNotEqual(old, new)
                 self.assertIn(ARGS["phone"], answer.await_args.args[0])
-                await click(old[0].callback_data)
+                await click(old)
                 self.assertFalse(spreadsheet.worksheet("Записи").writes)
-                await click(new[0].callback_data)
+                await click(new)
                 self.assertEqual(len(spreadsheet.worksheet("Записи").writes), 1)
                 self.assertEqual(store.my_bookings(111)["bookings"][0]["time"], "12:00")
 
@@ -139,7 +137,7 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await send("Да, подтверждаю запись")
                 self.assertFalse(spreadsheet.worksheet("Записи").writes)
                 keyboard = answer.await_args_list[1].kwargs["reply_markup"]
-                self.assertEqual([button.text for button in keyboard.inline_keyboard[0]], ["Подтвердить", "Изменить"])
+                self.assertEqual([button.text for button in keyboard.inline_keyboard[0]], ["Подтвердить"])
                 data = keyboard.inline_keyboard[0][0].callback_data
                 callback = CallbackQuery.model_validate({"id": "synthetic-click", "chat_instance": "synthetic",
                     "from": {"id": 111, "is_bot": False, "first_name": "Synthetic"},
@@ -155,7 +153,7 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(transport.chat.completions.create.await_count, 2)
                 self.assertEqual(len(spreadsheet.worksheet("Записи").writes), 1)
                 self.assertIn("Предлагаю запись:", answer.await_args_list[1].args[0])
-                self.assertIn("10:00", answer.await_args_list[-2].args[0])
+                self.assertIn("10:00", answer.await_args_list[-1].args[0])
                 self.assertEqual(sum("Записала вас" in call.args[0] for call in answer.await_args_list), 1)
                 self.assertFalse(queue.pending)
 
@@ -294,19 +292,20 @@ class MessageBatchingTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(Message, "answer", new_callable=AsyncMock) as answer:
             await asyncio.gather(self.batcher(wrapped, self.message("подготовьте запись"), self.data),
                                  self.batcher(wrapped, self.message("Да, подтверждаю запись"), self.data))
+        # Подтверждение до доставки сводки не доходит до агента: новая сводка с кнопкой заменяет его.
         wrapped.assert_awaited_once()
-        answer.assert_awaited_once()
-        self.assertIn("подтвердите заново", answer.await_args.args[0])
+        answer.assert_not_awaited()
 
-    async def test_undelivered_offer_confirmation_is_rejected_without_handler(self):
+    async def test_undelivered_offer_confirmation_is_passed_to_the_agent(self):
+        # Отклонение недоставленной сводки выполняет агент, а не слой батчинга.
         from aiogram.types import Message
         self.agent.delivery_token.return_value = object()
         self.agent._pending = {111: {"delivered": False}}
         handler = AsyncMock()
         with patch.object(Message, "answer", new_callable=AsyncMock) as answer:
             await self.batcher(handler, self.message("Да, подтверждаю запись"), self.data)
-        handler.assert_not_awaited()
-        answer.assert_awaited_once()
+        handler.assert_awaited_once()
+        answer.assert_not_awaited()
 
     async def test_delivered_confirmation_is_not_batched_with_following_text(self):
         self.agent.delivery_token.return_value = object()
