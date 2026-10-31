@@ -29,10 +29,10 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("size_class", self.agent._state[111].get("tentative", {}))
         self.assertEqual(self.agent._pending[111]["args"]["size_class"], "Легковой")
         text = self.agent._proposal_text(self.agent._pending[111])
-        # В сводке — распознанное название, без внутреннего класса прайса.
+        # В сводке — распознанное название и проверенный по прайсу класс.
         self.assertIn("Toyota Camry", text)
         self.assertNotIn("Fixture car", text)
-        self.assertNotIn("класс", text)
+        self.assertIn("класс «Легковой»", text)
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
 
     async def test_full_message_creates_python_proposal(self):
@@ -58,7 +58,8 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
                                                 size_class="Кроссовер", services=["Мойка"], date="2026-10-29")}
         self.transport.side_effect = [response(
             "На 29 октября 19:00 свободно. Подготовлено запись на мойку кузова для Renault Duster, 700 ₽.", raw=True)]
-        answer = await self.agent.reply(self.user, "19")
+        with patch.object(self.store, "now", return_value=datetime(2026, 10, 28, 12, tzinfo=ZoneInfo("Europe/Moscow"))):
+            answer = await self.agent.reply(self.user, "19")
         self.assertIn("Предлагаю запись:", answer)
         self.assertIn("19:00", answer)
         self.assertEqual(self.agent._pending[111]["args"]["time"], "19:00")
@@ -69,12 +70,14 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.agent._state[111] = {"facts": dict(ARGS, car="рено дастер", car_model="Renault Duster",
                                                 size_class="Кроссовер", services=["Мойка"], date="2026-10-29")}
         self.transport.side_effect = [response("Записываю вас в 5.", raw=True)]
-        answer = await self.agent.reply(self.user, "дава в 5")
+        with patch.object(self.store, "now", return_value=datetime(2026, 10, 28, 12, tzinfo=ZoneInfo("Europe/Moscow"))):
+            answer = await self.agent.reply(self.user, "дава в 5")
         self.assertIn("Предлагаю запись:", answer)
         self.assertEqual(self.agent._pending[111]["args"]["time"], "17:00")
 
         self.transport.side_effect = [response("Записываю вас в 21.", raw=True)]
-        answer = await self.agent.reply(self.user, "дава в 21")
+        with patch.object(self.store, "now", return_value=datetime(2026, 10, 28, 12, tzinfo=ZoneInfo("Europe/Moscow"))):
+            answer = await self.agent.reply(self.user, "дава в 21")
         self.assertIn("с 9:00 до 19:00", answer)
         self.assertNotIn(111, self.agent._pending)
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
@@ -85,7 +88,8 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
                                                 date="2026-10-29", time="18:00"),
                                   "availability": {"days": [{"date": "2026-10-29", "free_times": ["17:00", "19:00"]}]}}
         self.transport.side_effect = [response("Записываю вас на 29 октября, 17:00, Renault Logan, 700 ₽.", raw=True)]
-        answer = await self.agent.reply(self.user, "дава в 5 и логан бартік")
+        with patch.object(self.store, "now", return_value=datetime(2026, 10, 28, 12, tzinfo=ZoneInfo("Europe/Moscow"))):
+            answer = await self.agent.reply(self.user, "дава в 5 и логан бартік")
         self.assertIn("Предлагаю запись:", answer)
         self.assertIn("17:00", answer)
         self.assertIn("Renault Logan", answer)
@@ -499,7 +503,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         text = await self.say("Записывайте, пожалуйста", calls=[("create_booking", {})])
         self.assertIn("BMW M5", text)
         self.assertNotIn("бив м5", text)
-        self.assertNotIn("класс", text)
+        self.assertIn("класс «Легковой»", text)
         answer = await self.confirm()
         self.assertIn("Записала", answer)
         created = self.spreadsheet.worksheet("Записи").values[-1]

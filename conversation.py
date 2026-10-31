@@ -342,15 +342,63 @@ def plain_text(text):
     return text.translate(_PLAIN_TABLE)
 
 
-def safe_reply(text):
-    """Модель не является источником результата записи, даже после вычитки."""
+_CLAIM_TEXT = "Оформление или отмену подтверждает система после вашего согласия. Пока результат операции не подтверждён; уточним детали."
+
+
+def safe_claim(text):
+    """Причина, по которой текст выдаёт себя за результат операции, или None."""
+    if not isinstance(text, str) or not text:
+        return None
     value = folded(text.translate(HIDDEN)).translate(CONFUSABLE)
     claim = (r"\bзапис(?:ал[аи]?|аны?|ано|ала|ался|ались)\b|"
              r"\b(?:запись|бронь|бронирование|заявка|резерв\w*)\b.{0,90}"
              r"\b(?:создан\w*|оформлен\w*|подтвержден\w*|отменен\w*|готов\w*|успеш\w*|зарегистрирован\w*|принят\w*|сохранен\w*|внесен\w*)\b|"
-             r"\b(?:создал\w*|оформил\w*|подтвердил\w*|отменил\w*|забронировал\w*|зарегистрировал\w*)\b|"
+             r"\b(?:создал\w*|оформил\w*|подтвердил\w*|подтвержда\w*|отменил\w*|забронировал\w*|зарегистрировал\w*)\b|"
              r"\b(?:успешно|уже)\s+(?:запис\w*|отмен\w*|забронир\w*)\b|"
              r"\b(?:время|слот|место)\b.{0,60}\b(?:забронирован\w*|закреплен\w*|зарезервирован\w*)\b")
     if re.search(claim, value, re.S) or re.search(r"\b(?:готово|оформлено|заброниров\w*|отменена|зарезервиров\w*|зафиксировал\w*)\b|\bждем вас\b", value):
-        return "Оформление или отмену подтверждает система после вашего согласия. Пока результат операции не подтверждён; уточним детали."
-    return text
+        return "success_claim"
+    return None
+
+
+def safe_reply(text):
+    """Модель не является источником результата записи, даже после вычитки."""
+    return text if safe_claim(text) is None else _CLAIM_TEXT
+
+
+# Служебный текст не должен доходить до клиента: протокол памяти, названия
+# инструментов, JSON, ошибки API, служебные поля и заголовки системного промпта.
+# Детектор структурный (объекты с ключами в кавычках, snake_case, английские
+# служебные слова), а не по отдельным «запрещённым фразам»: обычные русские
+# ответы с ценами в кавычках он не задевает.
+_TOOL_NAME = (r"\b(?:get_price_list|calculate_price|get_free_slots|get_my_bookings|"
+              r"create_booking|cancel_booking|reschedule_booking|tool_calls|tool_choice|respond)\b")
+_STATE_FIELD = (r"\b(?:car_model|size_class|client_name|requested_service|requested_datetime|"
+                r"booking_id|phone_known|checked_at|free_times|not_included_now|table_unavailable|"
+                r"confirmation_required|quote_changed|unavailable_services|display_text|tentative|respond)\b|"
+                r"\bmissing_[a-z_]+\b")
+_LEAK_PATTERNS = (
+    re.compile(r'\{[^{}]*"[^"]+"\s*:|"(?:reply|facts|tentative)"\s*:'),
+    re.compile(_TOOL_NAME, re.I),
+    re.compile(_STATE_FIELD),
+    re.compile(r"\b(?:CUSTOMER|STATE|TENTATIVE|FACTS|MISSING|RESPOND)\b"),
+    re.compile(r"\b[a-z]+(?:_[a-z]+){2,}\b"),
+    re.compile(r"\b\w*(?:Error|Exception|Traceback)\b|Traceback|status_code|asyncio\.|openai\.|json\.loads|gspread"),
+    re.compile(r"\b(?:HTTP \d{3}|ошибка API|API-ключ|API key|spreadsheet|worksheet|credentials|сервисный аккаунт)\b", re.I),
+    re.compile(r"\b(?:system prompt|системн\w+ промпт|инструкци[яи] (?:для |от )?(?:модел|нейросет|разработчик)\w*|"
+               r"внутренн\w+ (?:инструмент|протокол|команд)|служебн\w+ (?:поле|данн|текст))\b", re.I),
+    re.compile(r"^(?:РОЛЬ И КОНТЕКСТ|МАНЕРА РЕЧИ|ОФОРМЛЕНИЕ ДЛЯ TELEGRAM|КОНТЕКСТ И УТОЧНЕНИЯ|"
+               r"КЛАСС И ПРАЙС|ДАТА И ВРЕМЯ|ЗАПИСЬ|ГРАНИЦЫ И ОШИБКИ|ПАМЯТЬ|ПРИМЕРЫ МАНЕРЫ|"
+               r"АКТУАЛЬНЫЕ ДАННЫЕ АВТОМОЙКИ)\s*$", re.M),
+)
+
+
+def leak_reason(text):
+    """Причина, по которой ответ модели нельзя показывать клиенту, или None."""
+    if not isinstance(text, str) or not text:
+        return None
+    value = text.translate(HIDDEN)
+    for pattern in _LEAK_PATTERNS:
+        if pattern.search(value):
+            return "internal_text"
+    return None

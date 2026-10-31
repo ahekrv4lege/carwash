@@ -115,7 +115,8 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
         before = self.transport.call_count
         answer = await self.say('Да')
         self.assertEqual(self.transport.call_count, before)
-        self.assertIn('#1', answer)
+        # b40fcfc: вместо «#1» (похоже на внутренний id) — собственный номер записи.
+        self.assertIn('Подтверждённая запись 1:', answer)
         self.assertEqual(len(self.spreadsheet.worksheet('Записи').writes), 1)
 
     async def test_tool_dictionary_arguments_fail_without_unhashable_cache_error(self):

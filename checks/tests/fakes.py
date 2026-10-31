@@ -1,11 +1,17 @@
 """Только синтетические таблицы. Сетевые клиенты здесь не создаются."""
 from copy import deepcopy
 from dataclasses import replace
+from itertools import count
 from pathlib import Path
 import re
 
 from config import Config
 from sheets import BOOKING_HEADERS, Store
+
+# Уникальный префикс токена на фикстуру: сводки предложений пишутся в
+# .runtime/proposals-<префикс>/, и без уникальности тесты наследуют
+# чужие предложения через общий каталог.
+_TOKENS = count(1)
 
 
 def coord(cell):
@@ -127,7 +133,8 @@ class Spreadsheet:
 
 
 def config(path, **kwargs):
-    cfg = Config(bot_token="123456:synthetic_token_never_used_12345", ai_api_key="synthetic",
+    token = f"123456{next(_TOKENS):04d}:synthetic_token_never_used_12345"
+    cfg = Config(bot_token=token, ai_api_key="synthetic",
                  ai_model="existing-model", spreadsheet_id="synthetic-spreadsheet",
                  google_credentials_file="unused", timezone="Europe/Moscow", carwash_name="Test",
                  carwash_address="", carwash_phone="", currency="₽", admin_chat_id=None,
