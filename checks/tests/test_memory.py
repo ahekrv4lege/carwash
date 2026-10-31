@@ -1133,6 +1133,31 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("phone_known", payload)
 
 
+class BookingOrdinalTests(unittest.IsolatedAsyncioTestCase):
+    """Порядковый номер записи клиента считается по прочитанным строкам, без повторного чтения."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.store, self.spreadsheet = fixture(folder.name)
+
+    def test_ordinal_follows_date_order_and_cancel_has_no_number(self):
+        from tests.fakes import booking as booking_args
+        self.spreadsheet.worksheet("Слоты").values.extend(
+            [["01.01.2099", "11:00", "2"], ["01.01.2099", "12:00", "2"]])
+        evening = self.store.create_booking(**booking_args(time_str="12:00"))
+        self.assertTrue(evening["ok"], evening)
+        self.assertEqual(evening["user_no"], "1")
+        earlier = self.store.create_booking(**booking_args(time_str="11:00"))
+        self.assertTrue(earlier["ok"], earlier)
+        self.assertEqual(earlier["user_no"], "1", "более ранняя запись получает меньший номер")
+        cancelled = self.store.cancel_booking(evening["booking_id"], 111)
+        self.assertTrue(cancelled["ok"], cancelled)
+        self.assertIsNone(cancelled.get("user_no"), "отменённая запись уже не активна")
+        mine = self.store.my_bookings(111)["bookings"]
+        self.assertEqual([str(b["booking_id"]) for b in mine], [str(earlier["booking_id"])])
+
+
 class NaturalDialogue(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         folder = tempfile.TemporaryDirectory()
