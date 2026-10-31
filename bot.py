@@ -250,7 +250,9 @@ async def archive_old_bookings(store: Store) -> None:
     while True:
         try:
             archived = await asyncio.to_thread(store.archive_old_bookings)
-            await asyncio.to_thread(store.refresh_bookings_sheet)
+            # Периодическое обслуживание: безопасная хронологическая сортировка.
+            # Колонка «ID» постоянна, формулы и данные вне шапки блокируют перезапись.
+            await asyncio.to_thread(store.refresh_bookings_sheet, sort=True)
             if archived:
                 log.info("Архивировано устаревших записей: %d", archived)
         except Exception as error:

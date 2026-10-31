@@ -23,7 +23,7 @@ from requests.exceptions import ConnectionError as HTTPConnectionError, Timeout 
 from google.auth.exceptions import TransportError
 
 from config import Config
-from adaptive import AdaptiveSheets, BOOKING_FIELDS, MappingError
+from adaptive import AdaptiveSheets, BOOKING_FIELDS, MappingError, cell_name
 
 log = logging.getLogger(__name__)
 
@@ -123,6 +123,15 @@ def pick(record: dict, *names: str) -> str:
 
 def digits(value: Any) -> str:
     return re.sub(r"\D", "", str(value))
+
+
+def header_index(headers: list, *names: str) -> int | None:
+    """Позиция колонки по названию (без учёта регистра); None, если колонки нет."""
+    wanted = {name.strip().lower() for name in names}
+    for index, header in enumerate(headers):
+        if str(header).strip().lower() in wanted:
+            return index
+    return None
 
 
 def valid_phone(value: Any) -> bool:
@@ -728,8 +737,7 @@ class Store:
                     worksheet.append_row(BOOKING_HEADERS, value_input_option="RAW")
                     headers = BOOKING_HEADERS
 
-            identifiers = [int(item) for item in (pick(record, "ID") for record in booking_rows) if item.isdigit()]
-            booking_id = max(identifiers, default=0) + 1
+            booking_id = self._next_booking_id(booking_rows)
 
             composition = []
             for line in quote["lines"]:
@@ -786,37 +794,87 @@ class Store:
             }
 
     # ---------- записи клиента ----------
-    def refresh_bookings_sheet(self) -> None:
-        """«Записи»: сортировка по дате и времени + цветовая разметка строк.
+    @staticmethod
+    def _next_booking_id(rows: list[dict]) -> int:
+        """Постоянный идентификатор записи: максимум среди известных ID + 1.
 
-        Перезапись пропускается, если сортировка и нумерация ничего не изменили;
-        раскраска выполняется одним batch-запросом на все диапазоны, а не запросом на строку.
+        ID живёт вечно: сортировка, отмена, перенос и архивация его не меняют.
+        Отменённые и архивные строки сохраняют ID и защищают его от повторного
+        использования; нечисловые наследственные ID при выделении игнорируются.
+        """
+        identifiers = [int(item) for item in (pick(record, "ID") for record in rows) if str(item).isdigit()]
+        return max(identifiers, default=0) + 1
+
+    def refresh_bookings_sheet(self, *, sort: bool = False) -> None:
+        """«Записи»: цветовая разметка строк; сортировка — только по явному запросу.
+
+        Идентификаторы записей постоянны: сортировка, создание, отмена, перенос
+        и архивация никогда не перенумеровывают колонку «ID» и не меняют ID
+        у существующих строк.
+
+        Физическая перестановка строк (sort=True, периодическое обслуживание)
+        выполняется только когда она безопасна:
+        - колонки «Дата»/«Время» ищутся по названиям, а не по фиксированным позициям;
+        - при формулах в данных или данных правее шапки перестановка пропускается:
+          полная перезапись разрушила бы их;
+        - записываются значения в FORMULA-рендере («как введено»), поэтому литералы
+          возвращаются без искажения типов; RAW безопасен, потому что формул в данных нет.
+        Адаптивные раскладки этот код не переписывает: адресные операции adaptive.py
+        не нуждаются в перестановке строк, а их структуру знает только mappings.
         """
         with self._lock:
+            if self._adaptive:
+                return
             worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
             if not hasattr(worksheet, "update"):
-                return  # синтетический лист в тестах не умеет перезапись и цвета
+                return  # синтетический лист без перезаписи: перезапись и цвета недоступны
             values = worksheet.get_all_values()
             if len(values) < 2:
                 return
             headers, body = values[0], values[1:]
-            width = len(headers)
-            last_col = chr(ord("A") + width - 1) if width <= 26 else "Z"
-
-            def sort_key(row):
-                booking_date = parse_date(str(row[2])) if len(row) > 2 else None
-                booking_time = parse_time(str(row[3])) if len(row) > 3 else ""
-                return (booking_date or date(9999, 12, 31), booking_time or "99:99")
-
-            body.sort(key=sort_key)
-            body = [row + [""] * (width - len(row)) for row in body]
-            if headers and headers[0].strip().lower() == "id":
-                # ID перенумеровываем по хронологии, чтобы колонка не выглядела перемешанной.
-                body = [[str(index)] + list(row[1:]) for index, row in enumerate(body, start=1)]
-            if body != [row + [""] * (width - len(row)) for row in values[1:]]:
-                worksheet.update(f"A2:{last_col}{len(body) + 1}", body, value_input_option="RAW")
+            if sort:
+                body = self._sort_bookings_body(worksheet, headers, body) or body
             self._paint_bookings(worksheet, headers, body)
             self._invalidate("bookings")
+
+    def _sort_bookings_body(self, worksheet, headers: list[str], body: list[list]) -> list[list] | None:
+        """Хронологическая перестановка строк без изменения их содержимого и ID.
+
+        Возвращает переставленный body для раскраски или None, если перестановка
+        не нужна или небезопасна.
+        """
+        date_index = header_index(headers, "Дата", "date")
+        time_index = header_index(headers, "Время", "time")
+        if date_index is None or time_index is None:
+            log.warning("«Записи»: колонки «Дата»/«Время» не распознаны — сортировка пропущена")
+            return None
+        width = len(headers)
+        # Данные правее шапки боту не принадлежат: их перемещение может их разрушить.
+        if any(len(row) > width and any(str(cell).strip() for cell in row[width:]) for row in body):
+            log.warning("«Записи»: есть данные правее распознанной шапки — сортировка пропущена")
+            return None
+        raw = worksheet.get_all_values(value_render_option="FORMULA")
+        raw_body = raw[1:] if len(raw) > 1 else []
+        if len(raw_body) != len(body):
+            log.warning("«Записи»: лист изменился между чтениями — сортировка пропущена")
+            return None
+        if any(str(cell).startswith("=") for row in raw_body for cell in row):
+            log.warning("«Записи»: в данных есть формулы — сортировка пропущена, чтобы их не разрушить")
+            return None
+
+        def order_key(index: int):
+            row = body[index]
+            booking_date = parse_date(str(row[date_index])) if date_index < len(row) else None
+            booking_time = parse_time(str(row[time_index])) if time_index < len(row) else ""
+            return (booking_date or date(9999, 12, 31), booking_time or "99:99")
+
+        order = sorted(range(len(body)), key=order_key)
+        if order == list(range(len(body))):
+            return None  # уже по хронологии: перезапись не нужна
+        ordered_raw = [list((raw_body[index] + [""] * width)[:width]) for index in order]
+        last_column = re.match(r"[A-Z]+", cell_name(1, width)).group()
+        worksheet.update(f"A2:{last_column}{len(body) + 1}", ordered_raw, value_input_option="RAW")
+        return [list((body[index] + [""] * width)[:width]) for index in order]
 
     def _paint_bookings(self, worksheet, headers, rows) -> None:
         if not hasattr(worksheet, "format"):
@@ -916,48 +974,51 @@ class Store:
         with self._lock:
             self._invalidate("bookings")
             headers, rows = self._get_bookings()
-            for record in rows:
-                if pick(record, "ID") != str(booking_id).strip():
-                    continue
-                if pick(record, "Telegram ID") != str(telegram_id):
-                    return _failure("Запись с таким номером не найдена среди записей этого клиента")
-                if not self._is_active(record):
-                    return _failure("Эта запись уже отменена")
-                booking_date, booking_time = parse_date(pick(record, "Дата")), parse_time(pick(record, "Время"))
-                if expected_booking is not None:
-                    if "_location" in expected_booking and tuple(expected_booking["_location"]) != (record.get("__sheet_id__"), record.get("__row__")):
-                        return _failure("Расположение записи изменилось. Подтвердите отмену заново")
-                    observed = {"date": booking_date.isoformat() if booking_date else "", "time": booking_time,
-                                **{key: pick(record, column) for key, column in
-                                   (("car", "Автомобиль"), ("tariff", "Тариф"), ("extras", "Доп. услуги"),
-                                    ("total", "Сумма"), ("status", "Статус"))}}
-                    if any(str(value) != str(expected_booking.get(key)) for key, value in observed.items()):
-                        return _failure("Детали записи изменились. Проверьте свои записи и подтвердите отмену заново")
-                if booking_date and booking_time and self._slot_datetime(booking_date, booking_time) < self.now():
-                    return _failure("Прошедшую запись отменить нельзя")
-                column = next((index for index, header in enumerate(headers, 1) if header.strip().lower() == "статус"), None)
-                if not column:
-                    return _failure("В таблице нет колонки «Статус»")
-                if self._adaptive:
-                    self._adaptive.cancel(record, telegram_id)
-                else:
-                    worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
-                    self._invalidate("bookings")
-                    current_headers, current_rows = self._get_bookings()
-                    matches = [row for row in current_rows if pick(row, "ID") == str(booking_id).strip()]
-                    if current_headers != headers or len(matches) != 1 or matches[0] != record:
-                        return _failure("Запись изменилась. Проверьте её и подтвердите отмену заново")
-                    worksheet.update_cell(record["__row__"], column, "Отмена")
+            matches = [record for record in rows if pick(record, "ID") == str(booking_id).strip()]
+            if len(matches) > 1:
+                # Наследственный дубль ID: не выбираем строку вслепую.
+                return _failure("Запись с таким номером неоднозначна; обратитесь к администратору")
+            if not matches:
+                return _failure("Запись с таким номером не найдена")
+            record = matches[0]
+            if pick(record, "Telegram ID") != str(telegram_id):
+                return _failure("Запись с таким номером не найдена среди записей этого клиента")
+            if not self._is_active(record):
+                return _failure("Эта запись уже отменена")
+            booking_date, booking_time = parse_date(pick(record, "Дата")), parse_time(pick(record, "Время"))
+            if expected_booking is not None:
+                if "_location" in expected_booking and tuple(expected_booking["_location"]) != (record.get("__sheet_id__"), record.get("__row__")):
+                    return _failure("Расположение записи изменилось. Подтвердите отмену заново")
+                observed = {"date": booking_date.isoformat() if booking_date else "", "time": booking_time,
+                            **{key: pick(record, column) for key, column in
+                               (("car", "Автомобиль"), ("tariff", "Тариф"), ("extras", "Доп. услуги"),
+                                ("total", "Сумма"), ("status", "Статус"))}}
+                if any(str(value) != str(expected_booking.get(key)) for key, value in observed.items()):
+                    return _failure("Детали записи изменились. Проверьте свои записи и подтвердите отмену заново")
+            if booking_date and booking_time and self._slot_datetime(booking_date, booking_time) < self.now():
+                return _failure("Прошедшую запись отменить нельзя")
+            column = next((index for index, header in enumerate(headers, 1) if header.strip().lower() == "статус"), None)
+            if not column:
+                return _failure("В таблице нет колонки «Статус»")
+            if self._adaptive:
+                self._adaptive.cancel(record, telegram_id)
+            else:
+                worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
                 self._invalidate("bookings")
-                self.refresh_bookings_sheet()
-                return {
-                    "ok": True,
-                    "booking_id": str(booking_id),
-                    "date": booking_date.isoformat() if booking_date else "",
-                    "time": booking_time or "",
-                    "message": "Запись отменена, слот освобождён",
-                }
-            return _failure("Запись с таким номером не найдена")
+                current_headers, current_rows = self._get_bookings()
+                current = [row for row in current_rows if pick(row, "ID") == str(booking_id).strip()]
+                if current_headers != headers or len(current) != 1 or current[0] != record:
+                    return _failure("Запись изменилась. Проверьте её и подтвердите отмену заново")
+                worksheet.update_cell(record["__row__"], column, "Отмена")
+            self._invalidate("bookings")
+            self.refresh_bookings_sheet()
+            return {
+                "ok": True,
+                "booking_id": str(booking_id),
+                "date": booking_date.isoformat() if booking_date else "",
+                "time": booking_time or "",
+                "message": "Запись отменена, слот освобождён",
+            }
 
     def reschedule_booking(self, booking_id: Any, telegram_id: int, date_str: str, time_str: str,
                            *, expected_booking: dict | None = None, dry_run: bool = False) -> dict:

@@ -23,6 +23,8 @@ class Worksheet:
         self.merges = []
         self.reads = 0
         self.writes = []
+        self.updates = []       # полные перезаписи диапазонов (worksheet.update)
+        self.format_calls = 0
         self.formatting = {"A1": {"bold": True}, "A2:Z100": {"numberFormat": "TEXT"}}
         self.literal_cells = set()
         self.before_get = None
@@ -59,12 +61,35 @@ class Worksheet:
                 self.values[row - 1].append("")
             self.values[row - 1][column - 1] = update["values"][0][0]
 
+    def update(self, range_name, values, value_input_option=None, **kwargs):
+        # Реальный путь gspread Worksheet.update: точечная запись сетки значений.
+        assert value_input_option == "RAW"
+        if self.fail_write:
+            raise OSError("simulated unknown response")
+        match = re.fullmatch(r"([A-Z]+)(\d+)", range_name.split(":")[0])
+        start_row, start_column = int(match.group(2)), coord(match.group(1) + "1")[1]
+        self.updates.append({"range": range_name, "values": deepcopy(values)})
+        for row_offset, row in enumerate(values):
+            row_number = start_row + row_offset
+            while len(self.values) < row_number:
+                self.values.append([])
+            for column_offset, cell in enumerate(row):
+                column = start_column + column_offset
+                while len(self.values[row_number - 1]) < column:
+                    self.values[row_number - 1].append("")
+                self.values[row_number - 1][column - 1] = cell
+
+    def format(self, ranges, cell_format):
+        self.format_calls += 1
+
     def update_cell(self, row, column, value):
         from adaptive import cell_name
         self.batch_update([{"range": cell_name(row, column), "values": [[value]]}], "RAW")
 
     def append_row(self, row, value_input_option=None):
         assert value_input_option == "RAW"
+        if self.fail_write:
+            raise OSError("simulated unknown response")
         self.values.append(deepcopy(row))
         self.writes.append(deepcopy(row))
 
