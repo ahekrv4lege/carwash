@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timedelta
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -67,8 +68,13 @@ class MappingError(RuntimeError):
     pass
 
 
+@lru_cache(maxsize=4096)
+def _normalize_header_cached(value: str) -> str:
+    return re.sub(r"[^\w%]+", " ", value.strip().lower().replace("ё", "е")).strip()
+
+
 def normalize_header(value: Any) -> str:
-    return re.sub(r"[^\w%]+", " ", str(value).strip().lower().replace("ё", "е")).strip()
+    return _normalize_header_cached(str(value))
 
 
 def fingerprint(value: Any) -> str:
@@ -735,26 +741,34 @@ class AdaptiveSheets:
     def _extract_records(self, rule: dict, values: list[list], title: str) -> list[dict]:
         records = []
         end_row = min(len(values), rule.get("end_row") or len(values))
+        # Инварианты цикла: не пересобираем их для каждой строки.
+        columns_items = list(rule["columns"].items())
+        transforms = rule.get("transforms", {})
+        date_transform = transforms.get("Дата", "date")
+        time_transform = transforms.get("Время", "time")
+        has_date_source = bool(rule.get("date_source"))
+        free = ({str(field_value).strip().casefold() for field_value in rule["free_markers"]}
+                if rule.get("grid_columns") else None)
+        statuses = ({normalize_header(field_name): field_value for field_name, field_value in rule.get("status_map", {}).items()}
+                    if "Статус" in rule["columns"] else None)
+        sheet_id = rule["sheet_id"]
         for row in range(rule["first_data_row"], end_row + 1):
-            record = {field: str(value_at(values, row, column_index)).strip() for field, column_index in rule["columns"].items()}
+            record = {field: str(value_at(values, row, column_index)).strip() for field, column_index in columns_items}
             if not any(record.values()):
                 continue
-            transforms = rule.get("transforms", {})
-            if rule.get("date_source"):
+            if has_date_source:
                 record["Дата"] = self._date_source(rule, values, title)
             elif "Дата" in record:
-                record["Дата"] = date_value(record["Дата"], transforms.get("Дата", "date"))
-            if rule.get("grid_columns"):
-                free = {str(field_value).strip().casefold() for field_value in rule["free_markers"]}
+                record["Дата"] = date_value(record["Дата"], date_transform)
+            if free is not None:
                 record["Постов"] = str(sum(str(value_at(values, row, column_index)).strip().casefold() in free
                                           for column_index in rule["grid_columns"]))
                 record["__free_capacity__"] = True
             if "Время" in record:
-                record["Время"] = time_value(record["Время"], transforms.get("Время", "time"))
-            if "Статус" in record:
-                statuses = {normalize_header(field_name): field_value for field_name, field_value in rule.get("status_map", {}).items()}
+                record["Время"] = time_value(record["Время"], time_transform)
+            if statuses is not None:
                 record["Статус"] = statuses.get(normalize_header(record["Статус"]), record["Статус"])
-            record["__row__"], record["__sheet_id__"] = row, rule["sheet_id"]
+            record["__row__"], record["__sheet_id__"] = row, sheet_id
             records.append(record)
         return records
 
@@ -911,26 +925,41 @@ class AdaptiveSheets:
                 except ValueError:
                     raise MappingError("Некорректное количество постов") from None
 
-    def _preflight(self) -> dict:
-        # Один пакет чтения используется также для проверки зависимостей цены и занятости.
+    def _preflight(self) -> tuple[dict, dict]:
+        """Полная ревалидация структуры и один свежий пакет чтения перед записью.
+
+        Возвращаем (observed, tables): снимок и таблицы по ролям, чтобы вызывающие
+        операции не извлекали одни и те же записи повторно.
+        """
         observed = {}
         self.refresh(force=True, _observed=observed)
+        tables = {}
         for role in ("services", "tariffs", "slots", "bookings"):
-            self.table(role, _observed=observed)
+            tables[role] = self.table(role, _observed=observed)
         if any(rule.get("grid_columns") for rule in self._rules("slots")):
             raise MappingError("Сетка постов доступна только для чтения; создание/отмена записей заблокированы")
-        return observed
+        return observed, tables
 
     def _target(self, day: str | None = None, sheet_id: int | None = None) -> dict:
         rules = self._rules("bookings")
         if sheet_id is not None:
             rules = [rule for rule in rules if rule["sheet_id"] == sheet_id]
         elif len(rules) > 1 or rules[0].get("date_source"):
-            rules = [rule for rule in rules if self._date_source(rule, self._worksheet(rule["sheet_id"]).get_all_values() if (rule.get("date_source") or {}).get("cell") else [],
-                                                          rule["sheet_title"]) == date_value(day)]
+            rules = [rule for rule in rules if self._date_source(rule, self._date_cell_values(rule), rule["sheet_title"]) == date_value(day)]
         if len(rules) != 1 or not rules[0]["validation"].get("write"):
             raise MappingError("Запись в выбранную область не разрешена; проверьте mappings")
         return rules[0]
+
+    def _date_cell_values(self, rule: dict) -> list[list]:
+        """Сетка, содержащая только ячейку-источник даты, вместо чтения всего листа."""
+        cell = (rule.get("date_source") or {}).get("cell")
+        if not cell:
+            return []
+        row, column = cell
+        raw = self._worksheet(rule["sheet_id"]).get(cell_name(row, column), value_render_option="FORMATTED_VALUE")
+        values: list[list] = [[""] * column for _ in range(row)]
+        values[row - 1][column - 1] = raw[0][0] if raw and raw[0] else ""
+        return values
 
     def _journal(self) -> tuple[Path, dict]:
         path = self.path.with_name(self.path.stem + "-operations.json")
@@ -940,6 +969,11 @@ class AdaptiveSheets:
                 if not isinstance(entries, dict) or not all(isinstance(field_value, dict) and field_value.get("state") in {"pending", "done"}
                                                            for field_value in entries.values()):
                     raise ValueError
+                # Завершённые операции старше недели теряют смысл идемпотентности
+                # (дубль всё равно отсечёт проверка записей), не копим журнал бесконечно.
+                deadline = time.time() - 7 * 24 * 3600
+                entries = {key: value for key, value in entries.items()
+                           if value.get("state") != "done" or value.get("at", 0) >= deadline}
                 return path, entries
             except ValueError:
                 raise MappingError("Журнал операций повреждён; нужна ручная проверка") from None
@@ -948,12 +982,11 @@ class AdaptiveSheets:
     def create(self, data: dict, expected_bookings: list[dict] | None = None) -> None:
         with self.lock:
             expected_versions = dict(self.read_versions)
-            observed = self._preflight()
+            _, tables = self._preflight()
             for role in ROLE_FIELDS:
-                _, current_records = self.table(role, _observed=observed)
                 if role not in expected_versions or self.read_versions[role] != expected_versions[role]:
                     raise MappingError("Данные или зависимости изменились перед записью; обновите предложение")
-                if role == "bookings" and expected_bookings is not None and fingerprint(current_records) != fingerprint(expected_bookings):
+                if role == "bookings" and expected_bookings is not None and tables["bookings"][1] != expected_bookings:
                     raise MappingError("Записи изменились перед созданием; обновите свободное время")
             rule = self._target(data["дата"])
             worksheet = self._worksheet(rule["sheet_id"])
@@ -967,7 +1000,7 @@ class AdaptiveSheets:
                 raise MappingError("Дата области изменилась непосредственно перед записью")
             if expected_bookings is not None:
                 target_records = [row_index for row_index in expected_bookings if row_index["__sheet_id__"] == rule["sheet_id"]]
-                if fingerprint(self._extract_records(rule, values, worksheet.title)) != fingerprint(target_records):
+                if self._extract_records(rule, values, worksheet.title) != target_records:
                     raise MappingError("Строки изменились непосредственно перед записью")
             raw_header = trim_headers(values[rule["header_row"] - 1]) if len(values) >= rule["header_row"] else []
             if raw_header != rule["structure"]["headers"]:
@@ -1005,10 +1038,9 @@ class AdaptiveSheets:
 
     def cancel(self, record: dict, telegram_id: int) -> None:
         with self.lock:
-            self._preflight()
+            _, tables = self._preflight()
             rule = self._target(sheet_id=record["__sheet_id__"])
-            _, records = self.table("bookings")
-            matches = [candidate for candidate in records if candidate["ID"] == record["ID"]]
+            matches = [candidate for candidate in tables["bookings"][1] if candidate["ID"] == record["ID"]]
             if len(matches) != 1:
                 raise MappingError("Идентификатор записи неоднозначен")
             current = matches[0]
@@ -1046,13 +1078,12 @@ class AdaptiveSheets:
     def reschedule(self, record: dict, telegram_id: int, new_date: str, new_time: str) -> None:
         with self.lock:
             versions = dict(self.read_versions)
-            observed = self._preflight()
+            _, tables = self._preflight()
             for role in ("slots", "bookings"):
-                self.table(role, _observed=observed)
                 if role not in versions or self.read_versions[role] != versions[role]:
                     raise MappingError("Слоты или записи изменились перед переносом; проверьте время заново")
             rule = self.validate_reschedule(record, new_date)
-            _, records = self.table("bookings", _observed=observed)
+            records = tables["bookings"][1]
             matches = [candidate for candidate in records if candidate["ID"] == record["ID"]]
             if len(matches) != 1 or matches[0] != record or record["Telegram ID"] != str(telegram_id):
                 raise MappingError("Исходная запись изменилась; перенос заблокирован")

@@ -48,7 +48,23 @@ def client_options(config) -> dict:
     return dict(api_key=config.ai_api_key, base_url=config.ai_base_url, timeout=config.ai_timeout_sec, max_retries=0)
 
 
+_COMPLETION_CACHE: dict[tuple, dict] = {}
+
+
 def completion_options(config) -> dict:
+    cache_key = (config.ai_model, config.ai_base_url, config.ai_max_output_tokens,
+                 config.ai_token_limit_parameter, config.ai_temperature, config.ai_reasoning_effort)
+    cached = _COMPLETION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    options = _build_completion_options(config)
+    if len(_COMPLETION_CACHE) >= 32:
+        _COMPLETION_CACHE.clear()
+    _COMPLETION_CACHE[cache_key] = options
+    return options
+
+
+def _build_completion_options(config) -> dict:
     model = config.ai_model
     hostname = urlsplit(config.ai_base_url).hostname
     options = {"model": model}

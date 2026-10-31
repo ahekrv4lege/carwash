@@ -6,7 +6,7 @@ import logging
 import os
 import time
 from collections import namedtuple
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from urllib.parse import urlsplit
 from urllib.request import getproxies, proxy_bypass
 
@@ -179,11 +179,15 @@ async def send_answer(message: Message, agent: Agent, reporter: AdminReporter,
     await reporter.dialog(user.id, user.full_name, user.username, text, answer)
 
 
-async def ask_agent(message: Message, agent: Agent, reporter: AdminReporter, text: str) -> None:
+async def ask_agent(message: Message, agent: Agent, reporter: AdminReporter, text: str,
+                    reply_gate: asyncio.Semaphore | None = None) -> None:
     telegram_user = message.from_user
     user = ChatUser(id=telegram_user.id, username=telegram_user.username, full_name=telegram_user.full_name)
     started = time.monotonic()
-    async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
+    gate = reply_gate if reply_gate is not None else nullcontext()
+    # Ограничитель параллельных диалогов (reply_gate из main): всплеск обновлений
+    # после простоя не должен порождать сотни одновременных AI-запросов и чтений таблиц.
+    async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id), gate:
         answer = await agent.reply(user, text)
         await asyncio.sleep(max(0, agent.config.reply_min_delay_sec - (time.monotonic() - started)))
     await send_answer(message, agent, reporter, user, text, answer)
@@ -226,8 +230,8 @@ async def cmd_reset(message: Message, agent: Agent) -> None:
 
 
 @router.message(Filter.text)
-async def on_text(message: Message, agent: Agent, reporter: AdminReporter) -> None:
-    await ask_agent(message, agent, reporter, message.text)
+async def on_text(message: Message, agent: Agent, reporter: AdminReporter, reply_gate: asyncio.Semaphore) -> None:
+    await ask_agent(message, agent, reporter, message.text, reply_gate)
 
 
 @router.message()
@@ -260,11 +264,13 @@ async def main() -> None:
     bot = Bot(config.bot_token, session=telegram_session())
     agent = None
     maintenance = None
+    archiver = None
     try:
         store = Store(config)
         reporter = AdminReporter(bot, config.admin_chat_id)
         agent = Agent(config, store, reporter)
-        dispatcher = Dispatcher(agent=agent, config=config, reporter=reporter)
+        dispatcher = Dispatcher(agent=agent, config=config, reporter=reporter,
+                                reply_gate=asyncio.Semaphore(config.reply_concurrency))
         batcher = MessageBatcher(config.reply_batch_sec)
         router.message.outer_middleware(batcher)
         router.callback_query.outer_middleware(batcher)

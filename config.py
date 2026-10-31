@@ -125,6 +125,7 @@ class Config:
     ai_proofread_enabled: bool = False
     reply_min_delay_sec: float = 1.5
     reply_batch_sec: float = 0.4
+    reply_concurrency: int = 8
     ai_session_ttl_sec: int = 3600
     ai_max_sessions: int = 1000
     llm_fallbacks: tuple[ProviderConfig, ...] = ()
@@ -262,6 +263,7 @@ def load_config(sheets_only: bool = False) -> Config:
         max_history=_integer("MAX_HISTORY", "24", 1),
         reply_min_delay_sec=_number("REPLY_MIN_DELAY_SEC", "1.5", 0),
         reply_batch_sec=_number("REPLY_BATCH_SEC", "0.4", 0),
+        reply_concurrency=_integer("REPLY_CONCURRENCY", "8", 1),
         **_sheet_settings(),
         **_ai_settings(sheets_only),
     )

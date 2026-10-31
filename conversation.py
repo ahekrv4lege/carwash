@@ -335,8 +335,11 @@ def model_state(state):
     return result
 
 
+_PLAIN_TABLE = str.maketrans({"—": "-", "–": "-", "«": '"', "»": '"', "“": '"', "”": '"'})
+
+
 def plain_text(text):
-    return text.translate(str.maketrans({"—": "-", "–": "-", "«": '"', "»": '"', "“": '"', "”": '"'}))
+    return text.translate(_PLAIN_TABLE)
 
 
 def safe_reply(text):

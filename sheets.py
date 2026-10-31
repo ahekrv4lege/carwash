@@ -356,6 +356,7 @@ class Store:
         self._spreadsheet = None  # gspread.Spreadsheet, подключаемся лениво
         self._adaptive = None
         self._observed = None
+        self._class_rules_absent = False  # лист «Классы» отсутствует: не перечитываем его зря
         if config.sheets_adaptive_enabled:
             self._adaptive = AdaptiveSheets(config, self._get_spreadsheet)
 
@@ -363,6 +364,7 @@ class Store:
         if not self._adaptive:
             raise RuntimeError("Включите SHEETS_ADAPTIVE_ENABLED для проверки mappings")
         with self._lock:
+            self._class_rules_absent = False
             document = self._adaptive.refresh(force=force, validate=validate)
             self._invalidate("catalog", "slots", "bookings")
             return document
@@ -504,9 +506,13 @@ class Store:
     # ---------- правила классов (лист «Классы») ----------
     def _load_class_rules(self, classes: list[str]) -> list[tuple[str, str]]:
         """Читаем необязательные правила, отбрасывая неизвестные и противоречивые классы."""
+        if self._class_rules_absent:
+            return []
         try:
             values = self._get_spreadsheet().worksheet(self.config.sheet_classes).get_all_values()
         except (WorksheetNotFound, StopIteration):
+            # Листа нет: запоминаем, чтобы не повторять заведомо пустой запрос при каждом прайсе.
+            self._class_rules_absent = True
             return []
         except Exception as error:
             log.warning("Не удалось прочитать лист «%s» (%s)", self.config.sheet_classes, type(error).__name__)
@@ -589,6 +595,24 @@ class Store:
     @staticmethod
     def _is_active(record: dict) -> bool:
         return not pick(record, "Статус").lower().startswith("отмен")
+
+    def _user_booking_position(self, rows: list[dict], telegram_id: int,
+                               booking_date: date, booking_time: str, *, exclude: dict | None = None) -> int:
+        """Порядковый номер записи среди активных будущих записей клиента — как их видит my_bookings.
+
+        Считается по уже прочитанным строкам, без повторного чтения таблицы.
+        """
+        new_key = (booking_date.isoformat(), booking_time)
+        position = 0
+        for record in rows:
+            if record is exclude or pick(record, "Telegram ID") != str(telegram_id) or not self._is_active(record):
+                continue
+            booking_day, booking_hour = parse_date(pick(record, "Дата")), parse_time(pick(record, "Время"))
+            if not booking_day or not booking_hour or self._slot_datetime(booking_day, booking_hour) < self.now():
+                continue
+            if (booking_day.isoformat(), booking_hour) <= new_key:
+                position += 1
+        return position + 1
 
     def _booked_capacity(self, rows: list[dict]) -> Counter:
         busy: Counter = Counter()
@@ -749,6 +773,7 @@ class Store:
             return {
                 "ok": True,
                 "booking_id": booking_id,
+                "user_no": str(self._user_booking_position(booking_rows, telegram_id, booking_date, booking_time)),
                 "date": booking_date.isoformat(),
                 "weekday": WEEKDAYS_RU[booking_date.weekday()],
                 "time": booking_time,
@@ -762,7 +787,11 @@ class Store:
 
     # ---------- записи клиента ----------
     def refresh_bookings_sheet(self) -> None:
-        """«Записи»: сортировка по дате и времени + цветовая разметка строк."""
+        """«Записи»: сортировка по дате и времени + цветовая разметка строк.
+
+        Перезапись пропускается, если сортировка и нумерация ничего не изменили;
+        раскраска выполняется одним batch-запросом на все диапазоны, а не запросом на строку.
+        """
         with self._lock:
             worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
             if not hasattr(worksheet, "update"):
@@ -784,7 +813,8 @@ class Store:
             if headers and headers[0].strip().lower() == "id":
                 # ID перенумеровываем по хронологии, чтобы колонка не выглядела перемешанной.
                 body = [[str(index)] + list(row[1:]) for index, row in enumerate(body, start=1)]
-            worksheet.update(f"A2:{last_col}{len(body) + 1}", body, value_input_option="RAW")
+            if body != [row + [""] * (width - len(row)) for row in values[1:]]:
+                worksheet.update(f"A2:{last_col}{len(body) + 1}", body, value_input_option="RAW")
             self._paint_bookings(worksheet, headers, body)
             self._invalidate("bookings")
 
@@ -797,6 +827,7 @@ class Store:
         status_idx = headers.index("Статус") if "Статус" in headers else None
         date_idx = headers.index("Дата") if "Дата" in headers else 2
         last_col = chr(ord("A") + len(headers) - 1) if len(headers) <= 26 else "Z"
+        colors: dict[tuple[float, float, float], list[str]] = {}
         for offset, row in enumerate(rows):
             sheet_row = offset + 2
             status = str(row[status_idx]).strip().lower() if status_idx is not None and status_idx < len(row) else ""
@@ -819,11 +850,15 @@ class Store:
                 color = (1.0, 0.97, 0.78)  # предстоящая - жёлтый
             else:
                 color = (0.93, 0.93, 0.93)
-            worksheet.format(f"A{sheet_row}:{last_col}{sheet_row}",
-                             {"backgroundColor": {"red": color[0], "green": color[1], "blue": color[2]}})
+            colors.setdefault(color, []).append(f"A{sheet_row}:{last_col}{sheet_row}")
+        # Один HTTP-запрос на цвет: gspread объединяет список диапазонов в один batch_update.
+        for color, ranges in colors.items():
+            worksheet.format(ranges, {"backgroundColor": {"red": color[0], "green": color[1], "blue": color[2]}})
 
     def archive_old_bookings(self) -> int:
         """Прошедшие даты со статусом «Новая» помечаем «Архив»."""
+        from adaptive import cell_name
+
         today = self.now().date()
         with self._lock:
             headers, rows = self._table(self.config.sheet_bookings)
@@ -831,16 +866,24 @@ class Store:
                 return 0
             status_col = headers.index("Статус") + 1
             worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
-            changed = 0
+            updates, cells = [], []
             for record in rows:
                 booking_date = parse_date(str(record.get("Дата", "")))
                 status = str(record.get("Статус", "")).strip()
                 if (booking_date and booking_date < today
                         and (not status or status.lower().startswith("нов"))):
-                    worksheet.update_cell(record["__row__"], status_col, "Архив")
-                    changed += 1
-            if changed:
-                self._invalidate("bookings")
+                    updates.append({"range": cell_name(record["__row__"], status_col), "values": [["Архив"]]})
+                    cells.append((record["__row__"], status_col))
+            if not updates:
+                return 0
+            try:
+                worksheet.batch_update(updates, value_input_option="RAW")
+            except AttributeError:
+                # Синтетические листы в тестах умеют только поячеечную запись.
+                for (row, column), update in zip(cells, updates):
+                    worksheet.update_cell(row, column, update["values"][0][0])
+            changed = len(updates)
+            self._invalidate("bookings")
             return changed
 
     def my_bookings(self, telegram_id: int) -> dict:
@@ -961,6 +1004,8 @@ class Store:
                       "total": current["total"], "currency": self.config.currency}
             if dry_run:
                 return result
+            user_no = str(self._user_booking_position(rows, telegram_id, new_date, new_time, exclude=record))
+            result["user_no"] = user_no
             if self._adaptive:
                 self._adaptive.reschedule(record, telegram_id, new_date.isoformat(), new_time)
             else:

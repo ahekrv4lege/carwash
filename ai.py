@@ -88,8 +88,8 @@ def _service_names(value: Any) -> list[str]:
     return [str(field_value) for field_value in value]
 
 
-def _compact_json(value) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+def _compact_json(value, default=None) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=default)
 
 
 def _clean_text(text: str) -> str:
@@ -98,49 +98,73 @@ def _clean_text(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+_VEHICLE_NUMBERS = {
+    1: r"1|перв\w*|единич\w*", 2: r"2|втор\w*|двойк\w*",
+    3: r"3|трет\w*|тройк\w*", 4: r"4|четв[её]рт\w*|четв[её]рк\w*",
+    5: r"5|пят\w*", 6: r"6|шест\w*", 7: r"7|седьм\w*|сем[её]р\w*|семь",
+    8: r"8|восьм\w*", 40: r"40|сорок", 50: r"50|пятьдесят",
+    60: r"60|шестьдесят", 70: r"70|семьдесят", 90: r"90|девяносто",
+}
+_VEHICLE_BMW = {n: f"{n} Series / X{n}" for n in range(1, 8)}
+for _n in (4, 5):
+    _VEHICLE_BMW[_n] += f" / i{_n} / M{_n}"
+_VEHICLE_BMW[7] += " / i7"
+_VEHICLE_FAMILIES = (
+    ("BMW", _VEHICLE_BMW, re.compile(r"\s*(?:series|сери\w*)\b", re.I),
+     tuple((n, re.compile(r"\b(?:bmw|бмв|бвм|беха|бэха|бумв)\s+(?:" + _VEHICLE_NUMBERS[n] + r")\b", re.I)) for n in _VEHICLE_BMW)),
+    ("Audi", {n: f"A{n} / Q{n}" for n in (3, 4, 5, 6, 7, 8)}, None,
+     tuple((n, re.compile(r"\b(?:audi|ауди)\s+(?:" + _VEHICLE_NUMBERS[n] + r")\b", re.I)) for n in (3, 4, 5, 6, 7, 8))),
+    ("Mazda", {3: "Mazda3 / CX-3", 5: "Mazda5 / CX-5"}, None,
+     ((3, re.compile(r"\b(?:mazda|мазда)\s+(?:" + _VEHICLE_NUMBERS[3] + r")\b", re.I)),
+      (5, re.compile(r"\b(?:mazda|мазда)\s+(?:" + _VEHICLE_NUMBERS[5] + r")\b", re.I)))),
+    ("Infiniti", {n: f"Q{n} / QX{n}" for n in (50, 60, 70)}, None,
+     tuple((n, re.compile(r"\b(?:infiniti|инфинити)\s+(?:" + _VEHICLE_NUMBERS[n] + r")\b", re.I)) for n in (50, 60, 70))),
+    ("Volvo", {n: f"S{n} / V{n} / XC{n}" for n in (40, 60, 90)}, None,
+     tuple((n, re.compile(r"\b(?:volvo|вольво)\s+(?:" + _VEHICLE_NUMBERS[n] + r")\b", re.I)) for n in (40, 60, 90))),
+)
+_VEHICLE_SPECIFIC = {str(n): re.compile(r"\b(?:a|q|qx|xc|cx|s|v|x|i|m)[-\s]*" + str(n) + r"\b", re.I)
+                     for n in (*range(1, 9), 40, 50, 60, 70, 90)}
+_VEHICLE_NAMED = (
+    (re.compile(r"(?:mercedes(?:-benz)?|мерседес)\s+([acesаес])(?:-?class|\s+класс)?\b", re.I),
+     {"a": "A-Class / GLA", "а": "A-Class / GLA", "c": "C-Class / GLC", "с": "C-Class / GLC", "e": "E-Class / GLE", "е": "E-Class / GLE", "s": "S-Class / GLS"},
+     re.compile(r"\b(?:gla|glc|gle|gls)\b", re.I)),
+    (re.compile(r"(?:citro[eё]n|ситроен|ситро[её]н)\s+c\s*([345])\b", re.I),
+     {"3": "C3 / C3 Aircross", "4": "C4 / C4 X", "5": "C5 / C5 Aircross / C5 X"},
+     re.compile(r"\b(?:aircross|аиркросс|x|х)\b", re.I)),
+    (re.compile(r"(?:toyota|тойота|та[её]та)\s+(yaris|ярис|corolla|королла)\b", re.I),
+     {"yaris": "Yaris / Yaris Cross", "ярис": "Yaris / Yaris Cross", "corolla": "Corolla / Corolla Cross", "королла": "Corolla / Corolla Cross"},
+     re.compile(r"\b(?:cross|кросс)\b", re.I)),
+    (re.compile(r"(?:mitsubishi|митсубиси)\s+(eclipse|эклипс)\b", re.I),
+     {"eclipse": "Eclipse / Eclipse Cross", "эклипс": "Eclipse / Eclipse Cross"},
+     re.compile(r"\b(?:cross|кросс)\b", re.I)),
+    (re.compile(r"(?:ford|форд)\s+(mustang|мустанг)\b", re.I),
+     {"mustang": "Mustang / Mustang Mach-E", "мустанг": "Mustang / Mustang Mach-E"},
+     re.compile(r"\b(?:mach|мак|мач)\b", re.I)),
+    (re.compile(r"(?:chevrolet|шевроле)\s+(blazer|блейзер)\b", re.I),
+     {"blazer": "Blazer / Trailblazer", "блейзер": "Blazer / Trailblazer"},
+     re.compile(r"trailblazer|трейлблейзер", re.I)),
+    (re.compile(r"(?:haval|хавал)\s+(f\s*7|ф\s*7|dargo|дарго)\b", re.I),
+     {"f7": "F7 / F7x", "ф7": "F7 / F7x", "dargo": "Dargo / Dargo X", "дарго": "Dargo / Dargo X"},
+     re.compile(r"(?:f|ф)\s*7\s*[xх]\b|\b(?:dargo|дарго)\s*[xх]\b", re.I)),
+)
+
+
 def vehicle_clarification(text):
     if re.search(r"\b(?:не|если|или|либо)\b", text, re.I):
         return None
-    numbers = {
-        1: r"1|перв\w*|единич\w*", 2: r"2|втор\w*|двойк\w*",
-        3: r"3|трет\w*|тройк\w*", 4: r"4|четв[её]рт\w*|четв[её]рк\w*",
-        5: r"5|пят\w*", 6: r"6|шест\w*", 7: r"7|седьм\w*|сем[её]р\w*|семь",
-        8: r"8|восьм\w*", 40: r"40|сорок", 50: r"50|пятьдесят",
-        60: r"60|шестьдесят", 70: r"70|семьдесят", 90: r"90|девяносто",
-    }
-    bmw = {n: f"{n} Series / X{n}" for n in range(1, 8)}
-    for n in (4, 5):
-        bmw[n] += f" / i{n} / M{n}"
-    bmw[7] += " / i7"
-    families = (
-        (r"bmw|бмв|бвм|беха|бэха|бумв", "BMW", bmw, r"series|сери\w*"),
-        (r"audi|ауди", "Audi", {n: f"A{n} / Q{n}" for n in (3, 4, 5, 6, 7, 8)}, ""),
-        (r"mazda|мазда", "Mazda", {3: "Mazda3 / CX-3", 5: "Mazda5 / CX-5"}, ""),
-        (r"infiniti|инфинити", "Infiniti", {n: f"Q{n} / QX{n}" for n in (50, 60, 70)}, ""),
-        (r"volvo|вольво", "Volvo", {n: f"S{n} / V{n} / XC{n}" for n in (40, 60, 90)}, ""),
-    )
-    for brand, label, choices, suffix in families:
-        for number, options in choices.items():
-            pattern = r"\b(?:" + brand + r")\s+(?:" + numbers[number] + r")\b"
-            match = re.search(pattern, text, re.I)
-            if match and not (suffix and re.match(r"\s*(?:" + suffix + r")\b", text[match.end():], re.I)):
+    for label, choices, suffix, numbered in _VEHICLE_FAMILIES:
+        for number, pattern in numbered:
+            match = pattern.search(text)
+            if match and not (suffix and suffix.match(text[match.end():])):
                 # Полное обозначение в том же сообщении снимает неоднозначность.
-                if re.search(r"\b(?:a|q|qx|xc|cx|s|v|x|i|m)[-\s]*" + str(number) + r"\b", text, re.I):
+                if _VEHICLE_SPECIFIC[str(number)].search(text):
                     continue
+                options = choices[number]
                 display = options if options.startswith(label) else f"{label} {options}"
                 return f"Уточните, пожалуйста, какую модель вы имеете в виду:\n{display}?"
-    named = (
-        (r"(?:mercedes(?:-benz)?|мерседес)\s+([acesаес])(?:-?class|\s+класс)?\b", {"a": "A-Class / GLA", "а": "A-Class / GLA", "c": "C-Class / GLC", "с": "C-Class / GLC", "e": "E-Class / GLE", "е": "E-Class / GLE", "s": "S-Class / GLS"}, r"\b(?:gla|glc|gle|gls)\b"),
-        (r"(?:citro[eё]n|ситроен|ситро[её]н)\s+c\s*([345])\b", {"3": "C3 / C3 Aircross", "4": "C4 / C4 X", "5": "C5 / C5 Aircross / C5 X"}, r"\b(?:aircross|аиркросс|x|х)\b"),
-        (r"(?:toyota|тойота|та[её]та)\s+(yaris|ярис|corolla|королла)\b", {"yaris": "Yaris / Yaris Cross", "ярис": "Yaris / Yaris Cross", "corolla": "Corolla / Corolla Cross", "королла": "Corolla / Corolla Cross"}, r"\b(?:cross|кросс)\b"),
-        (r"(?:mitsubishi|митсубиси)\s+(eclipse|эклипс)\b", {"eclipse": "Eclipse / Eclipse Cross", "эклипс": "Eclipse / Eclipse Cross"}, r"\b(?:cross|кросс)\b"),
-        (r"(?:ford|форд)\s+(mustang|мустанг)\b", {"mustang": "Mustang / Mustang Mach-E", "мустанг": "Mustang / Mustang Mach-E"}, r"\b(?:mach|мак|мач)\b"),
-        (r"(?:chevrolet|шевроле)\s+(blazer|блейзер)\b", {"blazer": "Blazer / Trailblazer", "блейзер": "Blazer / Trailblazer"}, r"trailblazer|трейлблейзер"),
-        (r"(?:haval|хавал)\s+(f\s*7|ф\s*7|dargo|дарго)\b", {"f7": "F7 / F7x", "ф7": "F7 / F7x", "dargo": "Dargo / Dargo X", "дарго": "Dargo / Dargo X"}, r"(?:f|ф)\s*7\s*[xх]\b|\b(?:dargo|дарго)\s*[xх]\b"),
-    )
-    for pattern, choices, specific in named:
-        match = re.search(pattern, text, re.I)
-        if match and not re.search(specific, text, re.I):
+    for pattern, choices, specific in _VEHICLE_NAMED:
+        match = pattern.search(text)
+        if match and not specific.search(text):
             options = choices.get(re.sub(r"\s+", "", match.group(1).lower()))
             if options:
                 return f"Уточните, пожалуйста:\n{options}?"
@@ -149,10 +173,32 @@ def vehicle_clarification(text):
 
 PROOFREAD_PROMPT = "Ты — корректор. Исправь только ошибки русского языка, о себе — женский род. Сохрани все имена, числа, смысл. Верни только исправленный текст."
 
+_CLARIFICATION_QUESTIONS = {
+    "date": "На какой день вас записать?", "time": "На какое время вас записать?",
+    "client_name": "Как вас зовут?", "phone": "Напишите телефон для записи.",
+    "car": "Какой у вас автомобиль?", "car_model": "Уточните модель автомобиля, пожалуйста.",
+    "size_class": "Уточните модель и кузов автомобиля, пожалуйста.",
+    "tariff_or_services": "Какую мойку хотите?", "tariff": "Какой тариф выберете?",
+    "services": "Какие услуги оставим?", "requested_service": "Какую мойку хотите?",
+    "requested_datetime": "На какой день и время вас записать?",
+    "available_time": "Какое другое время вам подойдёт?"}
+
+_AFFIRMATIVE_COMMON = frozenset({"да", "давайте", "подойдёт", "подойдет", "берём", "берем", "подтверждаю", "да подтверждаю",
+                                 "всё верно", "все верно", "да всё верно", "да все верно", "согласен", "согласна"})
+_AFFIRMATIVE_EXTRA = frozenset({"подтверждаю запись", "да подтверждаю запись", "записывайте", "да записывайте", "запишите", "да запишите"})
+_AFFIRMATIVE_CANCEL = frozenset({"подтверждаю отмену", "да отменяйте", "отменяйте", "да отменяйте запись"})
+
 
 class Agent:
+    # Статичное тело системного промпта формируется один раз на агента (см. __init__),
+    # в _system_prompt подставляется только актуальное время.
+    _PROMPT_TAIL = "АКТУАЛЬНЫЕ ДАННЫЕ АВТОМОЙКИ\n"
+
     def __init__(self, config: Config, store: Store, reporter=None):
         self.config, self.store, self.reporter = config, store, reporter
+        contacts = ", ".join(contact for contact in (config.carwash_address, config.carwash_phone) if contact) or "не указаны"
+        self._prompt_contacts = contacts
+        self._prompt_static = self._build_static_prompt(config, contacts)
         self.client = AsyncOpenAI(**client_options(config)) if config.ai_enabled else None
         self._provider_configs = (config, *(
             replace(config, ai_base_url=provider.base_url, ai_api_key=provider.api_key, ai_model=provider.model)
@@ -171,6 +217,7 @@ class Agent:
         self._last_seen: dict[int, float] = OrderedDict()
         self._active: dict[int, int] = defaultdict(int)
         self._turn_sources: dict[int, dict] = {}
+        self._tools_cache: dict[tuple, list] = {}
 
     def _proposal_file(self, user_id):
         return ROOT / ".runtime" / f"proposals-{self.config.bot_token.split(':')[0]}" / f"{user_id}.json"
@@ -282,9 +329,8 @@ class Agent:
         self._state[user_id]["pending"] = {"action": pending["action"], "delivered": False}
         return answer
 
-    def _system_prompt(self) -> str:
-        config, now = self.config, self.store.now()
-        contacts = ", ".join(contact for contact in (config.carwash_address, config.carwash_phone) if contact) or "не указаны"
+    @staticmethod
+    def _build_static_prompt(config: Config, contacts: str) -> str:
         return plain_text(f"""РОЛЬ И КОНТЕКСТ
 Ты — Светлана, администратор автомойки «{config.carwash_name}». Говори о себе в женском роде.
 
@@ -338,23 +384,20 @@ car — слова клиента с исходной цитатой; car_model 
 
 Перед ответом молча проверь: ответила ли на вопрос; использовала ли уже известные данные; подтверждены ли числа инструментом; не объявила ли запись раньше кнопки; понятен ли текст без служебных слов. Клиенту показывай только готовый ответ.
 
-АКТУАЛЬНЫЕ ДАННЫЕ АВТОМОЙКИ
-Сейчас {now:%Y-%m-%d %H:%M}, {WEEKDAYS_RU[now.weekday()]} ({config.timezone}). Контакты: {contacts}. Валюта: {config.currency}.
 """)
+
+    def _system_prompt(self) -> str:
+        now = self.store.now()
+        return self._prompt_static + self._PROMPT_TAIL + plain_text(
+            f"Сейчас {now:%Y-%m-%d %H:%M}, {WEEKDAYS_RU[now.weekday()]} ({self.config.timezone}). "
+            f"Контакты: {self._prompt_contacts}. Валюта: {self.config.currency}.\n"
+        )
 
     def _clarification(self, user_id, field=None):
         state = self._state[user_id]
         missing = model_state(state)["missing"]
         field = field or next(iter(missing), None)
-        questions = {"date": "На какой день вас записать?", "time": "На какое время вас записать?",
-                     "client_name": "Как вас зовут?", "phone": "Напишите телефон для записи.",
-                     "car": "Какой у вас автомобиль?", "car_model": "Уточните модель автомобиля, пожалуйста.",
-                     "size_class": "Уточните модель и кузов автомобиля, пожалуйста.",
-                     "tariff_or_services": "Какую мойку хотите?", "tariff": "Какой тариф выберете?",
-                     "services": "Какие услуги оставим?", "requested_service": "Какую мойку хотите?",
-                     "requested_datetime": "На какой день и время вас записать?",
-                     "available_time": "Какое другое время вам подойдёт?"}
-        return questions.get(field, "Не удалось проверить запись. Попробуйте ещё раз чуть позже.")
+        return _CLARIFICATION_QUESTIONS.get(field, "Не удалось проверить запись. Попробуйте ещё раз чуть позже.")
 
     def _remember(self, user_id, text, answer):
         if re.search(r"\b(?:respond|CUSTOMER|STATE|tentative|tool_choice|missing_[a-z_]+)\b", answer, re.I):
@@ -407,11 +450,8 @@ car — слова клиента с исходной цитатой; car_model 
     def _affirmative(text, action):
         value = re.sub(r"[,.!]+", " ", text.lower()).strip()
         value = " ".join(value.split())
-        common = {"да", "давайте", "подойдёт", "подойдет", "берём", "берем", "подтверждаю", "да подтверждаю", "всё верно", "все верно", "да всё верно", "да все верно", "согласен", "согласна"}
-        extra = {"подтверждаю запись", "да подтверждаю запись", "записывайте", "да записывайте", "запишите", "да запишите"}
-        if action == "cancel_booking":
-            extra = {"подтверждаю отмену", "да отменяйте", "отменяйте", "да отменяйте запись"}
-        return value in common | extra
+        extra = _AFFIRMATIVE_CANCEL if action == "cancel_booking" else _AFFIRMATIVE_EXTRA
+        return value in _AFFIRMATIVE_COMMON | extra
 
     async def reply(self, user: ChatUser, text: str) -> str:
         async with self._session(user.id):
@@ -528,7 +568,7 @@ car — слова клиента с исходной цитатой; car_model 
             try:
                 await asyncio.wait_for(self._remember_choice(user, state.get("facts", {})), timeout=remaining())
                 answer = _clean_text(await asyncio.wait_for(
-                    self._run(messages, user, review_before), timeout=remaining()))
+                    self._run(messages, user, review_before, deadline=deadline), timeout=remaining()))
                 if user.id not in self._pending and re.search(r"\b(?:подтвердите\s+(?:запись|заказ)|записать\s+вас|оформить\s+запись|записыва\w*|запиш\w*|оформл\w*|подготовлен\w*|подготов\w*\s+запис\w*)\b", answer, re.I):
                     facts_net = state.setdefault("facts", {})
                     parsed_net_time = source_time(text, True) or source_time(text)
@@ -848,7 +888,11 @@ car — слова клиента с исходной цитатой; car_model 
         state = self._state[user.id]
         known = state.get("facts", {})
         classes = state.get("catalog", {}).get("size_classes", [])
-        editing = state.get("stage") == "collecting" and state.get("quote")
+        editing = state.get("stage") == "collecting" and bool(state.get("quote"))
+        cache_key = (only, editing, tuple(sorted(str(name) for name in known)), _compact_json(classes, default=str))
+        cached_tools = self._tools_cache.get(cache_key)
+        if cached_tools is not None:
+            return cached_tools
         result = []
         for tool in TOOLS:
             function = tool["function"]
@@ -869,6 +913,9 @@ car — слова клиента с исходной цитатой; car_model 
             if classes and "size_class" in schema["properties"]:
                 schema = dict(schema, properties={**schema["properties"], "size_class": {"type": "string", "enum": classes}})
             result.append(tool if schema is function["parameters"] else dict(tool, function=dict(function, parameters=schema)))
+        if len(self._tools_cache) >= 64:
+            self._tools_cache.clear()
+        self._tools_cache[cache_key] = result
         return result
 
     def _quote_args(self, args, user):
@@ -1149,7 +1196,9 @@ car — слова клиента с исходной цитатой; car_model 
                 return self._clarification(user.id, tool_cache[key].get("field"))
             if key not in tool_cache:
                 tool_cache[key] = await self._call_tool(tool_call.function.name, raw, user)
-                tool_cache[self._cache_key(tool_call.function.name, normalized, user)] = tool_cache[key]
+                second_key = self._cache_key(tool_call.function.name, normalized, user)
+                if second_key != key:  # контекст мог измениться внутри вызова
+                    tool_cache[second_key] = tool_cache[key]
             result = tool_cache[key]
             if result.get("table_unavailable"):
                 return result["error"]
@@ -1190,10 +1239,12 @@ car — слова клиента с исходной цитатой; car_model 
                 return False
         return bool(reads)
 
-    async def _run(self, messages: list[dict], user: ChatUser, review_before=None) -> str:
+    async def _run(self, messages: list[dict], user: ChatUser, review_before=None, deadline: float | None = None) -> str:
         tool_cache, tool_count, sent_fields = {}, 0, set()
         memory_repair_used = force_reply = False
         state = self._state[user.id]
+        if deadline is None:
+            deadline = time.monotonic() + self.config.ai_request_budget_sec
         proposal = ("{}", review_before if review_before is not None else dict(state.get("facts", {}))) if state.get("review_required") else None
         for iteration in range(self.config.ai_max_tool_iterations):
             self._update_context(messages, user, sent_fields, redact=bool(iteration))
@@ -1282,7 +1333,7 @@ car — слова клиента с исходной цитатой; car_model 
                             response = await asyncio.wait_for(self._request(
                                 messages=repair, tools=[respond_tool],
                                 tool_choice={"type": "function", "function": {"name": "respond"}}),
-                                timeout=self.config.ai_timeout_sec)
+                                timeout=min(self.config.ai_timeout_sec, max(0.001, deadline - time.monotonic())))
                             memory = response.choices[0].message
                             content = (memory.tool_calls[0].function.arguments if memory.tool_calls else memory.content) or ""
                             if content.strip():
@@ -1523,7 +1574,9 @@ car — слова клиента с исходной цитатой; car_model 
                     return self._offer(user.id, pending, "Цена или состав услуги изменились. ")
                 if result.get("ok"):
                     facts = state.get("facts", {})
-                    user_no = await asyncio.to_thread(self._user_booking_no, user.id, result["booking_id"])
+                    # Номер записи считается по уже прочитанным строкам таблицы;
+                    # резервный путь с чтением my_bookings остаётся на случай нестандартных результатов.
+                    user_no = result.get("user_no") or await asyncio.to_thread(self._user_booking_no, user.id, result["booking_id"])
                     state.clear()
                     state.update(facts=facts, stage="booked", confirmed=True, booking={**{field_name: result[field_name] for field_name in ("booking_id", "date", "time", "car", "total", "currency")}, "user_no": user_no})
                     number = f" Запись {user_no}." if user_no else ""
@@ -1534,7 +1587,7 @@ car — слова клиента с исходной цитатой; car_model 
                     facts = state.get("facts", {})
                     facts.update(date=result["date"], time=result["time"])
                     state.clear()
-                    user_no = await asyncio.to_thread(self._user_booking_no, user.id, result["booking_id"])
+                    user_no = result.get("user_no") or await asyncio.to_thread(self._user_booking_no, user.id, result["booking_id"])
                     state.update(facts=facts, stage="booked", confirmed=True,
                                  booking={**{key: result[key] for key in ("booking_id", "date", "time", "car", "total", "currency")}, "user_no": user_no})
                     number = f" Запись {user_no}" if user_no else " Запись"
@@ -1544,7 +1597,8 @@ car — слова клиента с исходной цитатой; car_model 
                 if result.get("ok"):
                     facts = state.get("facts", {})
                     state.clear()
-                    user_no = await asyncio.to_thread(self._user_booking_no, user.id, result["booking_id"])
+                    # Отменённая запись уже неактивна: my_bookings её не вернёт, номер всегда отсутствует.
+                    user_no = None
                     state.update(facts=facts, stage="cancelled", confirmed=True,
                                  cancelled={**{field_name: result[field_name] for field_name in ("booking_id", "date", "time")}, "user_no": user_no})
                     number = f" Запись {user_no}" if user_no else " Запись"
