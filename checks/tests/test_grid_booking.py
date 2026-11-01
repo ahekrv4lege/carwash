@@ -259,7 +259,7 @@ class GridBookingTests(unittest.TestCase):
         with self.assertRaisesRegex(MappingError, "ручная сверка"):
             self.store.reschedule_booking(created["booking_id"], 111, "2099-01-01", "11:00")
 
-    def test_reschedule_row_failure_before_write_keeps_original_and_blocks_retry(self):
+    def test_reschedule_row_failure_before_write_is_completed_on_retry(self):
         created = self.store.create_booking(**booking())
         self.bookings().fail_write = True
         with self.assertRaisesRegex(MappingError, "неизвестен"):
@@ -267,8 +267,13 @@ class GridBookingTests(unittest.TestCase):
         self.assertEqual(self.bookings().values[1][3], "10:00")
         self.assertEqual(self.cell(2, 2), f"Запись {created['booking_id']}")
         self.assertEqual(self.cell(3, 2), f"Запись {created['booking_id']}")
-        with self.assertRaisesRegex(MappingError, "ручная сверка"):
-            self.store.reschedule_booking(created["booking_id"], 111, "2099-01-01", "11:00")
+        # Журнал и клетка доказывают план: повтор доводит перенос без нового занятия.
+        self.bookings().fail_write = False
+        resumed = self.store.reschedule_booking(created["booking_id"], 111, "2099-01-01", "11:00")
+        self.assertTrue(resumed["ok"], resumed)
+        self.assertEqual(self.bookings().values[1][3], "11:00")
+        self.assertEqual(self.cell(2, 2), "")
+        self.assertEqual(self.cell(3, 2), f"Запись {created['booking_id']}")
 
     def test_reschedule_old_bay_release_failure_keeps_moved_row_and_old_marker(self):
         created = self.store.create_booking(**booking())

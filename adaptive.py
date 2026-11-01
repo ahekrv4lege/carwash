@@ -1405,6 +1405,13 @@ class AdaptiveSheets:
             if len(candidates) != 1 or any(candidates[0].get(field) != current.get(field) for field in rule["columns"]):
                 raise MappingError("Строка записи перемещена или изменена; отмена заблокирована")
             journal_path, journal = self._journal()
+            cancel_key = self._cancel_key(current)
+            journal[cancel_key] = {"state": "pending", "sheet_id": rule["sheet_id"], "row": row, "at": time.time(),
+                                   "marker": f"Запись {current['ID']}"}
+            try:
+                atomic_json(journal_path, journal)
+            except Exception:
+                log.warning("Не удалось записать журнал отмены; продолжаем по фактической таблице")
             grid_rules = self._grid_rules(current["Дата"]) if current.get("Дата") else []
             try:
                 worksheet.batch_update([{"range": cell_name(row, rule["columns"]["Статус"]),
@@ -1412,23 +1419,148 @@ class AdaptiveSheets:
             except Exception:
                 # Ответ потерян: успех подтверждаем фактическим статусом строки.
                 if self._booking_row_state(rule, row, {"Статус": rule["write_statuses"]["cancelled"]}) is not True:
+                    # Журнал остаётся pending как улика неизвестного результата.
                     raise MappingError("Результат отмены неизвестен. Проверьте таблицу перед повтором") from None
-            grid_released = None
-            if grid_rules:
-                try:
-                    grid_released = self._grid_release_by_booking(grid_rules[0], current["Время"], str(current["ID"]))
-                except Exception:
-                    log.warning("Клетку поста не удалось освободить при отмене записи")
-                    grid_released = False
+            grid_released = self._release_cancelled_cell(grid_rules, current)
+            journal[cancel_key]["state"] = "done"
             key = fingerprint({field_name.lower(): str(current.get(field_name, "")).strip().casefold()
                           for field_name in ("Telegram ID", "Дата", "Время", "Автомобиль")})
             if journal.get(key, {}).get("state") == "done":
                 del journal[key]
+            try:
+                atomic_json(journal_path, journal)
+            except Exception:
+                log.warning("Журнал операций не обновлён после подтверждённой отмены")
+            return grid_released
+
+    @staticmethod
+    def _cancel_key(record: dict) -> str:
+        return fingerprint({"cancel": str(record.get("ID", "")), "sheet": record.get("__sheet_id__"),
+                            "row": record.get("__row__")})
+
+    def _release_cancelled_cell(self, grid_rules: list[dict], current: dict) -> bool | None:
+        """Освобождение клетки отменённой записи; сбой не отменяет саму отмену."""
+        if not grid_rules:
+            return None
+        try:
+            return self._grid_release_by_booking(grid_rules[0], current["Время"], str(current["ID"]))
+        except Exception:
+            log.warning("Клетку поста не удалось освободить при отмене записи %s", current.get("ID"))
+            return False
+
+    def grid_audit(self, bookings_by_id: dict[str, list[dict]], is_active) -> dict:
+        """Сверка клеток сетки с записями: ограниченная, только подтверждённые выводы.
+
+        Свой маркер «Запись <ID>» снимается, когда запись с этим ID ровно одна и она
+        отменена, либо когда перенос уже подтверждён журналом. Чужие и ручные пометки,
+        дубли ID и маркеры не на месте активной записи — только фиксируются.
+        """
+        from sheets import parse_date, parse_time
+        with self.lock:
+            report = {"checked": 0, "cleared": [], "ambiguous": [], "missing": []}
+            try:
+                journal_path, journal = self._journal()
+            except MappingError:
+                journal = {}
+            for rule in self.document["regions"]:
+                if rule["role"] != "slots" or not rule.get("grid_columns") or not rule["validation"].get("read"):
+                    continue
+                worksheet = self._worksheet(rule["sheet_id"])
+                values = worksheet.get_all_values(value_render_option="FORMULA", date_time_render_option="FORMATTED_STRING")
+                day = self._date_source(rule, values, worksheet.title)
+                markers: dict[str, tuple[int, int]] = {}
+                end_row = min(len(values), rule.get("end_row") or len(values))
+                time_transform = rule.get("transforms", {}).get("Время", "time")
+                for row in range(rule["first_data_row"], end_row + 1):
+                    row_time = time_value(value_at(values, row, rule["columns"]["Время"]), time_transform)
+                    for column in rule["grid_columns"]:
+                        report["checked"] += 1
+                        text = str(value_at(values, row, column)).strip()
+                        match = re.fullmatch(r"Запись\s+(\d+)", text)
+                        if not match:
+                            continue  # чужие и ручные пометки не наши
+                        booking_id = match.group(1)
+                        markers.setdefault(f"Запись {booking_id}", (row, column))
+                        records = bookings_by_id.get(booking_id, [])
+                        cell = cell_name(row, column)
+                        if len(records) != 1:
+                            report["ambiguous"].append({"day": day, "cell": cell, "booking_id": booking_id,
+                                                        "reason": "запись не найдена или дублируется"})
+                            continue
+                        record = records[0]
+                        if is_active(record):
+                            if (parse_date(record.get("Дата", "")) != parse_date(day)
+                                    or parse_time(record.get("Время", "")) != row_time):
+                                if not self._journal_has_marker(journal, text):
+                                    report["ambiguous"].append({"day": day, "cell": cell, "booking_id": booking_id,
+                                                                "reason": "маркер не на месте активной записи"})
+                                    continue
+                                try:
+                                    if self._grid_release({"sheet_id": rule["sheet_id"], "row": row,
+                                                           "column": column, "marker": text}):
+                                        report["cleared"].append({"day": day, "cell": cell,
+                                                                  "booking_id": booking_id,
+                                                                  "reason": "перенос подтверждён журналом"})
+                                    else:
+                                        report["ambiguous"].append({"day": day, "cell": cell,
+                                                                    "booking_id": booking_id,
+                                                                    "reason": "клетка изменена вручную"})
+                                except Exception:
+                                    report["ambiguous"].append({"day": day, "cell": cell, "booking_id": booking_id,
+                                                                "reason": "не удалось освободить клетку"})
+                            continue  # активная запись: клетка на месте или спорная — выше
+                        try:
+                            if self._grid_release({"sheet_id": rule["sheet_id"], "row": row, "column": column,
+                                                   "marker": text}):
+                                report["cleared"].append({"day": day, "cell": cell, "booking_id": booking_id,
+                                                          "reason": "запись отменена"})
+                            else:
+                                report["ambiguous"].append({"day": day, "cell": cell, "booking_id": booking_id,
+                                                            "reason": "клетка изменена вручную"})
+                        except Exception:
+                            report["ambiguous"].append({"day": day, "cell": cell, "booking_id": booking_id,
+                                                        "reason": "не удалось освободить клетку"})
+                for booking_id, records in bookings_by_id.items():
+                    if len(records) != 1 or not is_active(records[0]):
+                        continue
+                    record = records[0]
+                    if parse_date(record.get("Дата", "")) != parse_date(day):
+                        continue
+                    if f"Запись {booking_id}" not in markers:
+                        report["missing"].append({"day": day, "booking_id": booking_id,
+                                                  "reason": "у активной записи нет клетки в сетке"})
+            return report
+
+    @staticmethod
+    def _journal_has_marker(journal: dict, marker: str) -> bool:
+        return any(entry.get("marker") == marker and entry.get("state") in {"pending", "done"}
+                   for entry in journal.values())
+
+    def reconcile_cancel(self, record: dict) -> bool | None:
+        """Доводим прерванную отмену: запись уже «Отмена», клетка могла остаться занятой.
+
+        Клетка снимается только при точном совпадении маркера «Запись <ID>» и одной
+        записи с этим ID; спорные клетки не трогаются.
+        """
+        with self.lock:
+            if not record.get("Дата") or not record.get("ID"):
+                return None
+            try:
+                grid_rules = self._grid_rules(record["Дата"])
+            except MappingError:
+                return None  # сетка неоднозначна или только для чтения: без ручной сверки не трогаем
+            if not grid_rules:
+                return None
+            released = self._release_cancelled_cell(grid_rules, record)
+            journal_path, journal = self._journal()
+            key = self._cancel_key(record)
+            if journal.get(key, {}).get("state") == "pending":
+                journal[key]["state"] = "done"
                 try:
                     atomic_json(journal_path, journal)
                 except Exception:
-                    log.warning("Журнал операций не обновлён после подтверждённой отмены")
-            return grid_released
+                    log.warning("Журнал операций не обновлён после сверки отмены")
+            return released
 
     def validate_reschedule(self, record: dict, new_date: str) -> dict:
         rule = self._target(sheet_id=record["__sheet_id__"])
@@ -1476,17 +1608,27 @@ class AdaptiveSheets:
                 updates.append({"range": cell_name(row, rule["columns"][field]), "values": [[value]]})
             path, journal = self._journal()
             key = fingerprint({"move": record, "date": new_date, "time": new_time})
-            if journal.get(key, {}).get("state") == "pending":
-                raise MappingError("Результат прошлого переноса неизвестен; нужна ручная сверка")
             new_day = date.strftime("%d.%m.%Y")
             new_grid = self._grid_rules(new_day)
             old_grid = self._grid_rules(record["Дата"]) if record.get("Дата") else []
+            if journal.get(key, {}).get("state") == "pending":
+                resumed = self._resume_pending_move(rule, worksheet, row, record, journal, path, key, updates,
+                                                    new_day, new_time, old_grid)
+                if resumed is not None:
+                    return resumed
+                raise MappingError("Результат прошлого переноса неизвестен; нужна ручная сверка")
             # Журнал до занятия клетки: иначе сбой между ними оставлял бы маркер без следа.
-            journal[key] = {"state": "pending", "sheet_id": rule["sheet_id"], "row": row, "at": time.time()}
-            atomic_json(path, journal)
+            journal[key] = {"state": "pending", "sheet_id": rule["sheet_id"], "row": row, "at": time.time(),
+                            "marker": f"Запись {record['ID']}",
+                            "old": {"Дата": record.get("Дата", ""), "Время": record.get("Время", "")},
+                            "new": {"Дата": new_day, "Время": new_time}}
+            try:
+                atomic_json(path, journal)
+            except Exception:
+                log.warning("Не удалось записать журнал переноса; продолжаем по фактической таблице")
             if new_grid:
                 try:
-                    self._grid_claim(new_grid[0], new_day, new_time, f"Запись {record['ID']}")
+                    claim = self._grid_claim(new_grid[0], new_day, new_time, f"Запись {record['ID']}")
                 except MappingError:
                     # Ошибка до записи клетки: операция не началась, повтор разрешён.
                     journal.pop(key, None)
@@ -1498,6 +1640,11 @@ class AdaptiveSheets:
                 except Exception:
                     # Результат занятия клетки неизвестен: журнал и возможный маркер сохраняем.
                     raise
+                journal[key]["claim"] = dict(claim)
+                try:
+                    atomic_json(path, journal)
+                except Exception:
+                    log.warning("Не удалось зафиксировать занятую клетку в журнале переноса")
             try:
                 worksheet.batch_update(updates, value_input_option="RAW")
             except Exception:
@@ -1507,13 +1654,7 @@ class AdaptiveSheets:
                     # Результат неизвестен: новая клетка и старая запись остаются до ручной сверки.
                     raise MappingError("Результат переноса неизвестен. Проверьте таблицу перед повтором") from None
             journal[key]["state"] = "done"
-            grid_released = None
-            if old_grid and (record["Дата"], record["Время"]) != (new_day, new_time):
-                try:
-                    grid_released = self._grid_release_by_booking(old_grid[0], record["Время"], str(record["ID"]))
-                except Exception:
-                    log.warning("Старую клетку поста не удалось освободить после переноса")
-                    grid_released = False
+            grid_released = self._release_old_move_cell(old_grid, record, new_day, new_time)
             original = fingerprint({field.lower(): str(record.get(field, "")).strip().casefold()
                                     for field in ("Telegram ID", "Дата", "Время", "Автомобиль")})
             if journal.get(original, {}).get("state") == "done":
@@ -1524,3 +1665,62 @@ class AdaptiveSheets:
                 # Перенос уже подтверждён строкой; сбой журнала не делает его неуспешным.
                 log.warning("Журнал операций не обновлён после подтверждённого переноса")
             return grid_released
+
+    def _release_old_move_cell(self, old_grid: list[dict], record: dict, new_day: str, new_time: str) -> bool | None:
+        if not old_grid or (record.get("Дата"), record.get("Время")) == (new_day, new_time):
+            return None
+        try:
+            return self._grid_release_by_booking(old_grid[0], record["Время"], str(record["ID"]))
+        except Exception:
+            log.warning("Старую клетку поста не удалось освободить после переноса записи %s", record.get("ID"))
+            return False
+
+    def _resume_pending_move(self, rule: dict, worksheet, row: int, record: dict, journal: dict, path, key: str,
+                             updates: list[dict], new_day: str, new_time: str, old_grid: list[dict]) -> bool | None:
+        """Перенос с неизвестным исходом: доводим по фактическому состоянию строки.
+
+        Строка уже на новом месте — снимаем старую клетку и закрываем журнал.
+        Строка ещё на старом месте и клетка наша — повторяем запись строки один раз.
+        Иначе состояние спорное: остаётся заблокированным до ручной сверки.
+        """
+        new_state = {"Дата": new_day, "Время": new_time}
+        old_state = {"Дата": record.get("Дата", ""), "Время": record.get("Время", "")}
+        if self._booking_row_state(rule, row, new_state) is True:
+            journal[key]["state"] = "done"
+            released = self._release_old_move_cell(old_grid, record, new_day, new_time)
+            try:
+                atomic_json(path, journal)
+            except Exception:
+                log.warning("Журнал операций не обновлён после сверки переноса")
+            return released if released is not None else True
+        if not journal[key].get("claim") or self._booking_row_state(rule, row, old_state) is not True:
+            return None
+        claim = journal[key]["claim"]
+        claim_sheet = self._worksheet(claim["sheet_id"])
+        cell = f"{cell_name(claim['row'], claim['column'])}:{cell_name(claim['row'], claim['column'])}"
+        try:
+            current = claim_sheet.get(cell, value_render_option="FORMULA")
+        except Exception:
+            return None
+        value = current[0][0] if current and current[0] else ""
+        if str(value).strip() != claim["marker"]:
+            return None  # клетку занял кто-то другой: ручная сверка
+        try:
+            worksheet.batch_update(updates, value_input_option="RAW")
+        except Exception:
+            if self._booking_row_state(rule, row, new_state) is True:
+                journal[key]["state"] = "done"
+                released = self._release_old_move_cell(old_grid, record, new_day, new_time)
+                try:
+                    atomic_json(path, journal)
+                except Exception:
+                    log.warning("Журнал операций не обновлён после сверки переноса")
+                return released if released is not None else True
+            return None  # результат записи снова неизвестен: журнал остаётся
+        journal[key]["state"] = "done"
+        released = self._release_old_move_cell(old_grid, record, new_day, new_time)
+        try:
+            atomic_json(path, journal)
+        except Exception:
+            log.warning("Журнал операций не обновлён после возобновлённого переноса")
+        return released if released is not None else True

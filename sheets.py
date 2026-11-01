@@ -897,6 +897,23 @@ class Store:
                 return "Интервал занят: нет свободного поста на всю длительность услуги"
         return "Это время вне графика работы"
 
+    def grid_maintenance(self) -> dict:
+        """Сверка сеток постов с записями: устаревшие свои маркеры снимаются,
+        спорные и пропавшие фиксируются для администратора. Изменяются только
+        собственные маркеры с проверенным ID; записи только читаются."""
+        if not self._adaptive:
+            return {"checked": 0, "cleared": [], "ambiguous": [], "missing": []}
+        with self._lock:
+            self._invalidate("bookings")
+            _, rows = self._get_bookings()
+            by_id: dict[str, list[dict[str, Any]]] = {}
+            for record in rows:
+                by_id.setdefault(str(pick(record, "ID")), []).append(record)
+            report = self._adaptive.grid_audit(by_id, self._is_active)
+            if report["ambiguous"] or report["missing"]:
+                log.warning("Сетка постов требует ручной сверки: %s", report["ambiguous"] + report["missing"])
+            return report
+
     def analytics_snapshot(self) -> tuple[list[dict[str, Any]], dict]:
         """Свежие строки «Записи» и вместимость «Слоты» для статистики (только чтение)."""
         with self._lock:
@@ -1372,6 +1389,11 @@ class Store:
             if pick(record, "Telegram ID") != str(telegram_id):
                 return _failure("Запись с таким номером не найдена среди записей этого клиента")
             if not self._is_active(record):
+                # Отмена могла прерваться до освобождения клетки: доводим по факту.
+                released = self._adaptive.reconcile_cancel(record) if self._adaptive else None
+                if released is True:
+                    self._invalidate("bookings")
+                    return _failure("Эта запись уже была отменена; место в сетке освобождено")
                 return _failure("Эта запись уже отменена")
             booking_date, booking_time = parse_date(pick(record, "Дата")), parse_time(pick(record, "Время"))
             if expected_booking is not None:

@@ -322,6 +322,16 @@ async def maintain_vehicle_cache(agent: Agent) -> None:
             log.warning("Обслуживание кэша автомобилей не выполнено (%s)", type(error).__name__)
 
 
+async def maintain_grid_consistency(store: Store) -> None:
+    """Раз в 10 минут: сверка клеток сеток постов с записями (см. Store.grid_maintenance)."""
+    while True:
+        await asyncio.sleep(600)
+        try:
+            await asyncio.to_thread(store.grid_maintenance)
+        except Exception as error:
+            log.warning("Сверка сетки постов не выполнена (%s)", type(error).__name__)
+
+
 async def archive_old_bookings(store: Store) -> None:
     """Раз в 6 часов помечаем прошедшие заявки как «Архив»."""
     while True:
@@ -345,6 +355,7 @@ async def main() -> None:
     maintenance = None
     archiver = None
     vehicle_cache = None
+    grid_auditor = None
     try:
         store = Store(config)
         reporter = AdminReporter(bot, config.admin_chat_id)
@@ -358,13 +369,14 @@ async def main() -> None:
         maintenance = asyncio.create_task(maintain_sessions(agent))
         archiver = asyncio.create_task(archive_old_bookings(store))
         vehicle_cache = asyncio.create_task(maintain_vehicle_cache(agent))
+        grid_auditor = asyncio.create_task(maintain_grid_consistency(store))
         if config.sheets_adaptive_enabled and config.sheets_discover_on_start:
             await asyncio.to_thread(store.refresh_schema, force=config.sheets_force_schema_refresh)
         await bot.delete_webhook(drop_pending_updates=False)
         log.info("Бот запущен. Модель: %s", config.ai_model if config.ai_enabled else "AI отключён")
         await dispatcher.start_polling(bot, close_bot_session=False)
     finally:
-        for task in (maintenance, archiver, vehicle_cache):
+        for task in (maintenance, archiver, vehicle_cache, grid_auditor):
             if task is not None:
                 task.cancel()
                 with suppress(asyncio.CancelledError):
