@@ -105,6 +105,21 @@ def duration_unit_hint(value: Any) -> str | None:
     return None
 
 
+DURATION_WORDS = {"полчаса": 30, "час": 60, "часа": 60, "часов": 60, "часик": 60,
+                  "полтора": 90, "два": 120, "две": 120, "три": 180, "четыре": 240, "пять": 300}
+
+
+def _word_duration(text: str) -> int | None:
+    """«полчаса», «полтора часа», «два часа» — когда смысл однозначен."""
+    match = re.fullmatch(r"(\w+)(\s+час\w*)?", text)
+    if not match:
+        return None
+    word = match.group(1)
+    if word == "полтора":
+        return 90 if match.group(2) else None  # «полтора» без часа не про длительность
+    return DURATION_WORDS.get(word)
+
+
 def _duration_total(minutes: float) -> int | None:
     result = int(round(minutes))
     return result if 0 < result <= DURATION_MAX_MINUTES else None
@@ -120,6 +135,9 @@ def parse_duration_minutes(value: Any, unit_hint: str | None = None) -> int | No
     text = str(value or "").strip().lower().replace("ё", "е").replace(",", ".")
     if not text:
         return None
+    word = _word_duration(text)
+    if word:
+        return word
     span = re.fullmatch(r"(\d{1,2})[:.](\d{2})\s*[-–—]\s*(\d{1,2})[:.](\d{2})", text)
     if span:
         start, end = int(span[1]) * 60 + int(span[2]), int(span[3]) * 60 + int(span[4])
@@ -330,9 +348,27 @@ def discover(snapshot: dict, expected: dict[str, str]) -> tuple[list[dict], list
                     continue  # колонка без значений — не таблица длительностей
             source = {"title": True} if role in {"slots", "bookings"} and "Дата" not in columns and title_date(snapshot["title"]) else None
             present = set(columns) | ({"Дата"} if source else set())
+            tariff_prices = []
+            if (role == "tariffs" and "Тариф" in columns
+                    and "Telegram ID" not in header_mapping(headers, "bookings")[0]
+                    and "Услуга" not in header_mapping(headers, "services")[0]):
+                # Пакеты с фиксированной ценой: числовые колонки — классы вместо состава.
+                used_tariff = set(columns.values())
+                for column, header in enumerate(headers, 1):
+                    if not header or column in used_tariff or is_duration_header(header):
+                        continue
+                    if re.fullmatch(r"-?\d[\d\s]*(?:[.,]\d+)?\s*(?:₽|руб\.?|RUB)?", str(header).strip(), re.I):
+                        continue  # числовая шапка — не название класса
+                    samples = [str(value_at(snapshot["values"], row_index, column)).strip()
+                               for row_index in range(row_no + 1, min(len(snapshot["values"]), row_no + 20) + 1)]
+                    samples = [value for value in samples if value]
+                    if samples and all(re.fullmatch(r"-?\d[\d\s]*(?:[.,]\d+)?\s*(?:₽|руб\.?|RUB)?", value, re.I)
+                                       for value in samples):
+                        tariff_prices.append((str(header).strip(), column))
             if errors and (snapshot["title"] == expected.get(role) or len(present & READ_REQUIRED[role]) >= len(READ_REQUIRED[role]) - 1):
                 issues.extend(f"Лист {snapshot['id']}, строка {row_no}: {issue}" for issue in errors)
-            if not READ_REQUIRED[role] <= present:
+            if not READ_REQUIRED[role] <= present and not (
+                    role == "tariffs" and "Тариф" in columns and tariff_prices):
                 continue
             # Слотоподобная строка записей не является отдельной таблицей слотов.
             if role == "slots" and ("Telegram ID" in header_mapping(headers, "bookings")[0]):
@@ -352,6 +388,7 @@ def discover(snapshot: dict, expected: dict[str, str]) -> tuple[list[dict], list
                 issues.append(f"Лист {snapshot['id']}: неоднозначные колонки {role}")
                 continue
             pivot = False
+            rule_price_fields = []
             if role == "services":
                 booking_columns, _ = header_mapping(headers, "bookings")
                 if "Класс" in booking_columns and "Сумма" in booking_columns:
@@ -397,9 +434,18 @@ def discover(snapshot: dict, expected: dict[str, str]) -> tuple[list[dict], list
                 if pivot:
                     rule["pivot_prices"] = {"class_field": "Класс", "value_field": "Сумма"}
             if role == "tariffs":
-                duration = detect_duration_column(snapshot, row_no, headers, set(columns.values()))
+                used = set(columns.values())
+                used.update(column for _, column in tariff_prices)
+                duration = detect_duration_column(snapshot, row_no, headers, used)
                 if duration:
                     columns["Длительность"] = duration[1]
+                    used.add(duration[1])
+                for header, column in tariff_prices:
+                    columns[header] = column
+                if tariff_prices:
+                    rule_price_fields = [header for header, _ in tariff_prices]
+            if role == "tariffs" and rule_price_fields:
+                rule["price_fields"] = rule_price_fields
             rule["structure"] = structure(snapshot, rule)
             rule["fingerprint"] = fingerprint(rule["structure"])
             rules.append(rule)
@@ -490,6 +536,8 @@ class AdaptiveSheets:
         self.force_pending = config.sheets_force_schema_refresh
         self.worksheets = {}
         self.read_versions = {}
+        self.ai_requests = 0
+        self._ai_cache_key = None
         self.expected = {role: getattr(config, f"sheet_{role}") for role in ROLE_FIELDS}
 
     def _load(self) -> None:
@@ -690,6 +738,8 @@ class AdaptiveSheets:
             ):
                 errors.append("Некорректное преобразование даты/времени")
         required = SCHEDULE_REQUIRED if rule.get("schedule_mode") == "hours" else READ_REQUIRED[rule["role"]]
+        if rule["role"] == "tariffs":
+            required = required - {"Состав"} if rule.get("price_fields") else required
         missing = required - present
         if missing:
             errors.append("Не хватает полей: " + ", ".join(sorted(missing)))
@@ -859,11 +909,14 @@ class AdaptiveSheets:
                     rules, found_issues = discover(snapshot, self.expected)
                     issues.extend(found_issues)
                     regions.extend(self._validate_rule(rule, snapshot) for rule in rules)
+                self._maybe_interpret_with_ai(regions, by_id, issues)
                 self.document = {"version": VERSION, "spreadsheet_id": self.config.spreadsheet_id,
                                  "regions": regions, "relationships": [
                                      {"from": "bookings", "to": "slots", "fields": ["Дата", "Время"]},
                                      {"from": "tariffs", "to": "services", "fields": ["Состав", "Услуга"]}],
                                  "issues": issues}
+                if self._ai_cache_key:
+                    self.document["ai_regions"] = self.document.get("ai_regions", [])
             else:
                 regions = []
                 known = set()
@@ -894,6 +947,8 @@ class AdaptiveSheets:
                         rules, found_issues = discover(snapshot, self.expected)
                         issues.extend(found_issues)
                         regions.extend(self._validate_rule(rule, snapshot) for rule in rules)
+                if regions != self.document["regions"] or issues != self.document.get("issues"):
+                    self._maybe_interpret_with_ai(regions, by_id, issues)
                 self.document["regions"] = regions
                 self.document["issues"] = issues
             self.document["named_ranges"] = self.named_ranges
@@ -906,6 +961,132 @@ class AdaptiveSheets:
             self._save()
             self.force_pending = False
             return self.document
+
+    # ---- интерпретация структуры моделью: кандидаты сверяются с фактической таблицей
+
+    def _ai_enabled(self) -> bool:
+        return bool(getattr(self.config, "sheets_ai_mapping_enabled", True)
+                    and getattr(self.config, "ai_api_key", ""))
+
+    def _ai_candidates(self, snapshots: list[dict], issues: list[str]) -> list[dict]:
+        """Один вызов модели на новое структурное представление книги."""
+        import schema_ai
+        compact = schema_ai.compact_workbook(snapshots)
+        key = fingerprint(compact)
+        if self._ai_cache_key == key and self.document and self.document.get("ai_regions") is not None:
+            return self.document["ai_regions"]
+        began = time.time()
+        document = schema_ai.request_mapping(self.config, compact)
+        self.ai_requests += 1
+        candidates, model_issues = schema_ai.normalize_ai_document(document)
+        issues.extend(model_issues)
+        issues.append(f"Модель: интерпретация за {time.time() - began:.1f}с")
+        self._ai_cache_key = key
+        return candidates
+
+    def _ai_rule(self, candidate: dict, snapshot: dict, issues: list[str]) -> dict | None:
+        """Кандидат модели -> правило с проверенными номерами колонок."""
+        title = candidate["sheet_title"]
+        if title != snapshot["title"]:
+            return None  # ищем только на своём листе; чужие названия — молча
+        headers_all = snapshot["values"]
+        header_row = candidate["header_row"] or 1
+        if not 1 <= header_row <= min(20, len(headers_all)):
+            issues.append(f"Модель: некорректная строка шапки {header_row} на листе «{title}»")
+            return None
+        headers = trim_headers(headers_all[header_row - 1])
+        columns: dict[str, int] = {}
+        for field, claimed in candidate["columns"].items():
+            exact = [index for index, header in enumerate(headers, 1) if header == claimed]
+            loose = [index for index, header in enumerate(headers, 1)
+                     if normalize_header(header) == normalize_header(claimed)]
+            hits = exact or loose
+            if len(hits) == 1:
+                columns[field] = hits[0]
+            else:
+                issues.append(f"Модель: шапка «{claimed}» ({field}) не подтверждена на листе «{title}»")
+        role = candidate["role"]
+        if not columns:
+            return None
+        if candidate.get("duration_column"):
+            duration = detect_duration_column(snapshot, header_row, headers, set(columns.values()))
+            if duration and "Длительность" not in columns:
+                columns["Длительность"] = duration[1]
+        price_fields = []
+        if role in {"services", "tariffs"}:
+            price_fields = [field for field in columns
+                            if field not in ALL_ROLE_FIELDS[role] and field not in {"Класс", "Сумма", "Длительность"}]
+        grid_columns = []
+        for claimed in candidate.get("grid_columns", []):
+            hits = [index for index, header in enumerate(headers, 1) if header == claimed]
+            if len(hits) == 1:
+                grid_columns.append(hits[0])
+            else:
+                issues.append(f"Модель: колонка сетки «{claimed}» не подтверждена на листе «{title}»")
+        source = candidate.get("date_source")
+        date_source = {"title": True} if source == "title" else (
+            {"cell": source["cell"]} if isinstance(source, dict) and isinstance(source.get("cell"), list) else None)
+        if role in {"slots", "bookings"} and "Дата" not in columns and date_source is None                 and title_date(snapshot["title"]):
+            date_source = {"title": True}
+        rule = {"role": role, "sheet_id": snapshot["id"], "sheet_title": snapshot["title"],
+                "header_row": header_row, "first_data_row": header_row + 1, "end_row": None,
+                "columns": columns, "source": "ai",
+                "transforms": {"Дата": "date", "Время": "time", "Начало": "time", "Конец": "time"},
+                "status_map": dict(STATUS_MAP), "write_statuses": {"new": "Новая", "cancelled": "Отмена"},
+                "date_source": date_source, "permissions": {"read": True, "write": role == "bookings"},
+                "validation": {"read": False, "write": False, "issues": []}}
+        if role in {"services", "tariffs"} and price_fields:
+            rule["price_fields"] = price_fields
+        if role == "services" and "Класс" in columns and "Сумма" in columns:
+            rule["pivot_prices"] = {"class_field": "Класс", "value_field": "Сумма"}
+        if grid_columns:
+            rule["grid_columns"] = grid_columns
+            rule["free_markers"] = ["", "свободно", "free", "open"]
+        if candidate.get("schedule_mode") == "hours" and {"Начало", "Конец"} <= set(columns):
+            rule["schedule_mode"] = "hours"
+        rule["structure"] = structure(snapshot, rule)
+        rule["fingerprint"] = fingerprint(rule["structure"])
+        return rule
+
+    def _apply_ai_candidates(self, candidates: list[dict], by_id: dict[int, dict],
+                             regions: list[dict], issues: list[str]) -> None:
+        covered = {(rule["role"], rule["sheet_id"], rule["header_row"]) for rule in regions}
+        for candidate in candidates:
+            snapshot = next((item for item in by_id.values()
+                             if item["title"] == candidate["sheet_title"]), None)
+            if snapshot is None:
+                issues.append(f"Модель: лист «{candidate['sheet_title']}» не найден в книге")
+                continue
+            key = (candidate["role"], snapshot["id"], candidate["header_row"] or 1)
+            if key in covered:
+                continue  # детерминированное распознавание уже нашло эту область
+            rule = self._ai_rule(candidate, snapshot, issues)
+            if rule is None:
+                continue
+            self._validate_rule(rule, snapshot)
+            regions.append(rule)
+            covered.add(key)
+
+    def _maybe_interpret_with_ai(self, regions: list[dict], by_id: dict[int, dict],
+                                 issues: list[str]) -> None:
+        """Модель привлекается, когда детерминированного распознавания недостаточно."""
+        if not self._ai_enabled():
+            return
+        required_roles = {"bookings", "services", "tariffs", "slots"}
+        missing = required_roles - {rule["role"] for rule in regions}
+        unrecognized = any("не распознана" in issue or "требуют ручной настройки" in issue
+                           for issue in issues)
+        if not missing and not unrecognized:
+            return
+        try:
+            candidates = self._ai_candidates(list(by_id.values()), issues)
+        except Exception as error:
+            issues.append(f"Интерпретация модели недоступна ({type(error).__name__}); "
+                          "работает детерминированное распознавание")
+            log.warning("AI-интерпретация структуры не выполнена (%s)", type(error).__name__)
+            return
+        if candidates:
+            self._apply_ai_candidates(candidates, by_id, regions, issues)
 
     def _summarize(self) -> None:
         self.document["missing_roles"] = sorted(set(ROLE_FIELDS) - {rule["role"] for rule in self.document["regions"]})
@@ -1049,7 +1230,7 @@ class AdaptiveSheets:
                 classes = [header for header in headers if header not in {"Услуга", "Описание", "Доступна", "Длительность"}]
                 if len({header.casefold() for header in classes}) != len(classes):
                     raise MappingError("Повторяющиеся классы автомобилей")
-            self._validate_records(role, records)
+            self._validate_records(role, records, rules)
             self.read_versions[role] = fingerprint((headers, records))
             return headers, records
 
@@ -1075,7 +1256,7 @@ class AdaptiveSheets:
             item[matched_class] = price
         return ["Услуга", "Описание", *classes, "Доступна"], list(by_service.values())
 
-    def _validate_records(self, role: str, records: list[dict]) -> None:
+    def _validate_records(self, role: str, records: list[dict], rules: list[dict] | None = None) -> None:
         from sheets import parse_date, parse_time, to_number
         if role in {"services", "tariffs"}:
             yes_no = {"", "да", "yes", "true", "1", "y", "+", "✓", "✅", "истина", "есть",
@@ -1102,6 +1283,13 @@ class AdaptiveSheets:
                     items = [item.strip().casefold() for item in re.split(r"[,;\n]", record.get("Состав", "")) if item.strip()]
                     if len(items) != len(set(items)):
                         raise MappingError("Повторяющиеся услуги в составе тарифа")
+                    price_fields = sorted({field for rule in (rules or []) if rule["role"] == "tariffs"
+                                           for field in rule.get("price_fields", [])})
+                    for field in price_fields:
+                        value = str(record.get(field, "")).strip()
+                        if value and (not re.fullmatch(r"\d[\d\s]*(?:[.,]\d{1,2})?\s*(?:₽|руб\.?|RUB)?", value, re.I)
+                                      or (amount := to_number(value)) is None or amount < 0):
+                            raise MappingError(f"Некорректная цена пакета «{field}»")
             field = "Услуга" if role == "services" else "Тариф"
             names = [record.get(field, "").casefold() for record in records]
             if any(not name for name in names) or len(names) != len(set(names)):

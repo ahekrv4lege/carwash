@@ -208,6 +208,7 @@ class Tariff:
     discount: float                 # скидка в % за комплекс
     enabled: bool
     duration_minutes: int | None = None  # суммарная длительность пакета, если указана
+    fixed_prices: dict[str, int] = field(default_factory=dict)  # класс -> цена пакета
 
 
 @dataclass
@@ -275,7 +276,10 @@ class Catalog:
                             code="class_rule_mismatch", required_class=required)
         return None
 
-    # ---- тариф = сумма цен ДОСТУПНЫХ услуг из состава минус скидка
+    # ---- тариф: фиксированная цена пакета или сумма цен доступных услуг минус скидка
+    class TariffConflict(ValueError):
+        """Цена пакета противоречит расчёту по составу: источник неоднозначен."""
+
     def tariff_quote(self, tariff: Tariff, size_class: str) -> dict | None:
         included: list[str] = []
         removed: list[str] = []
@@ -288,14 +292,19 @@ class Catalog:
                 total += price
             else:
                 removed.append(service.name if service else item)
-        if not included:
-            return None
+        fixed = tariff.fixed_prices.get(size_class)
         discount = min(max(tariff.discount, 0.0), 100.0)
-        return {
-            "price": int(round(total * (1 - discount / 100))),
-            "included": included,
-            "removed": removed,
-        }
+        if fixed is None:
+            if not included:
+                return None  # нет ни цены пакета, ни доступного состава
+            price = int(round(total * (1 - discount / 100)))
+        else:
+            price = fixed
+            if included and price != int(round(total * (1 - discount / 100))):
+                raise self.TariffConflict(
+                    f"Тариф «{tariff.name}»: цена пакета {fixed} не совпадает с расчётом по составу "
+                    f"({int(round(total * (1 - discount / 100)))}); уточните у администратора")
+        return {"price": price, "included": included, "removed": removed}
 
     # ---- расчёт стоимости: тариф и/или отдельные услуги
     def quote(self, size_class: str, tariff: str | None, services: list[str] | None) -> dict:
@@ -312,7 +321,10 @@ class Catalog:
                     result.update(field="tariff", code="service_is_not_tariff",
                                   clarification="Это отдельная услуга; уточните выбор, не подменяйте тариф автоматически")
                 return result
-            tariff_price = self.tariff_quote(selected_tariff, size_class)
+            try:
+                tariff_price = self.tariff_quote(selected_tariff, size_class)
+            except self.TariffConflict as error:
+                return self._catalog_error(str(error))
             if not tariff_price:
                 return self._catalog_error(f"Тариф «{selected_tariff.name}» сейчас недоступен: все его позиции убраны")
             tariff_name = selected_tariff.name
@@ -424,7 +436,10 @@ class Catalog:
             prices: dict[str, int] = {}
             removed: dict[str, list[str]] = {}
             for size_class in self.size_classes:
-                tariff_price = self.tariff_quote(tariff, size_class)
+                try:
+                    tariff_price = self.tariff_quote(tariff, size_class)
+                except self.TariffConflict:
+                    raise
                 if tariff_price:
                     prices[size_class] = tariff_price["price"]
                     if tariff_price["removed"]:
@@ -621,6 +636,9 @@ class Store:
 
         tariff_headers, tariff_rows = self._table(self.config.sheet_tariffs, observed)
         tariff_duration_header = next((header for header in tariff_headers if is_duration_header(header)), None)
+        class_headers = [header for header in tariff_headers
+                         if header not in {"Тариф", "Состав", "Скидка %", "Доступен", "Доступна", "Длительность"}
+                         and not is_duration_header(header)]
         tariffs: dict[str, Tariff] = {}
         for record in tariff_rows:
             name = pick(record, "Тариф")
@@ -631,12 +649,22 @@ class Store:
                 if item.lower() not in services:
                     log.warning("Тариф «%s»: услуга «%s» не найдена на листе «%s»",
                                 name, item, self.config.sheet_services)
+            fixed_prices = {}
+            for header in class_headers:
+                raw = record.get(header, "")
+                if str(raw).strip():
+                    price = to_number(raw)
+                    if price is None or price < 0:
+                        log.warning("Тариф «%s»: некорректная цена пакета «%s» = %r", name, header, raw)
+                    else:
+                        fixed_prices[header] = int(round(price))
             tariffs[name.lower()] = Tariff(
                 name=name,
                 items=items,
                 discount=to_number(pick(record, "Скидка %", "Скидка")) or 0.0,
                 enabled=is_yes(pick(record, "Доступен", "Доступна"), default=True),
                 duration_minutes=self._duration_value(record.get(tariff_duration_header, "")) if tariff_duration_header else None,
+                fixed_prices=fixed_prices,
             )
         self._apply_duration_overrides(services)
         durations_present = any(service.duration_minutes for service in services.values()) or any(

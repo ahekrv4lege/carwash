@@ -64,6 +64,9 @@ def duration_store(temp, *, services=None, tariffs=None, schedule=None, duration
 class DurationParsingTests(unittest.TestCase):
     def test_minutes_hours_ranges_and_combinations(self):
         self.assertEqual(parse_duration_minutes("90"), 90)
+        self.assertEqual(parse_duration_minutes("полтора часа"), 90)
+        self.assertEqual(parse_duration_minutes("полчаса"), 30)
+        self.assertEqual(parse_duration_minutes("два часа"), 120)
         self.assertEqual(parse_duration_minutes("90 мин"), 90)
         self.assertEqual(parse_duration_minutes("1,5 ч"), 90)
         self.assertEqual(parse_duration_minutes("2 часа"), 120)
@@ -74,7 +77,7 @@ class DurationParsingTests(unittest.TestCase):
         self.assertEqual(parse_duration_minutes("2", "minutes"), 2)
 
     def test_unreadable_or_absurd_values_are_not_invented(self):
-        for value in ("", "мусор", "0", "полтора часа", "-30", "100:00"):
+        for value in ("", "мусор", "0", "полтора", "-30", "100:00"):
             self.assertIsNone(parse_duration_minutes(value), value)
 
 
@@ -119,11 +122,11 @@ class DurationScheduleTests(unittest.TestCase):
 
     def test_malformed_duration_is_neither_price_nor_duration(self):
         store, _ = duration_store(self.temp.name,
-                                  services=[["Мойка", "Кузов", "700", "800", "да", "полтора часа"]],
+                                  services=[["Мойка", "Кузов", "700", "800", "да", "как получится"]],
                                   tariffs=[["Базовый", "Мойка", "10", "да", ""]])
         catalog = store.get_catalog(fresh=True)
         self.assertFalse(catalog.durations_present)
-        self.assertNotIn("полтора часа", str(catalog.size_classes))
+        self.assertNotIn("как получится", str(catalog.size_classes))
         refused = store.create_booking(**booking())
         self.assertFalse(refused["ok"])
         self.assertIn("Нет данных о длительности", refused["error"])

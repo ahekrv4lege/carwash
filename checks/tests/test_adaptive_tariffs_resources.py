@@ -124,6 +124,42 @@ class TariffLayoutTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertTrue(legacy.cancel_booking(result["booking_id"], 111)["ok"])
 
+    def test_fixed_price_tariffs_without_composition(self):
+        self.tariffs.values = [["Тариф", "Легковой", "Кроссовер", "Доступен"],
+                               ["Экспресс", "700", "800", "да"],
+                               ["Комплекс", "1500", "1800", "да"]]
+        self.store._invalidate("catalog")
+        quote = self.price("Кроссовер", "Экспресс", [])
+        self.assertTrue(quote["ok"], quote)
+        self.assertEqual(quote["total"], 800)
+        self.assertEqual(quote["lines"][0]["includes"], [])  # состав не выдуман
+        missing = self.price("Легковой", "Комплекс", [])
+        self.assertEqual(missing["total"], 1500)
+
+    def test_fixed_price_conflicting_with_composition_is_exposed(self):
+        # Воск в фикстуре недоступен: состав даёт 700*0.9 = 630, цена пакета 800 — конфликт.
+        self.tariffs.values = [["Тариф", "Состав", "Скидка %", "Легковой", "Доступен"],
+                               ["Базовый", "Мойка", "10", "800", "да"]]
+        self.store._invalidate("catalog")
+        quote = self.price("Легковой", "Базовый", [])
+        self.assertFalse(quote["ok"], quote)
+        self.assertIn("не совпадает с расчётом по составу", quote["error"])
+
+    def test_fixed_price_equal_to_computation_is_accepted(self):
+        self.tariffs.values = [["Тариф", "Состав", "Скидка %", "Легковой", "Доступен"],
+                               ["Базовый", "Мойка", "0", "700", "да"]]
+        self.store._invalidate("catalog")
+        quote = self.price("Легковой", "Базовый", [])
+        self.assertTrue(quote["ok"], quote)
+        self.assertEqual(quote["total"], 700)
+        self.assertEqual(quote["lines"][0]["includes"], ["Мойка"])
+
+    def test_malformed_fixed_price_blocks_the_tariff_read(self):
+        self.tariffs.values = [["Тариф", "Легковой", "Доступен"], ["Экспресс", "по договорённости", "да"]]
+        self.store._invalidate("catalog")
+        with self.assertRaises(MappingError):
+            self.price("Легковой", "Экспресс", [])
+
     def test_class_with_several_words_and_spacer_column(self):
         sheet = self.spreadsheet.worksheet("Услуги")
         values = [["Услуга", "", "Легковой", "Внедорожник/минивэн", "Доступна"],

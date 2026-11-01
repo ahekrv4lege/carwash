@@ -103,6 +103,10 @@ class Config:
     sheet_classes: str         # правила для машин с несколькими классами (напр. BMW X5)
 
     sheets_adaptive_enabled: bool = False
+    # Интерпретация структуры книги моделью (DeepSeek): включена вместе с адаптивом.
+    sheets_ai_mapping_enabled: bool = True
+    sheets_ai_model: str = ""          # пусто — используется основная модель диалога
+    sheets_ai_timeout_sec: float = 90.0
     sheets_discover_on_start: bool = False
     sheets_schema_check_interval_hours: float = 24.0
     sheets_force_schema_refresh: bool = False
@@ -243,6 +247,9 @@ def _sheet_settings() -> dict:
     return dict(
         **names,
         sheets_adaptive_enabled=_bool("SHEETS_ADAPTIVE_ENABLED", has_table_mapping),
+        sheets_ai_mapping_enabled=_bool("SHEETS_AI_MAPPING", True),
+        sheets_ai_model=os.getenv("SHEETS_AI_MODEL", "").strip(),
+        sheets_ai_timeout_sec=_number("SHEETS_AI_TIMEOUT_SEC", "90", 1),
         sheets_discover_on_start=_bool("SHEETS_DISCOVER_ON_START"),
         sheets_schema_check_interval_hours=_number("SHEETS_SCHEMA_CHECK_INTERVAL_HOURS", "24", 0.001),
         sheets_force_schema_refresh=_bool("SHEETS_FORCE_SCHEMA_REFRESH"),
