@@ -6,8 +6,11 @@
 import tempfile
 import threading
 import unittest
+from collections import Counter
+from datetime import date
 
-from tests.fakes import fixture, booking
+from adaptive import MappingError
+from tests.fakes import Worksheet, booking, fixture
 
 
 def capacity_store(temp, rows):
@@ -81,6 +84,49 @@ class CapacityScheduleTests(unittest.TestCase):
         self.store._invalidate("slots", "bookings")
         self.assertIn("09:00", self.store.free_slots("2099-01-01")["days"][0]["free_times"])
         self.assertNotIn("09:00", self.store.free_slots("2099-01-02")["days"][0]["free_times"])
+
+    def test_capacity_two_reports_two_one_and_zero_places(self):
+        slots = self.store._get_slots()
+        busy = Counter()
+        key = (date(2099, 1, 1), "09:00")
+        self.assertEqual(self.store._capacity_left(slots, busy, key), 2)
+        busy[key] = 1
+        self.assertEqual(self.store._capacity_left(slots, busy, key), 1)
+        busy[key] = 2
+        self.assertEqual(self.store._capacity_left(slots, busy, key), 0)
+
+    def test_eight_simultaneous_attempts_for_two_posts_create_two_rows(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        store, spreadsheet = capacity_store(temp.name, [["01.01.2099", "10:00", "2"]])
+        results = []
+
+        def attempt(number):
+            results.append(store.create_booking(**booking(telegram_id=3000 + number, car=f"Car {number}")))
+
+        threads = [threading.Thread(target=attempt, args=(number,)) for number in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(1 for result in results if result["ok"]), 2)
+        self.assertEqual(len(spreadsheet.worksheet("Записи").values), 3)
+
+    def test_cancelled_status_frees_a_place_and_unknown_status_stays_conservative(self):
+        first = self.store.create_booking(**booking(time_str="09:00", telegram_id=111, car="A"))
+        second = self.store.create_booking(**booking(time_str="09:00", telegram_id=222, car="B"))
+        self.assertTrue(first["ok"] and second["ok"])
+        sheet = self.spreadsheet.worksheet("Записи")
+        sheet.values[1][-1] = "Отменена"
+        sheet.values[2][-1] = "Архив"  # неизвестный для будущей записи статус считаем занятым
+        self.store._invalidate("slots", "bookings")
+        self.assertTrue(self.store.create_booking(**booking(time_str="09:00", telegram_id=333, car="C"))["ok"])
+        self.assertFalse(self.store.create_booking(**booking(time_str="09:00", telegram_id=444, car="D"))["ok"])
+
+    def test_mixed_grid_and_capacity_rows_for_one_time_are_rejected(self):
+        self.spreadsheet.sheets.append(Worksheet(9, "01.01.2099", [["Время", "Пост 1"], ["10:00", ""]]))
+        with self.assertRaises(MappingError):
+            self.store.free_slots("2099-01-01")
 
     def test_concurrent_bookings_for_single_post_create_one_row(self):
         temp = tempfile.TemporaryDirectory()
