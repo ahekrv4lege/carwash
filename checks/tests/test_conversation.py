@@ -491,9 +491,9 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         loop_thread = threading.get_ident()
         seen = []
         original = self.store.calculate_price
-        def quote(*args):
+        def quote(*args, **kwargs):
             seen.append(threading.get_ident())
-            return original(*args)
+            return original(*args, **kwargs)
         with patch.object(self.store, "calculate_price", side_effect=quote):
             await self.say("Цена", response(calls=[("calculate_price", {"size_class": "Легковой", "tariff": "Базовый"})]), response("630 ₽."))
         self.assertTrue(seen)

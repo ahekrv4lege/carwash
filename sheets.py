@@ -143,6 +143,14 @@ def _failure(text: str, **extra: Any) -> dict:
     return {"ok": False, "error": text, **extra}
 
 
+def _car_key(value: str) -> str:
+    return " ".join((value or "").strip().casefold().replace("ё", "е").split())
+
+
+def _car_tokens(key: str) -> frozenset[str]:
+    return frozenset(re.findall(r"\w+(?:[.,]\w+)*", key))
+
+
 class FreeCapacity(int):
     """Число уже свободных боксов, а не общая вместимость."""
 
@@ -183,19 +191,50 @@ class Catalog:
                 return class_name
         return None
 
-    def resolve_class_rule(self, value: str) -> str | None:
-        """Точное правило важнее частичного; неоднозначный класс не выбираем."""
-        needle = (value or "").strip().casefold()
+    def class_rule_for(self, value: str) -> tuple[str, str | None]:
+        """("none", None) | ("rule", класс) | ("ambiguous", None).
+
+        Правило совпадает, если все слова названия правила есть в названии автомобиля
+        (целыми словами: «X5» не совпадает с «X50»). Точное совпадение и самое
+        конкретное правило важнее общего; при разных классах у равных кандидатов — неоднозначно.
+        """
+        needle = _car_key(value)
         if not needle:
-            return None
-        matches = set()
+            return "none", None
+        tokens = _car_tokens(needle)
+        exact = {size_class for car, size_class in self.class_rules if _car_key(car) == needle}
+        if exact:
+            return ("rule", next(iter(exact))) if len(exact) == 1 else ("ambiguous", None)
+        best_size, best_classes = 0, set()
         for car, size_class in self.class_rules:
-            car = car.strip().casefold()
-            if car == needle:
-                return size_class
-            if car and (car in needle or needle in car):
-                matches.add(size_class)
-        return next(iter(matches)) if len(matches) == 1 else None
+            rule_tokens = _car_tokens(_car_key(car))
+            if not rule_tokens or not rule_tokens <= tokens:
+                continue
+            if len(rule_tokens) > best_size:
+                best_size, best_classes = len(rule_tokens), {size_class}
+            elif len(rule_tokens) == best_size:
+                best_classes.add(size_class)
+        if not best_classes:
+            return "none", None
+        return ("rule", next(iter(best_classes))) if len(best_classes) == 1 else ("ambiguous", None)
+
+    def resolve_class_rule(self, value: str) -> str | None:
+        status, size_class = self.class_rule_for(value)
+        return size_class if status == "rule" else None
+
+    def class_rule_problem(self, car: str | None, size_class: str) -> dict | None:
+        """Класс из прайса для модели автомобиля обязателен: модель и клиент его не меняют."""
+        if not car:
+            return None
+        status, required = self.class_rule_for(car)
+        if status == "ambiguous":
+            return _failure("По правилам прайса этот автомобиль подходит к нескольким классам. "
+                            "Уточните модель и кузов клиента.", code="class_rule_ambiguous")
+        if status == "rule" and required != size_class:
+            return _failure(f"По правилам прайса для этого автомобиля класс «{required}». "
+                            f"Используйте его и не меняйте класс по просьбе клиента.",
+                            code="class_rule_mismatch", required_class=required)
+        return None
 
     # ---- тариф = сумма цен ДОСТУПНЫХ услуг из состава минус скидка
     def tariff_quote(self, tariff: Tariff, size_class: str) -> dict | None:
@@ -565,11 +604,15 @@ class Store:
         data["currency"] = self.config.currency
         return data
 
-    def calculate_price(self, size_class: str, tariff: str | None, services: list[str], *, fresh: bool = False) -> dict:
+    def calculate_price(self, size_class: str, tariff: str | None, services: list[str], *,
+                        fresh: bool = False, car: str | None = None) -> dict:
         catalog = self.get_catalog(fresh=fresh)
         matched_class = catalog.match_class(size_class)
         if not matched_class:
             return _failure("Неизвестный класс автомобиля", size_classes=catalog.size_classes)
+        problem = catalog.class_rule_problem(car, matched_class)
+        if problem:
+            return problem
         result = catalog.quote(matched_class, tariff, services)
         result["currency"] = self.config.currency
         return result
@@ -703,6 +746,9 @@ class Store:
             matched_class = catalog.match_class(size_class)
             if not matched_class:
                 return _failure("Неизвестный класс автомобиля", size_classes=catalog.size_classes)
+            problem = catalog.class_rule_problem(car, matched_class)
+            if problem:
+                return problem
             quote = catalog.quote(matched_class, tariff, services)
             if not quote["ok"]:
                 return quote

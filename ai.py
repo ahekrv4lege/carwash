@@ -960,6 +960,11 @@ car — слова клиента с исходной цитатой; car_model 
             fields += ["tariff", "services"]
         return {**{field_name: facts[field_name] for field_name in fields if field_name in facts and field_name not in guessed}, **args}
 
+    def _customer_car(self, user) -> str:
+        """Только подтверждённый автомобиль клиента: предположительные значения не влияют на класс."""
+        facts = self._state[user.id].get("facts", {})
+        return facts.get("car_model") or facts.get("car") or ""
+
     def _quote_state(self, quote):
         return {**{field_name: quote[field_name] for field_name in ("total", "currency", "lines")},
                 "checked_at": self.store.now().isoformat(timespec="seconds")}
@@ -1564,6 +1569,8 @@ car — слова клиента с исходной цитатой; car_model 
                         raise ValueError
                 elif not isinstance(value, str) or len(value) > 500:
                     raise ValueError
+            if name == "calculate_price":
+                args["car"] = self._customer_car(user)  # Python-side car for class rules; not a model argument
             if name == "create_booking":
                 args = self._booking_args(args, user)
         except (ValueError, TypeError, RecursionError) as error:
@@ -1649,7 +1656,8 @@ car — слова клиента с исходной цитатой; car_model 
             args = dict(args, date=booking_date.isoformat(), time=booking_time)
             def preview():
                 with self.store.fresh_tables():
-                    quote = self.store.calculate_price(args["size_class"], args.get("tariff"), args.get("services", []), fresh=True)
+                    quote = self.store.calculate_price(args["size_class"], args.get("tariff"), args.get("services", []),
+                                                       fresh=True, car=args.get("car") or None)
                     slots = self.store.free_slots(args["date"]) if quote.get("ok") else {}
                     return quote, slots
             quote, slots = await asyncio.to_thread(preview)
@@ -1803,7 +1811,8 @@ car — слова клиента с исходной цитатой; car_model 
 
         if name == "calculate_price":
             return await asyncio.to_thread(
-                store.calculate_price, arguments.get("size_class", ""), arguments.get("tariff"), _service_names(arguments.get("services"))
+                store.calculate_price, arguments.get("size_class", ""), arguments.get("tariff"), _service_names(arguments.get("services")),
+                car=arguments.get("car") or None,
             )
 
         if name == "get_free_slots":
