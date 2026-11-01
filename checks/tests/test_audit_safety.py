@@ -1,10 +1,20 @@
 """Регрессии независимого аудита; только синтетические таблицы."""
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from adaptive import AdaptiveSheets, MappingError, atomic_json
 from tests.fakes import fixture, booking, Worksheet
+
+
+def _called_from_adaptive_create() -> bool:
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_code.co_name == "create" and frame.f_code.co_filename.endswith("adaptive.py"):
+            return True
+        frame = frame.f_back
+    return False
 
 
 class AuditSafetyTests(unittest.TestCase):
@@ -226,13 +236,10 @@ class AuditSafetyTests(unittest.TestCase):
     def test_late_booking_edit_is_detected_on_final_read(self):
         self.store.create_booking(**booking())
         original = self.worksheet.get_all_values
-        calls = 0
         def conflict(value_render_option=None, **kwargs):
-            nonlocal calls
-            if value_render_option == "FORMULA":
-                calls += 1
-                if calls == 2:
-                    self.worksheet.values[1][0] = "999"
+            # Правка именно на финальном чтении create перед записью (вызов из adaptive.create).
+            if _called_from_adaptive_create() and not self.worksheet.writes[1:]:
+                self.worksheet.values[1][0] = "999"
             return original(value_render_option=value_render_option, **kwargs)
         with patch.object(self.worksheet, "get_all_values", side_effect=conflict), self.assertRaises(MappingError):
             self.store.create_booking(**booking(telegram_id=222, car="Another"))

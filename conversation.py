@@ -91,7 +91,8 @@ def source_date(source, now, embedded=False):
         if day_time:
             return source_date(day_time[1], now)
         month_names = "|".join(month + r"\w*" for month in months)
-        dates = re.findall(rf"\b(?:сегодня|завтра|послезавтра|{pattern}|\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}\.\d{{1,2}}(?:\.\d{{4}})?|\d{{1,2}}(?:-?го)?\s+(?:{month_names})(?:\s+\d{{4}})?)\b", text)
+        # В середине фразы dd.m без двузначного месяца — это чаще объём двигателя («3.5», «2.0»), а не дата.
+        dates = re.findall(rf"\b(?:сегодня|завтра|послезавтра|{pattern}|\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}\.\d{{2}}(?:\.\d{{4}})?|\d{{1,2}}(?:-?го)?\s+(?:{month_names})(?:\s+\d{{4}})?)\b", text)
         dates = [value for value in dates if source_date(value, now) is not None]
         return source_date(dates[0], now) if len(dates) == 1 else None
     weekday = re.fullmatch(rf"(?:в |во )?({pattern})", text)
@@ -158,6 +159,23 @@ def literal_car_patch(patch, text):
     return result
 
 
+def inflection_grounded(value, source) -> bool:
+    """Каждое слово значения есть в цитате клиента с точностью до падежа.
+
+    «мойка кузова» и «мойку кузова» — одно и то же: совпадают первые 4 буквы слов.
+    Короткие слова (до 4 букв) должны совпасть целиком. Пустое значение — не основание.
+    """
+    words = re.findall(r"[а-яёa-z0-9]+", folded(value or ""))
+    source_words = re.findall(r"[а-яёa-z0-9]+", folded(source or ""))
+    if not words or not source_words:
+        return False
+    for word in words:
+        stem = word[:4] if len(word) >= 5 else word
+        if not any((other[:4] if len(word) >= 5 else other) == stem for other in source_words):
+            return False
+    return True
+
+
 def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
     if not isinstance(patch, dict) or set(patch) - FIELDS:
         raise ValueError("invalid_fact_fields")
@@ -209,8 +227,8 @@ def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
                 previous = known.get(field, []) if field == "services" else [known.get(field, "")]
                 carried = any(folded(raw) == folded(field_value) for field_value in previous)
                 origin = grounded.get("car" if field == "size_class" else "requested_service", "")
-                inferred = origin and folded(origin) in folded(source)
-                if len(matches) != 1 or not (carried or inferred) and folded(matches[0]) not in folded(source):
+                inferred = origin and (folded(origin) in folded(source) or inflection_grounded(origin, source))
+                if len(matches) != 1 or not (carried or inferred) and not inflection_grounded(matches[0], source):
                     raise ValueError("unverified_catalog_value")
                 canonical.append(matches[0])
             value = list(dict.fromkeys(canonical)) if field == "services" else canonical[0]
@@ -228,7 +246,7 @@ def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
             value = parse_time(value)
             if not value or value != source_time(source, embedded=True):
                 raise ValueError("invalid_time_source")
-        elif folded(value) not in folded(source):
+        elif folded(value) not in folded(source) and not (field == "requested_service" and inflection_grounded(value, source)):
             raise ValueError("invented_customer_fact")
         result[field] = value
     return result

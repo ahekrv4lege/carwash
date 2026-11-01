@@ -1605,7 +1605,9 @@ class AdaptiveSheets:
             journal_path, journal = self._journal()
             if key in journal:
                 raise MappingError("Такая операция уже выполнена или ожидает ручной сверки; повтор заблокирован")
-            values = worksheet.get_all_values(value_render_option="FORMULA", date_time_render_option="FORMATTED_STRING")
+            # Сравниваем в том же режиме, что и таблица (FORMATTED_VALUE): в FORMULA телефон «+7…»,
+            # в отображении «7…», и любая сверка ложно видит «строки изменились».
+            values = worksheet.get_all_values(value_render_option="FORMATTED_VALUE")
             if rule.get("date_source") and self._date_source(rule, values, worksheet.title) != date_value(data["дата"]):
                 raise MappingError("Дата области изменилась непосредственно перед записью")
             if expected_bookings is not None:
@@ -1691,7 +1693,8 @@ class AdaptiveSheets:
             if self._typed_formulas(rule["sheet_id"], worksheet.title, candidates):
                 raise MappingError("Формула в строке записи; отмена заблокирована")
             row_rule = {**rule, "first_data_row": 1, "end_row": 1, "date_source": None}
-            candidates = self._extract_records(row_rule, raw, worksheet.title)
+            shown = worksheet.get(f"A{row}:{cell_name(row, max(rule['columns'].values()))}", value_render_option="FORMATTED_VALUE")
+            candidates = self._extract_records(row_rule, shown, worksheet.title)
             if len(candidates) != 1 or any(candidates[0].get(field) != current.get(field) for field in rule["columns"]):
                 raise MappingError("Строка записи перемещена или изменена; отмена заблокирована")
             journal_path, journal = self._journal()
@@ -1879,7 +1882,8 @@ class AdaptiveSheets:
             if self._typed_formulas(rule["sheet_id"], worksheet.title, formulas):
                 raise MappingError("В строке записи есть формула; перенос заблокирован")
             row_rule = {**rule, "first_data_row": 1, "end_row": 1, "date_source": None}
-            candidates = self._extract_records(row_rule, raw, worksheet.title)
+            shown = worksheet.get(f"A{row}:{cell_name(row, max(rule['columns'].values()))}", value_render_option="FORMATTED_VALUE")
+            candidates = self._extract_records(row_rule, shown, worksheet.title)
             if len(candidates) != 1 or any(candidates[0].get(field) != record.get(field) for field in rule["columns"]):
                 raise MappingError("Строка записи перемещена или изменена; перенос заблокирован")
             date = datetime.strptime(new_date, "%Y-%m-%d")

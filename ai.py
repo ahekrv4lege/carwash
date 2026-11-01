@@ -189,6 +189,18 @@ _HYPOTHETICAL = re.compile(
     r"коллег\w*|знаком\w*|сосед\w*|начальник\w*)\b", re.I)
 
 
+_BARE_HOUR = re.compile(r"\bна\s+(?:час|один|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять|одиннадцать|двенадцать|[1-9]|1[0-2])\b(?![:.]\d)", re.I)
+
+
+def hour_without_minutes(text: str) -> bool:
+    """«на 12» без минут может быть полночью или полднем; «на 12:00» — уже точное время.
+
+    Регулярка не должна срабатывать на часть времени: иначе «на 12:00» уходит в уточнение
+    «утро или вечер» (найдено живым прогоном).
+    """
+    return bool(_BARE_HOUR.search(text or ""))
+
+
 def car_ownership(text: str, quote: str | None = None) -> bool:
     """Клиент говорит о своём автомобиле («у меня камри», «моя машина»), а не о чужом или примере.
 
@@ -578,7 +590,7 @@ car — слова клиента с исходной цитатой; car_model 
                     hour = 0
                 apply_patch(state, {"time": f"{hour:02d}:{ambiguous_time[3:]}"}, {})
                 state.pop("ambiguous_time", None)
-            elif re.search(r"\bна\s+(?:час|один|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять|одиннадцать|двенадцать|[1-9]|1[0-2])\b", text, re.I) and not period:
+            elif hour_without_minutes(text) and not period:
                 clock = source_time(text, True)
                 if clock:
                     state["ambiguous_time"] = clock
@@ -665,6 +677,7 @@ car — слова клиента с исходной цитатой; car_model 
                     answer = await self._proofread(answer)
                 if user.id not in self._pending:
                     problem = (leak_reason(answer) or safe_claim(answer)
+                               or ("stale_offer" if "Подтвердить»" in answer and user.id not in self._pending else None)
                                or ("unverified_availability" if self._unverified_availability(user.id, answer, availability_before) else None)
                                or ("unverified_price" if re.search(rf"\d+\s*(?:{re.escape(self.config.currency)}|руб)", answer)
                                    and not self._price_verified(user.id) else None)
