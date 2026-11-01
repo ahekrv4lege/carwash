@@ -1949,7 +1949,11 @@ car — слова клиента с исходной цитатой; car_model 
             result = await asyncio.to_thread(store.reschedule_booking, arguments["booking_id"], user.id,
                                             arguments["date"], arguments["time"], expected_booking=expected)
             if result.get("ok") and self.reporter:
-                await self._notify(f"Запись #{result['booking_id']} перенесена на {result['date']} в {result['time']}", user)
+                text = f"Запись #{result['booking_id']} перенесена на {result['date']} в {result['time']}"
+                if result.get("grid_released") is False:
+                    text += ("\nВнимание: старое место в сетке постов не освободилось автоматически; "
+                             "проверьте таблицу")
+                await self._notify(text, user)
             return result
 
         return {"ok": False, "error": f"Неизвестный инструмент: {name}"}

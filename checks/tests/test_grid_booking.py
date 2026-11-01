@@ -7,7 +7,9 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
+import adaptive
 from adaptive import MappingError
 from sheets import FreeCapacity
 from tests.fakes import Worksheet, booking, fixture
@@ -183,6 +185,153 @@ class GridBookingTests(unittest.TestCase):
     def test_capacity_helper_treats_grid_counts_as_free_counts(self):
         slots = {("2099-01-01", "10:00"): FreeCapacity(1)}
         self.assertEqual(self.store._capacity_left(slots, {("2099-01-01", "10:00"): 5}, ("2099-01-01", "10:00")), 1)
+    # ---- отказы на промежуточных шагах: клетка и журнал не должны терять доказательства
+
+    def fail_after_apply(self, worksheet, matches=lambda updates: True):
+        """Первый подходящий batch_update применяется, затем ответ теряется."""
+        original = worksheet.batch_update
+
+        def wrapped(updates, value_input_option=None):
+            if matches(updates):
+                worksheet.batch_update = original
+                original(updates, value_input_option=value_input_option)
+                raise OSError("response lost after apply")
+            return original(updates, value_input_option=value_input_option)
+
+        worksheet.batch_update = wrapped
+        return original
+
+    def journal_writer(self, fail_at):
+        calls = []
+
+        def write(path, data):
+            if str(path).endswith("-operations.json"):
+                calls.append(path)
+                if len(calls) == fail_at:
+                    raise OSError("journal write failed")
+            return real_atomic_json(path, data)
+
+        real_atomic_json = adaptive.atomic_json
+        return write
+
+    def test_claim_failure_before_write_keeps_no_marker_and_blocks_retry(self):
+        self.grid.fail_write = True
+        with self.assertRaises(OSError):
+            self.store.create_booking(**booking())
+        self.assertEqual(self.cell(2, 2), "")
+        self.assertEqual(len(self.bookings().values), 1)
+        # Журнал уже записан до занятия клетки: повтор требует ручной сверки.
+        with self.assertRaisesRegex(MappingError, "повтор заблокирован"):
+            self.store.create_booking(**booking())
+
+    def test_claim_failure_after_write_keeps_marker_and_blocks_retry(self):
+        self.fail_after_apply(self.grid)
+        with self.assertRaises(OSError):
+            self.store.create_booking(**booking())
+        self.assertTrue(self.cell(2, 2).startswith("Запись "))
+        self.assertEqual(len(self.bookings().values), 1)
+        with self.assertRaisesRegex(MappingError, "повтор заблокирован"):
+            self.store.create_booking(**booking())
+
+    def test_journal_failure_before_claim_leaves_no_marker_and_allows_retry(self):
+        with patch.object(adaptive, "atomic_json", side_effect=self.journal_writer(1)):
+            with self.assertRaises(OSError):
+                self.store.create_booking(**booking())
+        self.assertEqual(self.cell(2, 2), "")
+        self.assertEqual(len(self.bookings().values), 1)
+        self.assertTrue(self.store.create_booking(**booking())["ok"])
+
+    def test_journal_failure_after_confirmed_row_is_not_reported_as_failure(self):
+        with patch.object(adaptive, "atomic_json", side_effect=self.journal_writer(2)):
+            result = self.store.create_booking(**booking())
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(self.cell(2, 2).startswith(f"Запись {result['booking_id']}"))
+        self.assertEqual(len(self.bookings().values), 2)
+
+    def test_reschedule_claim_failure_after_write_keeps_original_row_and_blocks_retry(self):
+        created = self.store.create_booking(**booking())
+        self.fail_after_apply(self.grid)
+        with self.assertRaises(OSError):
+            self.store.reschedule_booking(created["booking_id"], 111, "2099-01-01", "11:00")
+        self.assertEqual(self.cell(2, 2), f"Запись {created['booking_id']}")
+        self.assertEqual(self.cell(3, 2), f"Запись {created['booking_id']}")
+        self.assertEqual(self.bookings().values[1][3], "10:00")
+        with self.assertRaisesRegex(MappingError, "ручная сверка"):
+            self.store.reschedule_booking(created["booking_id"], 111, "2099-01-01", "11:00")
+
+    def test_reschedule_row_failure_before_write_keeps_original_and_blocks_retry(self):
+        created = self.store.create_booking(**booking())
+        self.bookings().fail_write = True
+        with self.assertRaisesRegex(MappingError, "неизвестен"):
+            self.store.reschedule_booking(created["booking_id"], 111, "2099-01-01", "11:00")
+        self.assertEqual(self.bookings().values[1][3], "10:00")
+        self.assertEqual(self.cell(2, 2), f"Запись {created['booking_id']}")
+        self.assertEqual(self.cell(3, 2), f"Запись {created['booking_id']}")
+        with self.assertRaisesRegex(MappingError, "ручная сверка"):
+            self.store.reschedule_booking(created["booking_id"], 111, "2099-01-01", "11:00")
+
+    def test_reschedule_old_bay_release_failure_keeps_moved_row_and_old_marker(self):
+        created = self.store.create_booking(**booking())
+        original = self.grid.batch_update
+
+        def fail_clear(updates, value_input_option=None):
+            if updates == [{"range": "B2", "values": [[""]]}]:
+                raise OSError("release failed")
+            return original(updates, value_input_option=value_input_option)
+
+        self.grid.batch_update = fail_clear
+        moved = self.store.reschedule_booking(created["booking_id"], 111, "2099-01-01", "11:00")
+        self.assertTrue(moved["ok"], moved)
+        self.assertIs(moved.get("grid_released"), False)  # администратор увидит предупреждение
+        self.assertEqual(self.bookings().values[1][3], "11:00")
+        self.assertEqual(self.cell(3, 2), f"Запись {created['booking_id']}")
+        self.assertEqual(self.cell(2, 2), f"Запись {created['booking_id']}")  # остаётся до ручной сверки
+
+    def test_cancel_status_failure_before_write_keeps_active_row_and_retries(self):
+        created = self.store.create_booking(**booking())
+        self.bookings().fail_write = True
+        with self.assertRaisesRegex(MappingError, "неизвестен"):
+            self.store.cancel_booking(created["booking_id"], 111)
+        self.assertEqual(self.bookings().values[1][-1], "Новая")
+        self.assertEqual(self.cell(2, 2), f"Запись {created['booking_id']}")
+        self.bookings().fail_write = False
+        cancelled = self.store.cancel_booking(created["booking_id"], 111)
+        self.assertTrue(cancelled["ok"], cancelled)
+        self.assertEqual(self.bookings().values[1][-1], "Отмена")
+        self.assertEqual(self.cell(2, 2), "")
+
+    def test_cancel_status_landed_before_error_is_reconciled(self):
+        created = self.store.create_booking(**booking())
+        self.fail_after_apply(self.bookings())
+        cancelled = self.store.cancel_booking(created["booking_id"], 111)
+        self.assertTrue(cancelled["ok"], cancelled)
+        self.assertIn("слот освобождён", cancelled["message"])
+        self.assertEqual(self.bookings().values[1][-1], "Отмена")
+        self.assertEqual(self.cell(2, 2), "")
+
+    def test_cancel_release_landed_before_error_is_reported_as_released(self):
+        created = self.store.create_booking(**booking())
+        self.fail_after_apply(self.grid, lambda updates: updates == [{"range": "B2", "values": [[""]]}])
+        cancelled = self.store.cancel_booking(created["booking_id"], 111)
+        self.assertTrue(cancelled["ok"], cancelled)
+        self.assertIn("слот освобождён", cancelled["message"])
+        self.assertEqual(self.cell(2, 2), "")
+
+    def test_cancel_release_failure_keeps_marker_and_warns(self):
+        created = self.store.create_booking(**booking())
+        original = self.grid.batch_update
+
+        def fail_clear(updates, value_input_option=None):
+            if updates == [{"range": "B2", "values": [[""]]}]:
+                raise OSError("release failed")
+            return original(updates, value_input_option=value_input_option)
+
+        self.grid.batch_update = fail_clear
+        cancelled = self.store.cancel_booking(created["booking_id"], 111)
+        self.assertTrue(cancelled["ok"], cancelled)
+        self.assertIn("не освобождено автоматически", cancelled["message"])
+        self.assertEqual(self.cell(2, 2), f"Запись {created['booking_id']}")
+
 
 
 if __name__ == "__main__":

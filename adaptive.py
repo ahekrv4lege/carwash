@@ -1053,7 +1053,15 @@ class AdaptiveSheets:
         value = current[0][0] if current and current[0] else ""
         if str(value).strip() != claim["marker"]:
             return False  # клетку уже изменили вручную: её не трогаем
-        worksheet.batch_update([{"range": cell, "values": [[""]]}], value_input_option="RAW")
+        try:
+            worksheet.batch_update([{"range": cell, "values": [[""]]}], value_input_option="RAW")
+        except Exception:
+            # Неизвестный результат: проверяем фактическую клетку, а не угадываем.
+            current = worksheet.get(f"{cell}:{cell}", value_render_option="FORMULA")
+            value = current[0][0] if current and current[0] else ""
+            if str(value).strip() == claim["marker"]:
+                raise
+            return True
         return True
 
     def _grid_release_by_booking(self, rule: dict, time_text: str, booking_id: str) -> bool:
@@ -1135,12 +1143,27 @@ class AdaptiveSheets:
                     hour, minute = map(int, value.split(":"))
                     value = (hour * 60 + minute) / 1440
                 updates.append({"range": cell_name(row, column), "values": [[value]]})
-            claim = None
             grid_rules = self._grid_rules(data["дата"])
-            if grid_rules:
-                claim = self._grid_claim(grid_rules[0], data["дата"], data["время"], f"Запись {data['id']}")
+            # Журнал пишем до занятия клетки: сбой между занятием и журналом оставлял бы
+            # маркер без записи и без доказательства для ручной сверки.
             journal[key] = {"state": "pending", "sheet_id": rule["sheet_id"], "row": row, "at": time.time()}
             atomic_json(journal_path, journal)
+            if grid_rules:
+                try:
+                    self._grid_claim(grid_rules[0], data["дата"], data["время"], f"Запись {data['id']}")
+                except MappingError:
+                    # Ошибка до записи клетки (нет времени/поста, неоднозначная сетка):
+                    # операции нет, повтор разрешён.
+                    journal.pop(key, None)
+                    try:
+                        atomic_json(journal_path, journal)
+                    except Exception:
+                        log.warning("Не удалось очистить журнал после отказа сетки")
+                    raise
+                except Exception:
+                    # Результат занятия клетки неизвестен: возможный маркер и журнал
+                    # сохраняем, повтор блокируется до ручной сверки.
+                    raise
             try:
                 worksheet.batch_update(updates, value_input_option="RAW")
             except Exception:
@@ -1149,7 +1172,11 @@ class AdaptiveSheets:
                 if self._booking_row_state(rule, row, {"ID": data["id"]}) is not True:
                     raise MappingError("Результат записи неизвестен. Проверьте Sheets и локальный журнал перед повтором") from None
             journal[key]["state"] = "done"
-            atomic_json(journal_path, journal)
+            try:
+                atomic_json(journal_path, journal)
+            except Exception:
+                # Строка уже подтверждена; сбой журнала не должен превращать успех в отказ.
+                log.warning("Журнал операций не обновлён после подтверждённой записи")
 
     def cancel(self, record: dict, telegram_id: int) -> None:
         with self.lock:
@@ -1175,8 +1202,13 @@ class AdaptiveSheets:
                 raise MappingError("Строка записи перемещена или изменена; отмена заблокирована")
             journal_path, journal = self._journal()
             grid_rules = self._grid_rules(current["Дата"]) if current.get("Дата") else []
-            worksheet.batch_update([{"range": cell_name(row, rule["columns"]["Статус"]),
-                              "values": [[rule["write_statuses"]["cancelled"]]]}], value_input_option="RAW")
+            try:
+                worksheet.batch_update([{"range": cell_name(row, rule["columns"]["Статус"]),
+                                  "values": [[rule["write_statuses"]["cancelled"]]]}], value_input_option="RAW")
+            except Exception:
+                # Ответ потерян: успех подтверждаем фактическим статусом строки.
+                if self._booking_row_state(rule, row, {"Статус": rule["write_statuses"]["cancelled"]}) is not True:
+                    raise MappingError("Результат отмены неизвестен. Проверьте таблицу перед повтором") from None
             grid_released = None
             if grid_rules:
                 try:
@@ -1188,7 +1220,10 @@ class AdaptiveSheets:
                           for field_name in ("Telegram ID", "Дата", "Время", "Автомобиль")})
             if journal.get(key, {}).get("state") == "done":
                 del journal[key]
-                atomic_json(journal_path, journal)
+                try:
+                    atomic_json(journal_path, journal)
+                except Exception:
+                    log.warning("Журнал операций не обновлён после подтверждённой отмены")
             return grid_released
 
     def validate_reschedule(self, record: dict, new_date: str) -> dict:
@@ -1242,9 +1277,23 @@ class AdaptiveSheets:
             new_day = date.strftime("%d.%m.%Y")
             new_grid = self._grid_rules(new_day)
             old_grid = self._grid_rules(record["Дата"]) if record.get("Дата") else []
-            claim = self._grid_claim(new_grid[0], new_day, new_time, f"Запись {record['ID']}") if new_grid else None
+            # Журнал до занятия клетки: иначе сбой между ними оставлял бы маркер без следа.
             journal[key] = {"state": "pending", "sheet_id": rule["sheet_id"], "row": row, "at": time.time()}
             atomic_json(path, journal)
+            if new_grid:
+                try:
+                    self._grid_claim(new_grid[0], new_day, new_time, f"Запись {record['ID']}")
+                except MappingError:
+                    # Ошибка до записи клетки: операция не началась, повтор разрешён.
+                    journal.pop(key, None)
+                    try:
+                        atomic_json(path, journal)
+                    except Exception:
+                        log.warning("Не удалось очистить журнал после отказа сетки при переносе")
+                    raise
+                except Exception:
+                    # Результат занятия клетки неизвестен: журнал и возможный маркер сохраняем.
+                    raise
             try:
                 worksheet.batch_update(updates, value_input_option="RAW")
             except Exception:
@@ -1265,5 +1314,9 @@ class AdaptiveSheets:
                                     for field in ("Telegram ID", "Дата", "Время", "Автомобиль")})
             if journal.get(original, {}).get("state") == "done":
                 journal.pop(original)
-            atomic_json(path, journal)
+            try:
+                atomic_json(path, journal)
+            except Exception:
+                # Перенос уже подтверждён строкой; сбой журнала не делает его неуспешным.
+                log.warning("Журнал операций не обновлён после подтверждённого переноса")
             return grid_released

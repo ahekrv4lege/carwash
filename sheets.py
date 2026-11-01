@@ -1134,7 +1134,7 @@ class Store:
             result["user_no"] = user_no
             if self._adaptive:
                 try:
-                    self._adaptive.reschedule(record, telegram_id, new_date.isoformat(), new_time)
+                    result["grid_released"] = self._adaptive.reschedule(record, telegram_id, new_date.isoformat(), new_time)
                 except SlotUnavailable as error:
                     return _failure(f"{error}. Исходная запись сохранена", free_times_that_day=self._free_times(new_date, slots, busy))
             else:
