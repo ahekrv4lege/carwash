@@ -1,5 +1,6 @@
 from copy import deepcopy
 from dataclasses import replace
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -345,6 +346,16 @@ class AdaptiveTests(unittest.TestCase):
             self.a.table("bookings")
         self.a.refresh(validate=True)
         self.assertFalse(self.rule()["validation"]["write"])
+
+    def test_manual_edit_detected_when_filesystem_mtime_does_not_change(self):
+        # Coarse filesystem clocks (ext4 on the VPS) can give two rewrites the same mtime_ns.
+        self.a.refresh()
+        before = self.a.path.stat()
+        self.rule()["columns"]["Имя"] = 100
+        self.save()
+        os.utime(self.a.path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        with self.assertRaises(MappingError):
+            self.a.table("bookings")
 
     def test_schema_discovery_uses_batch_reads(self):
         self.a.refresh()

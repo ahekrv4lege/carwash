@@ -139,6 +139,16 @@ def rule_signature(rule: dict) -> str:
                    if field_name not in {"structure", "fingerprint", "validation", "last_changes", "validated_rule"}})
 
 
+def file_stamp(path: Path) -> tuple | None:
+    """Stamp for cache invalidation. Atomic replace always changes the inode, so this
+    detects rewrites even when a coarse filesystem clock gives the same mtime."""
+    try:
+        status = path.stat()
+    except FileNotFoundError:
+        return None
+    return (status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns)
+
+
 def atomic_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     file_descriptor, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
@@ -306,17 +316,17 @@ class AdaptiveSheets:
         self.path = Path(config.sheets_mapping_file)
         self.lock = threading.RLock()
         self.document = None
-        self.mtime = None
+        self.stamp = None
         self.force_pending = config.sheets_force_schema_refresh
         self.worksheets = {}
         self.read_versions = {}
         self.expected = {role: getattr(config, f"sheet_{role}") for role in ROLE_FIELDS}
 
     def _load(self) -> None:
-        mtime = self.path.stat().st_mtime_ns if self.path.exists() else None
-        if self.document is not None and mtime == self.mtime:
+        stamp = file_stamp(self.path)
+        if self.document is not None and stamp == self.stamp:
             return
-        if mtime is None:
+        if stamp is None:
             self.document = None
             return
         try:
@@ -341,11 +351,11 @@ class AdaptiveSheets:
         if document.get("engine_revision") != ENGINE_REVISION:
             self.force_pending = True
         self._summarize()
-        self.mtime = mtime
+        self.stamp = stamp
 
     def _save(self) -> None:
         atomic_json(self.path, self.document)
-        self.mtime = self.path.stat().st_mtime_ns
+        self.stamp = file_stamp(self.path)
 
     def _worksheet(self, sheet_id: int):
         if sheet_id not in self.worksheets:
