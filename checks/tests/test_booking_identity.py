@@ -280,6 +280,25 @@ class IdentityTests(unittest.TestCase):
         cancelled = self.store.cancel_booking("701", 111)
         self.assertTrue(cancelled["ok"], cancelled)
 
+    def test_archive_marks_permuted_status_column_by_name(self):
+        # При переставленной шапке архивация пишет «Архив» в колонку «Статус» по имени,
+        # остальные данные строки не затрагивает.
+        order = [STATUS, DATE, ID] + [index for index in range(len(HEADERS)) if index not in {STATUS, DATE, ID}]
+        shuffled_headers = [HEADERS[index] for index in order]
+        def line(item_id, date_str, status):
+            values = row(item_id, date_str, "18:00", status=status)
+            return [values[index] for index in order]
+        self.sheet.values = [shuffled_headers, line("1", "01.01.2024", "Новая"),
+                             line("2", "01.01.2024", "Отмена"), line("3", "01.01.2099", "Новая")]
+        self.assertEqual(self.store.archive_old_bookings(), 1)
+        status_index = shuffled_headers.index("Статус")
+        self.assertEqual(str(self.sheet.values[1][status_index]), "Архив")
+        self.assertEqual(str(self.sheet.values[2][status_index]), "Отмена")
+        self.assertEqual(str(self.sheet.values[3][status_index]), "Новая")
+        identity_index = shuffled_headers.index("ID")
+        for row_number, item_id in zip((1, 2, 3), ("1", "2", "3")):
+            self.assertEqual(str(self.sheet.values[row_number][identity_index]), item_id)
+
     # ---------- конкуренция и повторы ----------
 
     def test_concurrent_creation_gets_unique_ids(self):

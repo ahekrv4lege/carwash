@@ -1362,7 +1362,13 @@ class Store:
             worksheet.format(ranges, {"backgroundColor": {"red": color[0], "green": color[1], "blue": color[2]}})
 
     def archive_old_bookings(self) -> int:
-        """Прошедшие даты со статусом «Новая» помечаем «Архив»."""
+        """Прошедшие даты со статусом «Новая» помечаем «Архив».
+
+        Колонку «Статус» берём из карты адаптива (rule["columns"]) — это физический
+        адрес колонки листа. Позиция в каноническом списке полей (headers.index)
+        с физикой не совпадает при перестановке колонок и направила бы «Архив»
+        в чужое поле. Остальные данные строки не затрагиваются.
+        """
         from adaptive import cell_name
 
         today = self.now().date()
@@ -1370,18 +1376,31 @@ class Store:
             headers, rows = self._table(self.config.sheet_bookings)
             if not rows or "Статус" not in headers:
                 return 0
-            status_col = headers.index("Статус") + 1
-            worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
-            updates, cells = [], []
+            candidates = []
             for record in rows:
                 booking_date = parse_date(str(record.get("Дата", "")))
                 status = str(record.get("Статус", "")).strip()
                 if (booking_date and booking_date < today
                         and (not status or status.lower().startswith("нов"))):
-                    updates.append({"range": cell_name(record["__row__"], status_col), "values": [["Архив"]]})
-                    cells.append((record["__row__"], status_col))
-            if not updates:
+                    candidates.append(record)
+            if not candidates:
                 return 0
+            if self._adaptive:
+                status_columns = {}
+                for sheet_id in {record["__sheet_id__"] for record in candidates}:
+                    try:
+                        status_columns[sheet_id] = self._adaptive.writable_column(sheet_id, "Статус")
+                    except MappingError as error:
+                        log.warning("Архивация остановлена: %s", error)
+                        return 0  # статус пишем только в подтверждённую картой колонку
+            else:
+                status_columns = {0: headers.index("Статус") + 1}
+            updates, cells = [], []
+            for record in candidates:
+                column = status_columns[record["__sheet_id__"] if self._adaptive else 0]
+                updates.append({"range": cell_name(record["__row__"], column), "values": [["Архив"]]})
+                cells.append((record["__row__"], column))
+            worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
             try:
                 worksheet.batch_update(updates, value_input_option="RAW")
             except AttributeError:

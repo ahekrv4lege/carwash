@@ -1463,6 +1463,13 @@ class AdaptiveSheets:
             raise MappingError("Запись в выбранную область не разрешена; проверьте mappings")
         return rules[0]
 
+    def writable_column(self, sheet_id: int, field: str) -> int:
+        """Физическая колонка канонического поля области листа (для адресных правок)."""
+        rule = self._target(sheet_id=sheet_id)
+        if field not in rule["columns"]:
+            raise MappingError(f"В области «{rule['sheet_title']}» нет колонки {field}")
+        return int(rule["columns"][field])
+
     def _date_cell_values(self, rule: dict) -> list[list]:
         """Сетка, содержащая только ячейку-источник даты, вместо чтения всего листа."""
         cell = (rule.get("date_source") or {}).get("cell")
