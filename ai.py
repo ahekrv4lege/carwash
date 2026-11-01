@@ -112,7 +112,7 @@ for _n in (4, 5):
 _VEHICLE_BMW[7] += " / i7"
 _VEHICLE_FAMILIES = (
     ("BMW", _VEHICLE_BMW, re.compile(r"\s*(?:series|сери\w*)\b", re.I),
-     tuple((n, re.compile(r"\b(?:bmw|бмв|бвм|беха|бэха|бумв)\s+(?:" + _VEHICLE_NUMBERS[n] + r")\b", re.I)) for n in _VEHICLE_BMW)),
+     tuple((n, re.compile(r"\b(?:bmw|бмв|бвм|беха|бэха|бэмв|бемв|бумв)\s+(?:" + _VEHICLE_NUMBERS[n] + r")\b", re.I)) for n in _VEHICLE_BMW)),
     ("Audi", {n: f"A{n} / Q{n}" for n in (3, 4, 5, 6, 7, 8)}, None,
      tuple((n, re.compile(r"\b(?:audi|ауди)\s+(?:" + _VEHICLE_NUMBERS[n] + r")\b", re.I)) for n in (3, 4, 5, 6, 7, 8))),
     ("Mazda", {3: "Mazda3 / CX-3", 5: "Mazda5 / CX-5"}, None,
@@ -125,15 +125,23 @@ _VEHICLE_FAMILIES = (
 )
 _VEHICLE_SPECIFIC = {str(n): re.compile(r"\b(?:a|q|qx|xc|cx|s|v|x|i|m)[-\s]*" + str(n) + r"\b", re.I)
                      for n in (*range(1, 9), 40, 50, 60, 70, 90)}
+_TOYOTA_CHOICES = {
+    **{word: "Yaris / Yaris Cross" for word in ("yaris", "ярис")},
+    **{word: "Corolla / Corolla Cross" for word in ("corolla", "corola", "королла", "корола", "карола")},
+}
 _VEHICLE_NAMED = (
-    (re.compile(r"(?:mercedes(?:-benz)?|мерседес)\s+([acesаес])(?:-?class|\s+класс)?\b", re.I),
+    (re.compile(r"(?:mercedes(?:-benz)?|мерседес|мерседс|мерс)\s+([acesаес])(?:-?class|\s+класс)?\b", re.I),
      {"a": "A-Class / GLA", "а": "A-Class / GLA", "c": "C-Class / GLC", "с": "C-Class / GLC", "e": "E-Class / GLE", "е": "E-Class / GLE", "s": "S-Class / GLS"},
      re.compile(r"\b(?:gla|glc|gle|gls)\b", re.I)),
     (re.compile(r"(?:citro[eё]n|ситроен|ситро[её]н)\s+c\s*([345])\b", re.I),
      {"3": "C3 / C3 Aircross", "4": "C4 / C4 X", "5": "C5 / C5 Aircross / C5 X"},
      re.compile(r"\b(?:aircross|аиркросс|x|х)\b", re.I)),
-    (re.compile(r"(?:toyota|тойота|та[её]та)\s+(yaris|ярис|corolla|королла)\b", re.I),
-     {"yaris": "Yaris / Yaris Cross", "ярис": "Yaris / Yaris Cross", "corolla": "Corolla / Corolla Cross", "королла": "Corolla / Corolla Cross"},
+    (re.compile(r"(?:toyota|тойота|тайота|тоёта|тоета|та[её]та|таета|тойтота|toyata)\s+(yaris|ярис|corolla|corola|королла|корола|карола)\b", re.I),
+     _TOYOTA_CHOICES,
+     re.compile(r"\b(?:cross|кросс)\b", re.I)),
+    # Модель без марки: «королла», «карола» — тот же выбор Corolla / Corolla Cross.
+    (re.compile(r"\b(corolla|corola|королла|корола|карола|yaris|ярис)\b", re.I),
+     _TOYOTA_CHOICES,
      re.compile(r"\b(?:cross|кросс)\b", re.I)),
     (re.compile(r"(?:mitsubishi|митсубиси)\s+(eclipse|эклипс)\b", re.I),
      {"eclipse": "Eclipse / Eclipse Cross", "эклипс": "Eclipse / Eclipse Cross"},
