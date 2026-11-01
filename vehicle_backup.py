@@ -31,7 +31,9 @@ def _stamp() -> str:
 
 
 def _restrict(path: Path) -> None:
-    os.chmod(path, 0o600)
+    """0o600 на POSIX; на Windows chmod умеет только read-only (и он сломал бы перезапись копии)."""
+    if os.name != "nt":
+        os.chmod(path, 0o600)
 
 
 def backup(source: Path, directory: Path, keep: int) -> Path:
@@ -40,7 +42,11 @@ def backup(source: Path, directory: Path, keep: int) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     destination = directory / f"{BACKUP_PREFIX}{_stamp()}.sqlite3"
     partial = destination.with_suffix(".partial")
-    VehicleDatabase(Path(source)).backup_to(partial)
+    db = VehicleDatabase(Path(source))
+    try:
+        db.backup_to(partial)
+    finally:
+        db.close()  # иначе на Windows база остаётся заблокированной открытым WAL
     _restrict(partial)
     problems = _integrity_problems(partial)
     if problems:

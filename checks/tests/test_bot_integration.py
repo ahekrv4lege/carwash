@@ -190,6 +190,9 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
                  patch("bot.Store", return_value=store), patch("bot.Agent", return_value=agent), \
                  patch("bot.Dispatcher", return_value=dispatcher):
                 await bot.main()
+                # Фоновые задачи уходят в to_thread; на Windows при уборке папки
+                # открытый tmp-файл карты заблокирует удаление — дожидаемся все потоки.
+                await asyncio.get_running_loop().shutdown_default_executor()
             transport.delete_webhook.assert_awaited_once_with(drop_pending_updates=False)
             dispatcher.start_polling.assert_awaited_once_with(transport, close_bot_session=False)
             transport.session.close.assert_awaited_once()

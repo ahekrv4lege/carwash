@@ -459,6 +459,8 @@ class Fallback(unittest.IsolatedAsyncioTestCase):
              patch('bot.Dispatcher', return_value=dispatcher):
             with self.assertRaises(RuntimeError):
                 await bot.main()
+            # Дождаться фоновые to_thread-потоки, иначе на Windows уборка папки упрётся в открытые файлы.
+            await asyncio.get_running_loop().shutdown_default_executor()
         transport.delete_webhook.assert_awaited_once_with(drop_pending_updates=False)
         transport.session.close.assert_awaited_once()
         agent.close.assert_awaited_once()

@@ -53,12 +53,17 @@ class DatabaseTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / "vehicles.sqlite3"
 
+    def open_db(self):
+        db = VehicleDatabase(self.path)
+        self.addCleanup(db.close)  # на Windows открытый WAL держит файл — уборка папки без close() падает
+        return db
+
     def test_database_file_is_not_created_until_first_use(self):
-        VehicleDatabase(self.path)
+        self.open_db()
         self.assertFalse(self.path.exists())
 
     def test_upsert_deduplicates_and_updates_class(self):
-        db = VehicleDatabase(self.path)
+        db = self.open_db()
         first = db.upsert(111, "Toyota Camry 3.5", "Легковой", "2026-01-01 10:00:00")
         second = db.upsert(111, "toyota camry 3,5", "Кроссовер", "2026-01-02 10:00:00")
         self.assertEqual(first.id, second.id)
@@ -66,7 +71,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(len(db.list_active(111)), 1)
 
     def test_unique_index_blocks_raw_duplicate_even_without_python_check(self):
-        db = VehicleDatabase(self.path)
+        db = self.open_db()
         db.upsert(111, "BMW X5", "Кроссовер", "2026-01-01 10:00:00")
         raw = sqlite3.connect(self.path)
         with self.assertRaises(sqlite3.IntegrityError):
@@ -75,13 +80,13 @@ class DatabaseTests(unittest.TestCase):
         raw.close()
 
     def test_limit_per_customer(self):
-        db = VehicleDatabase(self.path)
+        db = self.open_db()
         for number in range(10):
             self.assertIsNotNone(db.upsert(111, f"Car {number}", "Легковой", "2026-01-01 10:00:00"))
         self.assertIsNone(db.upsert(111, "Car 10", "Легковой", "2026-01-01 10:00:00"))
 
     def test_deactivate_checks_owner_and_never_reuses_ids(self):
-        db = VehicleDatabase(self.path)
+        db = self.open_db()
         car = db.upsert(111, "Lada Vesta", "Легковой", "2026-01-01 10:00:00")
         self.assertFalse(db.deactivate(222, car.id, "2026-01-02 10:00:00"))
         self.assertTrue(db.deactivate(111, car.id, "2026-01-02 10:00:00"))
@@ -90,8 +95,8 @@ class DatabaseTests(unittest.TestCase):
         self.assertNotEqual(again.id, car.id)
 
     def test_persists_across_connections(self):
-        VehicleDatabase(self.path).upsert(111, "Toyota Camry 3.5", "Легковой", "2026-01-01 10:00:00")
-        self.assertEqual([c.name for c in VehicleDatabase(self.path).list_active(111)], ["Toyota Camry 3.5"])
+        self.open_db().upsert(111, "Toyota Camry 3.5", "Легковой", "2026-01-01 10:00:00")
+        self.assertEqual([c.name for c in self.open_db().list_active(111)], ["Toyota Camry 3.5"])
 
     def test_newer_schema_is_refused(self):
         raw = sqlite3.connect(self.path)
@@ -99,10 +104,10 @@ class DatabaseTests(unittest.TestCase):
         raw.commit()
         raw.close()
         with self.assertRaises(CarMemoryError):
-            VehicleDatabase(self.path).list_active(111)
+            self.open_db().list_active(111)
 
     def test_backup_is_consistent_while_wal_is_open(self):
-        db = VehicleDatabase(self.path)
+        db = self.open_db()
         db.upsert(111, "Toyota Camry 3.5", "Легковой", "2026-01-01 10:00:00")
         copy = Path(self.temp.name) / "copy.sqlite3"
         db.backup_to(copy)
@@ -169,7 +174,9 @@ class MemoryTests(unittest.TestCase):
         self.clock = Clock()
 
     def new(self, **kwargs):
-        return memory(self.path, clock=self.clock, **kwargs)
+        mem = memory(self.path, clock=self.clock, **kwargs)
+        self.addCleanup(mem.close)
+        return mem
 
     def test_repeated_messages_do_not_read_sqlite_again(self):
         mem = self.new()
@@ -307,16 +314,21 @@ class BackupTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.source = self.root / "live.sqlite3"
-        VehicleDatabase(self.source).upsert(111, "Toyota Camry 3.5", "Легковой", "2026-01-01 10:00:00")
-        VehicleDatabase(self.source).upsert(222, "BMW X5", "Кроссовер", "2026-01-01 10:00:00")
+        source_db = VehicleDatabase(self.source)
+        self.addCleanup(source_db.close)
+        source_db.upsert(111, "Toyota Camry 3.5", "Легковой", "2026-01-01 10:00:00")
+        source_db.upsert(222, "BMW X5", "Кроссовер", "2026-01-01 10:00:00")
 
     def test_backup_is_private_and_restorable(self):
         destination = vehicle_backup.backup(self.source, self.root / "backups", keep=5)
-        self.assertEqual(stat.S_IMODE(os.stat(destination).st_mode), 0o600)
+        if os.name != "nt":  # Windows: chmod меняет только атрибут read-only, режима 0o600 не бывает
+            self.assertEqual(stat.S_IMODE(os.stat(destination).st_mode), 0o600)
         self.assertEqual(vehicle_backup.verify(destination), {"ok": True, "active_vehicles": 2, "customers": 2})
         target = self.root / "restored" / "customer_vehicles.sqlite3"
         vehicle_backup.restore(destination, target, force=False)
-        self.assertEqual([c.name for c in VehicleDatabase(target).list_active(111)], ["Toyota Camry 3.5"])
+        restored = VehicleDatabase(target)
+        self.addCleanup(restored.close)
+        self.assertEqual([c.name for c in restored.list_active(111)], ["Toyota Camry 3.5"])
 
     def test_restore_refuses_to_overwrite_without_force_and_keeps_old_copy_with_force(self):
         destination = vehicle_backup.backup(self.source, self.root / "backups", keep=5)
