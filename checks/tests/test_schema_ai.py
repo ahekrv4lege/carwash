@@ -35,10 +35,10 @@ class UnfamiliarWorkbookTests(unittest.TestCase):
         AI_CALLS.clear()
 
     def patch_model(self, document):
-        def fake_request(config, compact):
+        def fake_request(config, compact, hint=None):
             self.calls.append(compact)
             return document
-        return patch("schema_ai.request_mapping", side_effect=fake_request)
+        return patch("schema_ai._request_mapping", side_effect=fake_request)
 
     def refresh(self, document=None):
         document = document or ai_response([])
@@ -110,13 +110,14 @@ class UnfamiliarWorkbookTests(unittest.TestCase):
         self.assertFalse(doc["writes_enabled"])
 
     def test_repeated_refresh_does_not_call_the_model_again(self):
+        # Модель отвечает только про services: недостающие роли дают одну подсказку.
         self.refresh(ai_response([{"role": "services", "sheet_title": "Услуги", "header_row": 1,
                                    "columns": {"Услуга": "Работа", "Легковой": "Седан",
                                                "Кроссовер": "Кроссовер", "Доступна": "Выполняется"}}]))
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.calls), 2)  # первичный вызов + адресная подсказка
         self.store._adaptive.refresh(force=True)
         self.store._adaptive.refresh()
-        self.assertEqual(len(self.calls), 1)  # структура не менялась — модель не нужна
+        self.assertEqual(len(self.calls), 2)  # структура не менялась — модель больше не нужна
         self.assertGreaterEqual(self.store._adaptive.ai_requests, 1)
 
     def test_ai_disabled_by_config_skips_the_model(self):

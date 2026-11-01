@@ -1119,22 +1119,37 @@ class AdaptiveSheets:
                           "работает детерминированное распознавание")
             log.warning("AI-интерпретация структуры не выполнена (%s)", type(error).__name__)
             return
-        if candidates:
-            self._apply_ai_candidates(candidates, by_id, regions, issues)
+        # До трёх адресных подсказок: модель иногда пропускает обязательную роль.
+        sheet_titles = ", ".join(repr(snapshot["title"]) for snapshot in by_id.values())
+        for _attempt in range(3):
             still_missing = required_roles - {rule["role"] for rule in regions}
-            if still_missing:
-                # Адресная вторая попытка: модель пропустила обязательную роль.
-                try:
-                    import schema_ai
-                    compact = schema_ai.compact_workbook(list(by_id.values()))
-                    reminder = ("В прошлый раз ты не указал области: " + ", ".join(sorted(still_missing))
-                                + ". Проверь ещё раз все листы; если данные позволяют — укажи их.")
-                    retry = schema_ai.request_mapping_with_hint(self.config, compact, reminder)
-                    retry_candidates, retry_issues = schema_ai.normalize_ai_document(retry)
-                    issues.extend(retry_issues)
-                    self._apply_ai_candidates(retry_candidates, by_id, regions, issues)
-                except Exception as error:
-                    issues.append(f"Повторная интерпретация модели недоступна ({type(error).__name__})")
+            if not still_missing:
+                break
+            try:
+                import schema_ai
+                compact = schema_ai.compact_workbook(list(by_id.values()))
+                examples = {
+                    "services": '{"role": "services", "sheet_title": "...", "header_row": 1, '
+                                '"columns": {"Услуга": "<шапка>", "Легковой": "<шапка>"}}',
+                    "tariffs": '{"role": "tariffs", "sheet_title": "...", "header_row": 1, '
+                               '"columns": {"Тариф": "<шапка>", "Состав": "<шапка>", "Скидка %": "<шапка>"}}',
+                    "slots": '{"role": "slots", "sheet_title": "...", "header_row": 1, '
+                             '"columns": {"Дата": "<шапка>", "Время": "<шапка>", "Постов": "<шапка>"}}',
+                    "bookings": '{"role": "bookings", "sheet_title": "...", "header_row": 1, '
+                                '"columns": {"ID": "<шапка>", "Дата": "<шапка>", "Время": "<шапка>", '
+                                '"Telegram ID": "<шапка>", "Статус": "<шапка>"}}',
+                }
+                reminder = ("В книге листы: " + sheet_titles + ". Ты не указал области: "
+                                + ", ".join(sorted(still_missing))
+                                + ". Проверь ещё раз все листы; если данные позволяют — укажи их. Пример формы: "
+                                + "; ".join(examples[role] for role in sorted(still_missing)))
+                retry = schema_ai.request_mapping_with_hint(self.config, compact, reminder)
+                retry_candidates, retry_issues = schema_ai.normalize_ai_document(retry)
+                issues.extend(retry_issues)
+                self._apply_ai_candidates(retry_candidates, by_id, regions, issues)
+            except Exception as error:
+                issues.append(f"Повторная интерпретация модели недоступна ({type(error).__name__})")
+                break
 
     def _summarize(self) -> None:
         self.document["missing_roles"] = sorted(set(ROLE_FIELDS) - {rule["role"] for rule in self.document["regions"]})
