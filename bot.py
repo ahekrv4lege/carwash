@@ -256,6 +256,37 @@ async def cmd_stats(message: Message, command: CommandObject, store: Store) -> N
     await message.answer(text[:TG_LIMIT])
 
 
+@router.message(Command("mycars"))
+async def cmd_mycars(message: Message, agent: Agent) -> None:
+    try:
+        cars = await asyncio.to_thread(agent.cars.for_user, message.from_user.id)
+    except Exception as error:
+        log.warning("Память об автомобилях недоступна (%s)", type(error).__name__)
+        await message.answer("Сохранённые автомобили сейчас недоступны. Попробуйте позже.")
+        return
+    if not cars:
+        await message.answer("Сохранённых автомобилей пока нет. Они появятся после первой подтверждённой записи.")
+        return
+    lines = [f"{number}. {car.name} — {car.size_class}" for number, car in enumerate(cars, 1)]
+    await message.answer("Ваши автомобили:\n" + "\n".join(lines) + "\n\nУдалить: /forgetcar номер")
+
+
+@router.message(Command("forgetcar"))
+async def cmd_forgetcar(message: Message, command: CommandObject, agent: Agent) -> None:
+    arguments = (command.args or "").strip()
+    try:
+        cars = await asyncio.to_thread(agent.cars.for_user, message.from_user.id)
+        if not arguments.isdigit() or not 1 <= int(arguments) <= len(cars):
+            await message.answer("Укажите номер из списка: /mycars, затем /forgetcar номер")
+            return
+        removed = await asyncio.to_thread(agent.cars.forget, message.from_user.id, cars[int(arguments) - 1].id)
+    except Exception as error:
+        log.warning("Автомобиль не удалён из памяти (%s)", type(error).__name__)
+        await message.answer("Не удалось удалить автомобиль. Попробуйте позже.")
+        return
+    await message.answer("Автомобиль удалён из памяти." if removed else "Такого автомобиля уже нет в памяти.")
+
+
 @router.message(Filter.text)
 async def on_text(message: Message, agent: Agent, reporter: AdminReporter, reply_gate: asyncio.Semaphore) -> None:
     await ask_agent(message, agent, reporter, message.text, reply_gate)
@@ -270,6 +301,16 @@ async def maintain_sessions(agent: Agent) -> None:
     while True:
         await asyncio.sleep(60)
         agent.cleanup_sessions()
+
+
+async def maintain_vehicle_cache(agent: Agent) -> None:
+    """Раз в минуту: выгрузка неактивных клиентов из RAM. Данные в SQLite не трогаются."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await asyncio.to_thread(agent.cars.maintenance)
+        except Exception as error:
+            log.warning("Обслуживание кэша автомобилей не выполнено (%s)", type(error).__name__)
 
 
 async def archive_old_bookings(store: Store) -> None:
@@ -294,6 +335,7 @@ async def main() -> None:
     agent = None
     maintenance = None
     archiver = None
+    vehicle_cache = None
     try:
         store = Store(config)
         reporter = AdminReporter(bot, config.admin_chat_id)
@@ -306,13 +348,14 @@ async def main() -> None:
         dispatcher.include_router(router)
         maintenance = asyncio.create_task(maintain_sessions(agent))
         archiver = asyncio.create_task(archive_old_bookings(store))
+        vehicle_cache = asyncio.create_task(maintain_vehicle_cache(agent))
         if config.sheets_adaptive_enabled and config.sheets_discover_on_start:
             await asyncio.to_thread(store.refresh_schema, force=config.sheets_force_schema_refresh)
         await bot.delete_webhook(drop_pending_updates=False)
         log.info("Бот запущен. Модель: %s", config.ai_model if config.ai_enabled else "AI отключён")
         await dispatcher.start_polling(bot, close_bot_session=False)
     finally:
-        for task in (maintenance, archiver):
+        for task in (maintenance, archiver, vehicle_cache):
             if task is not None:
                 task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -320,6 +363,7 @@ async def main() -> None:
         try:
             if agent is not None:
                 await agent.close()
+                agent.cars.close()
         finally:
             await bot.session.close()
 

@@ -141,7 +141,8 @@ def config(path, **kwargs):
                  min_lead_minutes=0, catalog_cache_sec=60, slots_cache_sec=15, max_history=24,
                  sheet_services="Услуги", sheet_tariffs="Тарифы", sheet_slots="Слоты", sheet_bookings="Записи",
                  sheet_classes="Классы",
-                 sheets_adaptive_enabled=True, sheets_mapping_file=str(Path(path) / "mapping.json"))
+                 sheets_adaptive_enabled=True, sheets_mapping_file=str(Path(path) / "mapping.json"),
+                 vehicle_memory_file=str(Path(path) / f"vehicles-{next(_TOKENS)}.sqlite3"))
     return replace(cfg, **kwargs)
 
 

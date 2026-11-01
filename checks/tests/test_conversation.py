@@ -58,7 +58,11 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         return answer
 
     def writes(self):
-        return sum(len(s.writes) for s in self.spreadsheet.sheets)
+        # Строки бронирования. Память об автомобилях хранится в SQLite, не в таблице.
+        return len(self.spreadsheet.worksheet("Записи").writes)
+
+    def other_writes(self):
+        return sum(len(s.writes) for s in self.spreadsheet.sheets if s.title != "Записи")
 
     async def test_display_text_is_metadata_for_reads_and_memory_not_customer_consent(self):
         answer = await self.say("Мой автомобиль раф 4", response(calls=[
@@ -94,6 +98,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.writes(), 0)
         self.assertIn("Записала", await self.confirm())
         self.assertEqual(self.writes(), 1)
+        self.assertEqual(self.other_writes(), 0)
 
     async def test_edit_preserves_facts_and_requires_new_delivered_summary(self):
         await self.offer()

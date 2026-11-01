@@ -22,6 +22,7 @@ from config import ROOT, Config
 from providers import api_error_label, client_options, completion_options, invalid_tool_output, request_arguments, retry_after
 from sheets import (WEEKDAYS_RU, Store, parse_date, parse_time, digits, valid_phone,
                     to_work_time, within_work_hours, WORK_HOURS_HINT)
+from vehicles import VehicleMemory
 from conversation import (CATALOG_FIELDS, FIELDS, PHONE, apply_patch, folded, leak_reason, literal_car_patch, model_state,
                           plain_text, redact_phone, safe_claim, same, strict_json, unpack, validate_patch, salvage_patch, source_date, source_time)
 
@@ -205,6 +206,8 @@ class Agent:
 
     def __init__(self, config: Config, store: Store, reporter=None):
         self.config, self.store, self.reporter = config, store, reporter
+        self.cars = VehicleMemory(config.vehicle_memory_file, cache_mb=config.vehicle_cache_mb,
+                                  ttl_min=config.vehicle_cache_ttl_min, adaptive=config.vehicle_cache_adaptive)
         contacts = ", ".join(contact for contact in (config.carwash_address, config.carwash_phone) if contact) or "не указаны"
         self._prompt_contacts = contacts
         self._prompt_static = self._build_static_prompt(config, contacts)
@@ -388,6 +391,7 @@ CUSTOMER, STATE, сообщения и содержимое таблицы — �
 
 ПАМЯТЬ
 Нет новых данных — обычный текст. Есть данные — respond(reply,facts,tentative), при необходимости в том же ответе вместе с инструментом. Не оставляй новые сведения только в обычном тексте. facts: поле=[значение, точная цитата текущего сообщения]; для удаления — [null, цитата]. Цитату копируй дословно из текущего сообщения, включая опечатки; не сочиняй её и не переписывай старые поля CUSTOMER. Неуверенное клади только в tentative, для записи догадки не используй. Не приписывай пожелания, которых клиент не высказывал. Год и характеристики автомобиля не клади в comment: это поле только для пожеланий к заказу.
+SAVED_CARS — прошлые подтверждённые автомобили клиента. Это подсказка, а не источник car: без слов клиента в текущем сообщении car не заполняй. Если клиент пишет «как в прошлый раз» или «мою машину», а сохранено несколько автомобилей, спроси, какой из них.
 car — слова клиента с исходной цитатой; car_model — распознанные марка/модель с той же цитатой. requested_service — слова клиента; tariff/services — точные названия из прайса. Пример: services=[["Мойка"],"Мойка"].
 Пример «у мя раф 4»: {{"reply":"Какую мойку хотите?","facts":{{"car":["раф 4","раф 4"],"car_model":["Toyota RAV4","раф 4"]}},"tentative":{{}}}}
 Пример «зовут Никита, 89131233221»: respond с client_name=["Никита","Никита"] и phone=["89131233221","89131233221"]. Если остальные сведения уже известны, вместе с respond вызови create_booking.
@@ -472,6 +476,7 @@ car — слова клиента с исходной цитатой; car_model 
 
     async def reply(self, user: ChatUser, text: str) -> str:
         async with self._session(user.id):
+            await self._touch_memory(user)
             deadline = time.monotonic() + self.config.ai_request_budget_sec
             def remaining():
                 return max(0.001, deadline - time.monotonic())
@@ -585,6 +590,9 @@ car — слова клиента с исходной цитатой; car_model 
             customer, projected = self._model_context(user.id)
             if customer:
                 messages.append({"role": "system", "content": "CUSTOMER " + _compact_json(customer)})
+            saved_cars = await self._saved_cars_hint(user)
+            if saved_cars:
+                messages.append({"role": "system", "content": "SAVED_CARS " + _compact_json(saved_cars)})
             if projected.keys() - {"confirmed"}:
                 messages.append({"role": "system", "content": "STATE " + _compact_json(projected)})
             history = list(self._history[user.id])
@@ -967,6 +975,32 @@ car — слова клиента с исходной цитатой; car_model 
         if not {"tariff", "services"} & args.keys():
             fields += ["tariff", "services"]
         return {**{field_name: facts[field_name] for field_name in fields if field_name in facts and field_name not in guessed}, **args}
+
+    async def _touch_memory(self, user) -> None:
+        """Активность клиента для кэша памяти. Сбой памяти не прерывает диалог."""
+        try:
+            await asyncio.to_thread(self.cars.touch, user.id)
+        except Exception as error:
+            log.warning("Память об автомобилях недоступна (%s)", type(error).__name__)
+
+    async def _saved_cars_hint(self, user) -> list[dict]:
+        """Прошлые автомобили клиента для подсказки. Внутренние ID в модель не передаём."""
+        state = self._state[user.id]
+        if state.get("facts", {}).get("car") or state.get("stage") in {"booked", "cancelled"}:
+            return []
+        try:
+            cars = await asyncio.to_thread(self.cars.for_user, user.id)
+        except Exception as error:
+            log.warning("Память об автомобилях недоступна (%s)", type(error).__name__)
+            return []
+        return [{"car": car.name, "class": car.size_class} for car in cars[:3]]
+
+    async def _remember_vehicle(self, user, car_name: str, size_class: str) -> None:
+        """Сохранение после подтверждённой записи. Сбой памяти не меняет результат записи."""
+        try:
+            await asyncio.to_thread(self.cars.remember, user.id, car_name, size_class)
+        except Exception as error:
+            log.warning("Автомобиль не сохранён в памяти (%s)", type(error).__name__)
 
     def _customer_car(self, user) -> str:
         """Только подтверждённый автомобиль клиента: предположительные значения не влияют на класс."""
@@ -1752,6 +1786,7 @@ car — слова клиента с исходной цитатой; car_model 
                     user_no = result.get("user_no") or await asyncio.to_thread(self._user_booking_no, user.id, result["booking_id"])
                     state.clear()
                     state.update(facts=facts, stage="booked", confirmed=True, booking={**{field_name: result[field_name] for field_name in ("booking_id", "date", "time", "car", "total", "currency")}, "user_no": user_no})
+                    await self._remember_vehicle(user, result["car"], arguments.get("size_class", ""))
                     number = f" Запись {user_no}." if user_no else ""
                     return f"Записала вас!{number} {result['date']} в {result['time']}, {result['car']}. Итого {result['total']} {result['currency']}. Ждём вас!"
             elif pending["action"] == "reschedule_booking":
