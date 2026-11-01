@@ -300,6 +300,11 @@ class BackupTests(unittest.TestCase):
         vehicle_backup.backup(self.source, directory, keep=3)
         self.assertEqual(len(list(directory.glob("customer_vehicles-*.sqlite3"))), 3)
 
+    def test_backup_without_database_is_a_clean_noop(self):
+        missing = self.root / "never-created.sqlite3"
+        self.assertEqual(vehicle_backup.main(["backup", "--source", str(missing), "--dir", str(self.root / "b")]), 0)
+        self.assertFalse((self.root / "b").exists())
+
     def test_invalid_backup_is_rejected(self):
         bad = self.root / "bad.sqlite3"
         bad.write_bytes(b"not a database")

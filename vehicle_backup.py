@@ -126,6 +126,9 @@ def main(argv: list[str] | None = None) -> int:
     back_restore.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
     if args.command == "backup":
+        if not args.source.is_file():
+            print(f"Базы памяти пока нет, копировать нечего: {args.source}")
+            return 0
         print(f"Копия: {backup(args.source, args.dir, args.keep)}")
     elif args.command == "verify":
         print(verify(args.file))
