@@ -1285,7 +1285,9 @@ car — слова клиента с исходной цитатой; car_model 
                 if not self._retryable_api_error(error) or (attempt >= retries and not connection_retry) or retry_after(error) is not None:
                     raise
                 log.warning("Повтор AI-запроса после %s", type(error).__name__)
-                await asyncio.sleep(0.25 * (attempt + 1))
+                # Провайдер «мигает» окнами по несколько секунд: пауза 1с/2с даёт
+                # соединению время восстановиться, 0.25с уходили в тот же провал.
+                await asyncio.sleep(1.0 * (attempt + 1))
 
     async def _request(self, **kwargs):
         if self._closed:
