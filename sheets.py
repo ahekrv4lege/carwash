@@ -24,7 +24,7 @@ from google.auth.exceptions import TransportError
 
 from config import Config
 from adaptive import (AdaptiveSheets, BOOKING_FIELDS, MappingError, SlotUnavailable, cell_name,
-                      is_duration_header, parse_duration_minutes)
+                      is_duration_header, normalize_header, parse_duration_minutes)
 
 log = logging.getLogger(__name__)
 
@@ -600,7 +600,16 @@ class Store:
     def _load_catalog(self) -> Catalog:
         observed = self._observed
         if self._adaptive and observed is None:
-            observed = self._adaptive.observe(roles=("services", "tariffs"))
+            try:
+                observed = self._adaptive.observe(roles=("services", "tariffs"))
+            except MappingError as error:
+                # Тарифов в книге может не быть вовсе — тогда цена считается по услугам.
+                if "Нет подтверждённой области tariffs" not in str(error):
+                    raise
+                issues = (self._adaptive.document or {}).get("issues", [])
+                if any("область tariffs" in issue for issue in issues):
+                    raise  # лист тарифов есть, но не распознан: молча терять его нельзя
+                observed = self._adaptive.observe(roles=("services",))
         headers, rows = self._table(self.config.sheet_services, observed)
         service_duration_header = next((header for header in headers if is_duration_header(header)), None)
         # Классы без повторов: две колонки с одинаковым названием (даже в
@@ -609,9 +618,9 @@ class Store:
         seen_classes: set[str] = set()
         for header in headers:
             label = str(header).strip()
-            lowered = label.lower()
-            if lowered and lowered not in SERVICE_FIXED_COLS and lowered not in seen_classes:
-                seen_classes.add(lowered)
+            normalized = normalize_header(label)
+            if normalized and normalized not in SERVICE_FIXED_COLS and normalized not in seen_classes:
+                seen_classes.add(normalized)
                 classes.append(label)
 
         services: dict[str, Service] = {}
@@ -634,7 +643,13 @@ class Store:
                 duration_minutes=self._duration_value(record.get(service_duration_header, "")) if service_duration_header else None,
             )
 
-        tariff_headers, tariff_rows = self._table(self.config.sheet_tariffs, observed)
+        try:
+            tariff_headers, tariff_rows = self._table(self.config.sheet_tariffs, observed)
+        except MappingError as error:
+            if "Нет подтверждённой области" not in str(error):
+                raise  # лист тарифов есть, но повреждён: молча терять его нельзя
+            # Тарифов в книге может не быть: цена считается по услугам, выдумывать пакеты нельзя.
+            tariff_headers, tariff_rows = [], []
         tariff_duration_header = next((header for header in tariff_headers if is_duration_header(header)), None)
         class_headers = [header for header in tariff_headers
                          if header not in {"Тариф", "Состав", "Скидка %", "Доступен", "Доступна", "Длительность"}

@@ -47,8 +47,8 @@ ALIASES = {
     "Постов": ["постов", "мест", "боксов", "capacity", "bays", "пост", "бокс"],
     "Услуга": ["услуга", "service", "service name", "название услуги"],
     "Описание": ["описание", "description", "details"],
-    "Доступна": ["доступна", "available", "active", "enabled", "активна"],
-    "Доступен": ["доступен", "available", "active", "enabled", "активен", "доступна"],
+    "Доступна": ["доступна", "available", "active", "enabled", "активна", "выполняется", "выполняем"],
+    "Доступен": ["доступен", "available", "active", "enabled", "активен", "доступна", "выполняется"],
     "Скидка %": ["скидка", "скидка %", "скидка процентов", "discount", "discount %", "discount percent"],
     "Длительность": ["длительность", "длительность мин", "длительность минуты", "длительность работы",
                      "время мин", "время работы", "время выполнения", "минуты", "мин",
@@ -458,7 +458,12 @@ def discover(snapshot: dict, expected: dict[str, str]) -> tuple[list[dict], list
             if grid:
                 rules.append(grid)
             else:
-                issues.append(f"Лист {snapshot['id']}: структура не распознана; нужна ручная настройка")
+                expected_role = next((role for role, title in expected.items() if title == snapshot["title"]), None)
+                if expected_role:
+                    issues.append(f"Лист {snapshot['id']}: ожидаемая область {expected_role} не распознана; "
+                                  "нужна ручная настройка или интерпретация моделью")
+                else:
+                    issues.append(f"Лист {snapshot['id']}: структура не распознана; нужна ручная настройка")
     # Более одной таблицы одного назначения на листе не выбираем молча.
     for role in ALL_ROLE_FIELDS:
         candidates = [row_index for row_index in rules if row_index["role"] == role]
@@ -668,6 +673,9 @@ class AdaptiveSheets:
         allowed = allowed | set(rule.get("price_fields", []))
         if rule.get("pivot_prices"):
             allowed.update({"Класс", "Сумма"})
+        if rule.get("prices_transposed"):
+            allowed.add("Класс")
+            allowed |= set(rule["columns"]) - {"Класс"}
         if rule.get("schedule_mode") == "hours":
             allowed.update({"Начало", "Конец"})
         if "Длительность" in columns:
@@ -738,6 +746,8 @@ class AdaptiveSheets:
             ):
                 errors.append("Некорректное преобразование даты/времени")
         required = SCHEDULE_REQUIRED if rule.get("schedule_mode") == "hours" else READ_REQUIRED[rule["role"]]
+        if rule.get("prices_transposed"):
+            required = {"Класс"}  # классы строками, услуги — колонки-ключи
         if rule["role"] == "tariffs":
             required = required - {"Состав"} if rule.get("price_fields") else required
         missing = required - present
@@ -996,7 +1006,15 @@ class AdaptiveSheets:
             return None
         headers = trim_headers(headers_all[header_row - 1])
         columns: dict[str, int] = {}
-        for field, claimed in candidate["columns"].items():
+        canonical_keys = set(ALL_ROLE_FIELDS.get(role := candidate["role"], ())) | {"Класс", "Сумма", "Длительность"}
+        for key, value in candidate["columns"].items():
+            # Модель иногда меняет направление пары; нормализуем к «поле -> шапка».
+            if key in canonical_keys or key.casefold() in KNOWN_PRICE_CLASSES:
+                field, claimed = key, value
+            elif value in canonical_keys or value.casefold() in KNOWN_PRICE_CLASSES:
+                field, claimed = value, key
+            else:
+                field, claimed = key, value
             exact = [index for index, header in enumerate(headers, 1) if header == claimed]
             loose = [index for index, header in enumerate(headers, 1)
                      if normalize_header(header) == normalize_header(claimed)]
@@ -1008,6 +1026,17 @@ class AdaptiveSheets:
         role = candidate["role"]
         if not columns:
             return None
+        if role in {"services", "tariffs"} and not candidate.get("orientation"):
+            # Класс заявлен, но в листе есть ещё колонка с той же шапкой: неоднозначно.
+            for field, claimed in list(candidate["columns"].items()):
+                if field in ALL_ROLE_FIELDS[role] or field in {"Класс", "Сумма", "Длительность"}:
+                    continue
+                duplicates = [header for header in headers
+                              if normalize_header(header) == normalize_header(claimed)]
+                if len(duplicates) > 1:
+                    issues.append(f"Модель: класс «{field}» неоднозначен на листе «{title}»: "
+                                  f"несколько колонок {duplicates}")
+                    return None
         if candidate.get("duration_column"):
             duration = detect_duration_column(snapshot, header_row, headers, set(columns.values()))
             if duration and "Длительность" not in columns:
@@ -1028,9 +1057,14 @@ class AdaptiveSheets:
             {"cell": source["cell"]} if isinstance(source, dict) and isinstance(source.get("cell"), list) else None)
         if role in {"slots", "bookings"} and "Дата" not in columns and date_source is None                 and title_date(snapshot["title"]):
             date_source = {"title": True}
+        # Транспонировка объявлена, но ключами оказались классы — это обычная матрица.
+        transposed = candidate.get("orientation") == "services_in_columns" and not any(
+            key.casefold() in KNOWN_PRICE_CLASSES
+            for key in candidate["columns"] if key not in ALL_ROLE_FIELDS.get(role, ()))
         rule = {"role": role, "sheet_id": snapshot["id"], "sheet_title": snapshot["title"],
                 "header_row": header_row, "first_data_row": header_row + 1, "end_row": None,
                 "columns": columns, "source": "ai",
+                **({"prices_transposed": True} if transposed else {}),
                 "transforms": {"Дата": "date", "Время": "time", "Начало": "time", "Конец": "time"},
                 "status_map": dict(STATUS_MAP), "write_statuses": {"new": "Новая", "cancelled": "Отмена"},
                 "date_source": date_source, "permissions": {"read": True, "write": role == "bookings"},
@@ -1087,6 +1121,20 @@ class AdaptiveSheets:
             return
         if candidates:
             self._apply_ai_candidates(candidates, by_id, regions, issues)
+            still_missing = required_roles - {rule["role"] for rule in regions}
+            if still_missing:
+                # Адресная вторая попытка: модель пропустила обязательную роль.
+                try:
+                    import schema_ai
+                    compact = schema_ai.compact_workbook(list(by_id.values()))
+                    reminder = ("В прошлый раз ты не указал области: " + ", ".join(sorted(still_missing))
+                                + ". Проверь ещё раз все листы; если данные позволяют — укажи их.")
+                    retry = schema_ai.request_mapping_with_hint(self.config, compact, reminder)
+                    retry_candidates, retry_issues = schema_ai.normalize_ai_document(retry)
+                    issues.extend(retry_issues)
+                    self._apply_ai_candidates(retry_candidates, by_id, regions, issues)
+                except Exception as error:
+                    issues.append(f"Повторная интерпретация модели недоступна ({type(error).__name__})")
 
     def _summarize(self) -> None:
         self.document["missing_roles"] = sorted(set(ROLE_FIELDS) - {rule["role"] for rule in self.document["regions"]})
@@ -1119,7 +1167,27 @@ class AdaptiveSheets:
             return date_value(value_at(values, *source["cell"]), rule.get("transforms", {}).get("Дата", "date"))
         raise MappingError("Не задан источник даты")
 
+    def _extract_transposed_prices(self, rule: dict, values: list[list], title: str) -> list[dict]:
+        """Классы строками, услуги колонками -> длинный формат «услуга, класс, цена»."""
+        records = []
+        end_row = min(len(values), rule.get("end_row") or len(values))
+        class_column = rule["columns"]["Класс"]
+        service_columns = [field for field in rule["columns"] if field != "Класс"]
+        sheet_id = rule["sheet_id"]
+        for row in range(rule["first_data_row"], end_row + 1):
+            class_name = str(value_at(values, row, class_column)).strip()
+            if not class_name:
+                continue
+            for service in service_columns:
+                price = str(value_at(values, row, rule["columns"][service])).strip()
+                if price:
+                    records.append({"Услуга": service, class_name: price,
+                                    "__row__": row, "__sheet_id__": sheet_id})
+        return records
+
     def _extract_records(self, rule: dict, values: list[list], title: str) -> list[dict]:
+        if rule.get("prices_transposed"):
+            return self._extract_transposed_prices(rule, values, title)
         records = []
         end_row = min(len(values), rule.get("end_row") or len(values))
         # Инварианты цикла: не пересобираем их для каждой строки.
@@ -1215,6 +1283,10 @@ class AdaptiveSheets:
                         raise MappingError("Структура продолжает меняться; повторите чтение позже")
                     self.refresh(force=True)
                     return self.table(role, _attempt=1)
+                if rule.get("prices_transposed"):
+                    # Классы строками: ключи-услуги не становятся классами, а записями «Услуга».
+                    records.extend(self._extract_records(rule, values, worksheet.title))
+                    continue
                 fields = list(rule["columns"])
                 if rule.get("date_source") and "Дата" not in fields:
                     fields.append("Дата")
@@ -1226,9 +1298,24 @@ class AdaptiveSheets:
                 if len(rules) != 1:
                     raise MappingError("Для длинного прайса нужна одна область services")
                 headers, records = self._pivot_prices(rules[0], records)
+            if role == "services" and any(rule.get("prices_transposed") for rule in rules):
+                # Из длинного формата собираем привычную матрицу «услуга × класс».
+                classes: list[str] = []
+                by_service: dict[str, dict] = {}
+                for record in records:
+                    service = record.get("Услуга", "")
+                    item = by_service.setdefault(service, {"Услуга": service})
+                    for key, value in record.items():
+                        if key in {"Услуга", "__row__", "__sheet_id__"} or key in item:
+                            continue
+                        item[key] = value
+                        if key not in classes:
+                            classes.append(key)
+                headers = ["Услуга", *classes]
+                records = list(by_service.values())
             if role == "services":
                 classes = [header for header in headers if header not in {"Услуга", "Описание", "Доступна", "Длительность"}]
-                if len({header.casefold() for header in classes}) != len(classes):
+                if len({normalize_header(header) for header in classes}) != len(classes):
                     raise MappingError("Повторяющиеся классы автомобилей")
             self._validate_records(role, records, rules)
             self.read_versions[role] = fingerprint((headers, records))
