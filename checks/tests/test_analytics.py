@@ -105,8 +105,8 @@ class ComputeTests(unittest.TestCase):
 
 
 class AdminAccessTests(unittest.IsolatedAsyncioTestCase):
-    def config(self, admin):
-        return SimpleNamespace(admin_chat_id=admin)
+    def config(self, admin, users=()):
+        return SimpleNamespace(admin_chat_id=admin, admin_user_ids=tuple(users))
 
     def message(self, user_id, text=""):
         return SimpleNamespace(from_user=SimpleNamespace(id=user_id), answer=AsyncMock())
@@ -115,6 +115,15 @@ class AdminAccessTests(unittest.IsolatedAsyncioTestCase):
         check = AdminOnly()
         self.assertTrue(await check(self.message(111), self.config(111)))
         self.assertFalse(await check(self.message(222), self.config(111)))
+        self.assertFalse(await check(self.message(111), self.config(None)))
+
+    async def test_explicit_admin_user_ids_allow_list(self):
+        check = AdminOnly()
+        self.assertTrue(await check(self.message(555), self.config(None, users=(555, 666))))
+        self.assertFalse(await check(self.message(777), self.config(None, users=(555, 666))))
+
+    async def test_no_admin_configuration_denies_everyone(self):
+        check = AdminOnly()
         self.assertFalse(await check(self.message(111), self.config(None)))
 
     async def test_customer_gets_no_statistics(self):

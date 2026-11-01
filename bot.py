@@ -231,10 +231,19 @@ async def cmd_reset(message: Message, agent: Agent) -> None:
 
 
 class AdminOnly:
-    """Доступ только для ADMIN_CHAT_ID. Для остальных фильтр не проходит, и сообщение идёт диалогу как обычно."""
+    """Доступ только администратору: ADMIN_USER_IDS или ADMIN_CHAT_ID в личном чате.
+
+    Для остальных фильтр не проходит, и сообщение идёт диалогу как обычно. Без настроек — отказ.
+    """
 
     async def __call__(self, message: Message, config: Config) -> bool:
-        return config.admin_chat_id is not None and message.from_user is not None and message.from_user.id == config.admin_chat_id
+        if message.from_user is None:
+            return False
+        user_id = message.from_user.id
+        if user_id in config.admin_user_ids:
+            return True
+        # ADMIN_CHAT_ID в личном чате совпадает с ID пользователя; ID группы админом не делает.
+        return config.admin_chat_id is not None and user_id == config.admin_chat_id
 
 
 @router.message(Command("stats"), AdminOnly())

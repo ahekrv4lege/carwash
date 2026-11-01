@@ -128,6 +128,7 @@ class Config:
     reply_concurrency: int = 8
     ai_session_ttl_sec: int = 3600
     ai_max_sessions: int = 1000
+    admin_user_ids: tuple[int, ...] = ()  # явный список админов для /stats по Telegram ID
     llm_fallbacks: tuple[ProviderConfig, ...] = ()
     # Память об автомобилях клиентов: SQLite на диске и RAM-кэш по пользователю.
     vehicle_memory_file: str = ".runtime/customer_vehicles.sqlite3"
@@ -250,6 +251,7 @@ def load_config(sheets_only: bool = False) -> Config:
     """sheets_only=True — для настройки Sheets без запуска Telegram и AI."""
     bot_token = os.getenv("BOT_TOKEN", "").strip() if sheets_only else _required("BOT_TOKEN")
     admin = os.getenv("ADMIN_CHAT_ID", "").strip()
+    admin_users = tuple(int(value) for value in re.findall(r"-?\d+", os.getenv("ADMIN_USER_IDS", "")))
     if admin and not re.fullmatch(r"-?\d+", admin):
         raise RuntimeError("ADMIN_CHAT_ID: нужен целочисленный Telegram ID")
     return Config(
@@ -262,6 +264,7 @@ def load_config(sheets_only: bool = False) -> Config:
         carwash_phone=os.getenv("CARWASH_PHONE", "").strip(),
         currency=os.getenv("CURRENCY", "₽").strip(),
         admin_chat_id=int(admin) if admin else None,
+        admin_user_ids=admin_users,
         min_lead_minutes=_integer("MIN_LEAD_MINUTES", "30"),
         catalog_cache_sec=_integer("CATALOG_CACHE_SEC", "60"),
         slots_cache_sec=_integer("SLOTS_CACHE_SEC", "15"),
