@@ -181,6 +181,23 @@ def vehicle_clarification(text):
     return None
 
 
+_OWNERSHIP = re.compile(
+    r"\b(?:у\s+меня|у\s+нас|мой|моя|моё|мое|мои|мою|моей|моих|моим|наша|наше|наш)\b", re.I)
+_HYPOTHETICAL = re.compile(r"\b(?:не|если|или|либо|вроде|кажется|наверное|возможно|может|чуж\w*|друг\w*)\b", re.I)
+
+
+def car_ownership(text: str) -> bool:
+    """Клиент говорит о своём автомобиле («у меня камри», «моя машина»), а не о чужом или примере.
+
+    Гипотетичность проверяется в той же части фразы, где назван владелец:
+    «Нет, у меня королла» — исправление, а «если моя королла» — предположение.
+    """
+    for clause in re.split(r"[,.!?;]|\s+[—–-]\s+", text or ""):
+        if _OWNERSHIP.search(clause):
+            return not _HYPOTHETICAL.search(clause)
+    return False
+
+
 PROOFREAD_PROMPT = "Ты — корректор. Исправь только ошибки русского языка, о себе — женский род. Сохрани все имена, числа, смысл. Верни только исправленный текст."
 
 _CLARIFICATION_QUESTIONS = {
@@ -828,6 +845,9 @@ car — слова клиента с исходной цитатой; car_model 
             self._state[user.id].pop("selection", None)
         apply_patch(self._state[user.id], changes, tentative)
         self._turn_sources.setdefault(user.id, {}).update(positions)
+        if ({"car", "car_model"} & changes.keys()) and car_ownership(source) and not self._state[user.id].get("vehicle_ambiguous"):
+            facts = self._state[user.id].get("facts", {})
+            await self._remember_vehicle(user, facts.get("car_model") or facts.get("car") or "", facts.get("size_class") or "")
         if conflicts:
             labels = {"car": "автомобиль", "car_model": "модель автомобиля", "size_class": "класс автомобиля",
                       "date": "дату", "time": "время", "phone": "телефон", "client_name": "имя",
@@ -996,7 +1016,9 @@ car — слова клиента с исходной цитатой; car_model 
         return [{"car": car.name, "class": car.size_class} for car in cars[:3]]
 
     async def _remember_vehicle(self, user, car_name: str, size_class: str) -> None:
-        """Сохранение после подтверждённой записи. Сбой памяти не меняет результат записи."""
+        """Подтверждённый клиентом автомобиль (не догадка). Сбой памяти не меняет ответ клиенту."""
+        if not car_name:
+            return
         try:
             await asyncio.to_thread(self.cars.remember, user.id, car_name, size_class)
         except Exception as error:
