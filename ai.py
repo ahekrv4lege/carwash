@@ -183,16 +183,38 @@ def vehicle_clarification(text):
 
 _OWNERSHIP = re.compile(
     r"\b(?:у\s+меня|у\s+нас|мой|моя|моё|мое|мои|мою|моей|моих|моим|наша|наше|наш)\b", re.I)
-_HYPOTHETICAL = re.compile(r"\b(?:не|если|или|либо|вроде|кажется|наверное|возможно|может|чуж\w*|друг\w*)\b", re.I)
+_HYPOTHETICAL = re.compile(
+    r"\b(?:не|если|или|либо|вроде|кажется|наверное|возможно|может|чуж\w*|друг\w*|брат\w*|сестр\w*|"
+    r"жен\w*|муж\w*|отец|отц\w*|мать|мат\w*|пап\w*|мам\w*|сын\w*|доч\w*|дедушк\w*|бабушк\w*|"
+    r"коллег\w*|знаком\w*|сосед\w*|начальник\w*)\b", re.I)
 
 
-def car_ownership(text: str) -> bool:
+def car_ownership(text: str, quote: str | None = None) -> bool:
     """Клиент говорит о своём автомобиле («у меня камри», «моя машина»), а не о чужом или примере.
 
     Гипотетичность проверяется в той же части фразы, где назван владелец:
     «Нет, у меня королла» — исправление, а «если моя королла» — предположение.
+    Если известна цитата факта, проверяется часть фразы с этой цитатой: иначе
+    «У меня камри, но у друга королла» сохранило бы чужую машину.
     """
-    for clause in re.split(r"[,.!?;]|\s+[—–-]\s+", text or ""):
+    clauses = re.split(r"[,.!?;]|\s+[—–-]\s+", text or "")
+    if quote:
+        wanted = quote.casefold().replace("ё", "е")
+        matching = [index for index, clause in enumerate(clauses)
+                    if wanted and wanted in clause.casefold().replace("ё", "е")]
+        owned = [clauses[index] for index in matching if _OWNERSHIP.search(clauses[index])]
+        if any(not _HYPOTHETICAL.search(clause) for clause in owned):
+            return True
+        for index in matching:
+            clause = clauses[index]
+            previous = clauses[index - 1] if index else ""
+            # Контрастная поправка: «У меня не камри, а лансер».
+            if (re.match(r"\s*(?:а|но)\b", clause, re.I) and _OWNERSHIP.search(previous)
+                    and not _HYPOTHETICAL.search(clause)):
+                return True
+        if matching:
+            return False
+    for clause in clauses:
         if _OWNERSHIP.search(clause):
             return not _HYPOTHETICAL.search(clause)
     return False
@@ -845,7 +867,13 @@ car — слова клиента с исходной цитатой; car_model 
             self._state[user.id].pop("selection", None)
         apply_patch(self._state[user.id], changes, tentative)
         self._turn_sources.setdefault(user.id, {}).update(positions)
-        if ({"car", "car_model"} & changes.keys()) and car_ownership(source) and not self._state[user.id].get("vehicle_ambiguous"):
+        car_quote = ""
+        for field in ("car_model", "car"):
+            entry = sources[0].get(field)
+            if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[1], str):
+                car_quote = entry[1]
+                break
+        if ({"car", "car_model"} & changes.keys()) and car_ownership(source, car_quote) and not self._state[user.id].get("vehicle_ambiguous"):
             facts = self._state[user.id].get("facts", {})
             await self._remember_vehicle(user, facts.get("car_model") or facts.get("car") or "", facts.get("size_class") or "")
         if conflicts:

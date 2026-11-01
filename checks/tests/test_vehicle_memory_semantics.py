@@ -21,6 +21,20 @@ class OwnershipPhraseTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(car_ownership(text))
 
+    def test_quote_selects_the_clause_with_the_fact(self):
+        text = "У меня камри, но у друга лансер"
+        self.assertTrue(car_ownership(text, "камри"))
+        self.assertFalse(car_ownership(text, "лансер"))
+        self.assertFalse(car_ownership("У друга лансер, а у меня камри", "лансер"))
+        self.assertTrue(car_ownership("У друга лансер, а у меня камри", "камри"))
+
+    def test_contrastive_correction_counts_as_ownership(self):
+        self.assertTrue(car_ownership("У меня не камри, а лансер", "лансер"))
+        self.assertFalse(car_ownership("У меня камри, а у друга лансер", "лансер"))
+        self.assertFalse(car_ownership("У меня камри, а если лансер", "лансер"))
+        self.assertFalse(car_ownership("У меня камри, а брат купил лансер", "лансер"))
+        self.assertTrue(car_ownership("У меня камри, а брат купил лансер", "камри"))
+
     def test_hypothetical_and_third_party_cars_are_not_ownership(self):
         for text in ("если у меня была бы камри", "у друга камри", "или моя королла", "наверное у меня камри",
                      "Какая цена на мойку?", "а что если моя машина сломалась"):
@@ -68,6 +82,16 @@ class MemoryWithoutBookingTests(unittest.IsolatedAsyncioTestCase):
         await self.say(self.agent, "А у друга камри 3.5, сколько стоит?", self.facts("камри 3.5", "камри 3.5"))
         self.assertEqual(self.agent.cars.for_user(111), [])
 
+    async def test_third_party_car_in_message_with_owned_car_is_not_saved(self):
+        await self.say(self.agent, "У меня камри, но у друга лансер",
+                       self.facts("лансер", "лансер", "Mitsubishi Lancer"))
+        self.assertEqual(self.agent.cars.for_user(111), [])
+
+    async def test_owned_car_in_mixed_message_is_saved(self):
+        await self.say(self.agent, "У меня камри, но у друга лансер",
+                       self.facts("камри", "камри", "Toyota Camry"))
+        self.assertEqual([c.name for c in self.agent.cars.for_user(111)], ["Toyota Camry"])
+
     async def test_hypothetical_vehicle_is_not_saved(self):
         await self.say(self.agent, "Если моя королла, то сколько?", self.facts("королла", "королла"))
         self.assertEqual(self.agent.cars.for_user(111), [])
@@ -91,6 +115,11 @@ class MemoryWithoutBookingTests(unittest.IsolatedAsyncioTestCase):
         await self.say(self.agent, "У меня королла", self.facts("королла", "королла", "Toyota Corolla"))
         self.assertEqual(self.agent.cars.for_user(111), [])
         self.assertEqual(self.agent._state[111].get("facts", {}).get("car"), "королла")  # слова клиента сохранены
+
+    async def test_contrastive_correction_is_saved(self):
+        await self.say(self.agent, "У меня не камри, а лансер",
+                       self.facts("лансер", "лансер", "Mitsubishi Lancer"))
+        self.assertEqual([c.name for c in self.agent.cars.for_user(111)], ["Mitsubishi Lancer"])
 
     async def test_repeated_mention_does_not_duplicate(self):
         for _ in range(3):
