@@ -11,12 +11,13 @@ from urllib.parse import urlsplit
 from urllib.request import getproxies, proxy_bypass
 
 from aiogram import Bot, Dispatcher, F as Filter, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.chat_action import ChatActionSender
 
+import analytics
 from admin import AdminReporter
 from ai import Agent, ChatUser
 from config import Config, load_config
@@ -229,6 +230,32 @@ async def cmd_reset(message: Message, agent: Agent) -> None:
     await message.answer("Диалог сброшен. Чем могу помочь?")
 
 
+class AdminOnly:
+    """Доступ только для ADMIN_CHAT_ID. Для остальных фильтр не проходит, и сообщение идёт диалогу как обычно."""
+
+    async def __call__(self, message: Message, config: Config) -> bool:
+        return config.admin_chat_id is not None and message.from_user is not None and message.from_user.id == config.admin_chat_id
+
+
+@router.message(Command("stats"), AdminOnly())
+async def cmd_stats(message: Message, command: CommandObject, store: Store) -> None:
+    arguments = (command.args or "").strip()
+    days = analytics.DEFAULT_PERIOD
+    if arguments:
+        if not arguments.isdigit() or int(arguments) not in analytics.PERIOD_CHOICES:
+            await message.answer("Использование: /stats 1, /stats 7 или /stats 30")
+            return
+        days = int(arguments)
+    try:
+        rows, slots = await asyncio.to_thread(store.analytics_snapshot)
+        text = analytics.render(analytics.compute(rows, slots, store.now().date(), days))
+    except Exception as error:
+        log.error("Статистика недоступна (%s)", type(error).__name__)
+        await message.answer("Статистика временно недоступна. Попробуйте позже.")
+        return
+    await message.answer(text[:TG_LIMIT])
+
+
 @router.message(Filter.text)
 async def on_text(message: Message, agent: Agent, reporter: AdminReporter, reply_gate: asyncio.Semaphore) -> None:
     await ask_agent(message, agent, reporter, message.text, reply_gate)
@@ -271,7 +298,7 @@ async def main() -> None:
         store = Store(config)
         reporter = AdminReporter(bot, config.admin_chat_id)
         agent = Agent(config, store, reporter)
-        dispatcher = Dispatcher(agent=agent, config=config, reporter=reporter,
+        dispatcher = Dispatcher(agent=agent, config=config, reporter=reporter, store=store,
                                 reply_gate=asyncio.Semaphore(config.reply_concurrency))
         batcher = MessageBatcher(config.reply_batch_sec)
         router.message.outer_middleware(batcher)

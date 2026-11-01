@@ -635,6 +635,13 @@ class Store:
             slots[key] = FreeCapacity(total) if free else total
         return slots
 
+    def analytics_snapshot(self) -> tuple[list[dict[str, Any]], dict]:
+        """Свежие строки «Записи» и вместимость «Слоты» для статистики (только чтение)."""
+        with self._lock:
+            self._invalidate("bookings", "slots")
+            _, rows = self._get_bookings()
+            return rows, self._get_slots()
+
     def _load_bookings(self) -> tuple[list[str], list[dict[str, Any]]]:
         return self._table(self.config.sheet_bookings)
 
