@@ -222,6 +222,43 @@ class MemoryTests(unittest.TestCase):
     def test_restart_restores_records(self):
         self.new().remember(111, "Toyota Camry 3.5", "Легковой")
         self.assertEqual([c.name for c in self.new().for_user(111)], ["Toyota Camry 3.5"])
+    def test_restart_reuses_the_same_file_and_starts_with_empty_cache(self):
+        mem = self.new()
+        mem.remember(111, "Toyota Camry 3.5", "Легковой")
+        inode = self.path.stat().st_ino
+        mem.close()
+        restarted = self.new()
+        self.assertEqual(self.path.stat().st_ino, inode)  # файл не пересоздан
+        self.assertEqual(len(restarted.cache), 0)          # RAM-кэш пуст
+        self.assertEqual(restarted.db_reads, 0)            # ленивая загрузка
+        self.assertEqual([c.name for c in restarted.for_user(111)], ["Toyota Camry 3.5"])
+        self.assertEqual(restarted.db_reads, 1)
+        restarted.touch(111)
+        self.assertEqual(restarted.db_reads, 1)            # дальше читается из кэша
+
+    def test_two_connections_can_write_concurrently_without_corruption(self):
+        first, second = VehicleDatabase(self.path), VehicleDatabase(self.path)
+        errors = []
+
+        def worker(db, user):
+            try:
+                for index in range(10):
+                    db.upsert(user, f"Car {index}", "Легковой", "2026-01-01 10:00:00")
+            except Exception as error:  # pragma: no cover - не должно происходить
+                errors.append(error)
+
+        threads = [threading.Thread(target=worker, args=(first, 111)),
+                   threading.Thread(target=worker, args=(second, 222))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(VehicleDatabase(self.path).list_active(111)), 10)
+        self.assertEqual(len(VehicleDatabase(self.path).list_active(222)), 10)
+        raw = sqlite3.connect(self.path)
+        self.assertEqual(raw.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        raw.close()
 
     def test_failed_database_write_leaves_database_and_cache_consistent(self):
         mem = self.new()
@@ -310,6 +347,15 @@ class BackupTests(unittest.TestCase):
         bad.write_bytes(b"not a database")
         with self.assertRaises(sqlite3.DatabaseError):
             vehicle_backup.verify(bad)
+
+
+class ConfigPathTests(unittest.TestCase):
+    def test_vehicle_memory_path_is_absolute_and_independent_of_working_directory(self):
+        from config import ROOT, _path
+        with patch.dict(os.environ, {"VEHICLE_MEMORY_FILE": ".runtime/customer_vehicles.sqlite3"}):
+            path = Path(_path("VEHICLE_MEMORY_FILE", ".runtime/customer_vehicles.sqlite3"))
+        self.assertTrue(path.is_absolute())
+        self.assertEqual(path, ROOT / ".runtime" / "customer_vehicles.sqlite3")
 
 
 class AgentIntegrationTests(unittest.IsolatedAsyncioTestCase):

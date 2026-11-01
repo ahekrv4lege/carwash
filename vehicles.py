@@ -66,11 +66,28 @@ class VehicleDatabase:
     def _db(self) -> sqlite3.Connection:
         if self._connection is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            connection = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None, timeout=10)
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA synchronous=FULL")
-            self._migrate(connection)
-            self._connection = connection
+            # Два процесса могут одновременно открыть новый файл: WAL/миграция
+            # требуют короткой эксклюзивной блокировки. Повторяем её, не теряя данные.
+            for attempt in range(5):
+                connection = None
+                try:
+                    connection = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None, timeout=10)
+                    connection.execute("PRAGMA journal_mode=WAL")
+                    connection.execute("PRAGMA synchronous=FULL")
+                    self._migrate(connection)
+                except sqlite3.OperationalError as error:
+                    if connection is not None:
+                        connection.close()
+                    if "locked" not in str(error).lower() or attempt == 4:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                except Exception:
+                    if connection is not None:
+                        connection.close()
+                    raise
+                self._connection = connection
+                break
         return self._connection
 
     @staticmethod
