@@ -1058,8 +1058,27 @@ car — слова клиента с исходной цитатой; car_model 
         return facts.get("car_model") or facts.get("car") or ""
 
     def _quote_state(self, quote):
-        return {**{field_name: quote[field_name] for field_name in ("total", "currency", "lines")},
-                "checked_at": self.store.now().isoformat(timespec="seconds")}
+        state = {field_name: quote[field_name] for field_name in ("total", "currency", "lines")}
+        if quote.get("duration_minutes") is not None:
+            state["duration_minutes"] = quote["duration_minutes"]
+        if quote.get("duration_missing"):
+            state["duration_missing"] = list(quote["duration_missing"])
+        return {**state, "checked_at": self.store.now().isoformat(timespec="seconds")}
+
+    def _duration_hint(self, user) -> int | None:
+        """Длительность выбранного заказа по данным прайса; модель её не придумывает."""
+        try:
+            catalog = self.store.get_catalog()
+        except Exception:
+            return None
+        facts = self._state.get(user.id, {}).get("facts", {})
+        selection = self._state.get(user.id, {}).get("selection") or {}
+        tariff = selection.get("tariff") or facts.get("tariff")
+        services = selection.get("services") if selection.get("services") is not None else facts.get("services")
+        try:
+            return catalog.duration_for(tariff, services or [])
+        except Exception:
+            return None
 
     def _state_fresh(self, entry, ttl_sec) -> bool:
         """Проверенная запись STATE ещё актуальна по своей метке времени.
@@ -1909,7 +1928,7 @@ car — слова клиента с исходной цитатой; car_model 
             )
 
         if name == "get_free_slots":
-            return await asyncio.to_thread(store.free_slots, arguments.get("date") or None)
+            return await asyncio.to_thread(store.free_slots, arguments.get("date") or None, 7, self._duration_hint(user))
 
         if name == "create_booking":
             result = await asyncio.to_thread(

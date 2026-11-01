@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
 
-from sheets import FreeCapacity, parse_date, parse_time, pick, to_number
+from sheets import DurationSchedule, FreeCapacity, parse_date, parse_time, pick, to_number
 
 PERIOD_CHOICES = (1, 7, 30)
 DEFAULT_PERIOD = 7
@@ -78,10 +78,13 @@ def compute(rows: list[dict], slots: dict[tuple[date, str], Any], today: date, d
     """Метрики за последние `days` дней, включая сегодня. Предстоящие записи — отдельно."""
     start = today - timedelta(days=days - 1)
     stats = Stats(days=days, start=start, end=today)
-    free_grid = any(isinstance(capacity, FreeCapacity) for capacity in slots.values())
-    for (slot_date, _), capacity in slots.items():
-        if start <= slot_date <= today:
-            stats.capacity_hours = None if free_grid else stats.capacity_hours + int(capacity)
+    # Запись по длительности не имеет слотов: «часы постов» не выводим, остальное считаем.
+    duration_mode = isinstance(slots, DurationSchedule)
+    free_grid = duration_mode or any(isinstance(capacity, FreeCapacity) for capacity in slots.values())
+    if not duration_mode:
+        for (slot_date, _), capacity in slots.items():
+            if start <= slot_date <= today:
+                stats.capacity_hours = None if free_grid else stats.capacity_hours + int(capacity)
     booked_per_slot: Counter = Counter()
     for record in rows:
         booking_date, booking_time = parse_date(pick(record, "Дата")), parse_time(pick(record, "Время"))
@@ -116,6 +119,8 @@ def compute(rows: list[dict], slots: dict[tuple[date, str], Any], today: date, d
         else:
             stats.booked_value += amount
     for key, booked in booked_per_slot.items():
+        if duration_mode:
+            continue  # занятость считается интервалами, а не слотами
         if key not in slots:
             stats.unlisted_hours += booked
         elif not free_grid:

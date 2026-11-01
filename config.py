@@ -129,6 +129,8 @@ class Config:
     ai_session_ttl_sec: int = 3600
     ai_max_sessions: int = 1000
     admin_user_ids: tuple[int, ...] = ()  # явный список админов для /stats по Telegram ID
+    # Лист с длительностями услуг («Услуга», «Длительность»); лист может отсутствовать.
+    sheet_durations: str = "Длительности"
     llm_fallbacks: tuple[ProviderConfig, ...] = ()
     # Память об автомобилях клиентов: SQLite на диске и RAM-кэш по пользователю.
     vehicle_memory_file: str = ".runtime/customer_vehicles.sqlite3"
@@ -228,7 +230,8 @@ def table_mapping_path(spreadsheet_id: str) -> str:
 
 
 def _sheet_settings() -> dict:
-    defaults = {"services": "Услуги", "tariffs": "Тарифы", "slots": "Слоты", "bookings": "Записи", "classes": "Классы"}
+    defaults = {"services": "Услуги", "tariffs": "Тарифы", "slots": "Слоты", "bookings": "Записи",
+                "classes": "Классы", "durations": "Длительности"}
     names = {
         f"sheet_{role}": os.getenv(f"SHEET_{role.upper()}", default).strip()
         for role, default in defaults.items()

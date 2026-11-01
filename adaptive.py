@@ -23,14 +23,15 @@ MAX_DISCOVERY_CELLS = 1_000_000
 ENGINE_REVISION = 2
 KNOWN_PRICE_CLASSES = {"легковой", "кроссовер", "внедорожник", "минивэн", "внедорожник минивэн", "микроавтобус",
                        "седан", "хэтчбек", "универсал", "sedan", "suv", "crossover", "van", "minivan", "passenger car"}
-NON_PRICE_HEADERS = {"id", "duration", "duration minutes", "длительность", "длительность мин", "время мин", "номер", "код"}
+NON_PRICE_HEADERS = {"id", "duration", "duration minutes", "duration hours", "длительность", "длительность мин",
+                     "длительность работы", "время мин", "время работы", "минуты", "часы", "номер", "код"}
 BOOKING_FIELDS = ["ID", "Создано", "Дата", "Время", "Имя", "Телефон", "Автомобиль", "Класс",
                   "Тариф", "Доп. услуги", "Состав", "Сумма", "Комментарий", "Telegram ID", "Username", "Статус"]
 ALIASES = {
     "ID": ["id", "номер записи", "booking id", "номер брони"],
     "Создано": ["создано", "created", "created at", "дата создания"],
     "Дата": ["дата", "date", "день", "дата записи", "booking date"],
-    "Время": ["время", "time", "начало", "время записи", "start time"],
+    "Время": ["время", "time", "время записи", "start time"],
     "Имя": ["имя", "клиент", "client", "name", "client name", "фио"],
     "Телефон": ["телефон", "phone", "тел", "номер телефона"],
     "Автомобиль": ["автомобиль", "машина", "car", "vehicle", "авто"],
@@ -49,6 +50,11 @@ ALIASES = {
     "Доступна": ["доступна", "available", "active", "enabled", "активна"],
     "Доступен": ["доступен", "available", "active", "enabled", "активен", "доступна"],
     "Скидка %": ["скидка", "скидка %", "discount", "discount percent"],
+    "Длительность": ["длительность", "длительность мин", "длительность минуты", "длительность работы",
+                     "время мин", "время работы", "время выполнения", "минуты", "мин",
+                     "часы", "час", "duration", "duration minutes", "duration hours"],
+    "Начало": ["начало", "start", "открытие", "старт"],
+    "Конец": ["конец", "окончание", "закрытие", "end", "финиш"],
 }
 ROLE_FIELDS = {
     "bookings": BOOKING_FIELDS,
@@ -56,12 +62,17 @@ ROLE_FIELDS = {
     "services": ["Услуга", "Описание", "Доступна"],
     "tariffs": ["Тариф", "Состав", "Скидка %", "Доступен"],
 }
+# Опциональные роли: их отсутствие не делает mappings неполными и не блокирует записи.
+OPTIONAL_ROLE_FIELDS = {"durations": ["Услуга", "Длительность"]}
+ALL_ROLE_FIELDS = {**ROLE_FIELDS, **OPTIONAL_ROLE_FIELDS}
 READ_REQUIRED = {
     "bookings": {"ID", "Дата", "Время", "Telegram ID", "Статус"},
     "slots": {"Дата", "Время", "Постов"},
     "services": {"Услуга"},
     "tariffs": {"Тариф", "Состав"},
+    "durations": {"Услуга", "Длительность"},
 }
+SCHEDULE_REQUIRED = {"Начало", "Конец"}
 STATUS_MAP = {"новая": "Новая", "new": "Новая", "confirmed": "Подтверждена",
               "подтверждена": "Подтверждена", "cancelled": "Отмена", "canceled": "Отмена",
               "отменена": "Отмена", "отмена": "Отмена", "выполнена": "Выполнена", "done": "Выполнена"}
@@ -73,6 +84,66 @@ class MappingError(RuntimeError):
 
 class SlotUnavailable(MappingError):
     """Время или пост занят, запись не создана. Текст безопасен для показа клиенту."""
+
+
+DURATION_HEADER_RE = re.compile(r"длительность|duration|время (?:работы|выполнения)|^мин(?:ут\w*)?$|^час(?:ов|ы)?$")
+DURATION_MAX_MINUTES = 12 * 60
+
+
+def is_duration_header(value: Any) -> bool:
+    text = normalize_header(value)
+    return bool(text) and bool(DURATION_HEADER_RE.search(text))
+
+
+def duration_unit_hint(value: Any) -> str | None:
+    """Единица из названия колонки: «Длительность, ч» -> hours, «Длительность, мин» -> minutes."""
+    text = normalize_header(value)
+    if re.search(r"час|hour", text):
+        return "hours"
+    if re.search(r"мин|minute", text):
+        return "minutes"
+    return None
+
+
+def _duration_total(minutes: float) -> int | None:
+    result = int(round(minutes))
+    return result if 0 < result <= DURATION_MAX_MINUTES else None
+
+
+def parse_duration_minutes(value: Any, unit_hint: str | None = None) -> int | None:
+    """Длительность в целых минутах из достоверных табличных форматов, иначе None.
+
+    Понимаются: «90», «90 мин», «1,5 ч», «2 часа», «1 ч 30 мин», «1:30» и диапазон
+    «10:00-11:30». Голое число понимается как минуты, дробное — как часы, если
+    колонка сама не подсказывает единицу. Длительность не выводится из других данных.
+    """
+    text = str(value or "").strip().lower().replace("ё", "е").replace(",", ".")
+    if not text:
+        return None
+    span = re.fullmatch(r"(\d{1,2})[:.](\d{2})\s*[-–—]\s*(\d{1,2})[:.](\d{2})", text)
+    if span:
+        start, end = int(span[1]) * 60 + int(span[2]), int(span[3]) * 60 + int(span[4])
+        return end - start if 0 <= start < end <= 24 * 60 else None
+    combined = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(?:час\w*|ч|hours?|h)\s*(\d+(?:\.\d+)?)?\s*(?:минут\w*|мин|minutes?|m)?", text)
+    if combined and re.search(r"час|hour|\bч\b|\bh\b", text):
+        total = float(combined[1]) * 60 + (float(combined[2]) if combined[2] else 0.0)
+        return _duration_total(total)
+    single = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(час\w*|ч|hours?|h|минут\w*|мин|minutes?|m)", text)
+    if single:
+        hours = re.match(r"час|h|hour", single[2]) is not None
+        return _duration_total(float(single[1]) * (60 if hours else 1))
+    clock = re.fullmatch(r"(\d{1,2})[:.](\d{2})", text)
+    if clock:
+        return _duration_total(int(clock[1]) * 60 + int(clock[2]))
+    number = re.fullmatch(r"(\d+(?:\.\d+)?)", text)
+    if number:
+        amount = float(number[1])
+        if unit_hint == "hours":
+            return _duration_total(amount * 60)
+        if unit_hint == "minutes" or amount.is_integer():
+            return _duration_total(amount)
+        return _duration_total(amount * 60)
+    return None
 
 
 @lru_cache(maxsize=4096)
@@ -180,7 +251,7 @@ def atomic_json(path: Path, data: dict) -> None:
 def header_mapping(headers: list, role: str) -> tuple[dict, list[str]]:
     columns = {}
     errors = []
-    for field in ROLE_FIELDS[role]:
+    for field in ALL_ROLE_FIELDS[role]:
         aliases = {normalize_header(alias) for alias in ALIASES[field]}
         hits = [index for index, header in enumerate(headers, 1) if normalize_header(header) in aliases]
         if len(hits) == 1:
@@ -219,13 +290,44 @@ def diff_structure(before: dict, after: dict) -> dict:
     }
 
 
+def detect_duration_column(snapshot: dict, row_no: int, headers: list, used: set[int]) -> tuple[str, int] | None:
+    """Колонка длительности: название про длительность, все значения разбираются.
+
+    Возвращает (название шапки, номер колонки) или None. Служебные и ценовые
+    колонки не рассматриваются; неоднозначные значения колонку не открывают.
+    """
+    hint = None
+    for column, header in enumerate(headers, 1):
+        if not header or column in used or not is_duration_header(header):
+            continue
+        hint = duration_unit_hint(header)
+        samples = [str(value_at(snapshot["values"], row_index, column)).strip()
+                   for row_index in range(row_no + 1, min(len(snapshot["values"]), row_no + 20) + 1)]
+        samples = [sample for sample in samples if sample]
+        if samples and all(parse_duration_minutes(sample, hint) for sample in samples):
+            return str(header).strip(), column
+    return None
+
+
 def discover(snapshot: dict, expected: dict[str, str]) -> tuple[list[dict], list[str]]:
     """Смотрим только заголовки и типы цен; значения клиентов остаются в памяти."""
     rules = []
     issues = []
     for row_no, headers in enumerate(snapshot["values"][:20], 1):
-        for role in ROLE_FIELDS:
+        for role in ALL_ROLE_FIELDS:
             columns, errors = header_mapping(headers, role)
+            if role == "durations":
+                if any(rule["header_row"] == row_no and "Длительность" in rule.get("columns", {})
+                       for rule in rules if rule["role"] in {"services", "tariffs"}):
+                    continue  # длительность уже разобрана колонкой таблицы услуг/тарифов
+                duration_column = columns.get("Длительность")
+                if not duration_column:
+                    continue
+                samples = [str(value_at(snapshot["values"], sample_row, duration_column)).strip()
+                           for sample_row in range(row_no + 1, min(len(snapshot["values"]), row_no + 20) + 1)]
+                if not any(parse_duration_minutes(sample, duration_unit_hint(headers[duration_column - 1]))
+                           for sample in samples if sample):
+                    continue  # колонка без значений — не таблица длительностей
             source = {"title": True} if role in {"slots", "bookings"} and "Дата" not in columns and title_date(snapshot["title"]) else None
             present = set(columns) | ({"Дата"} if source else set())
             if errors and (snapshot["title"] == expected.get(role) or len(present & READ_REQUIRED[role]) >= len(READ_REQUIRED[role]) - 1):
@@ -235,6 +337,11 @@ def discover(snapshot: dict, expected: dict[str, str]) -> tuple[list[dict], list
             # Слотоподобная строка записей не является отдельной таблицей слотов.
             if role == "slots" and ("Telegram ID" in header_mapping(headers, "bookings")[0]):
                 continue
+            if role == "slots" and any(
+                normalize_header(header) in {normalize_header(alias) for alias in ALIASES["Конец"]}
+                for header in headers if header
+            ):
+                continue  # лист с «Конец» — это график работы, а не таблица слотов
             if role == "tariffs" and ("Услуга" in header_mapping(headers, "services")[0] or
                                       "Telegram ID" in header_mapping(headers, "bookings")[0]):
                 continue
@@ -251,6 +358,10 @@ def discover(snapshot: dict, expected: dict[str, str]) -> tuple[list[dict], list
                     columns.update({field: booking_columns[field] for field in ("Класс", "Сумма")})
                     pivot = True
                 used = set(columns.values())
+                duration = detect_duration_column(snapshot, row_no, headers, used)
+                if duration:
+                    columns["Длительность"] = duration[1]
+                    used.add(duration[1])
                 prices = []
                 for column, header in enumerate(headers, 1):
                     if not header or column in used or normalize_header(header) in NON_PRICE_HEADERS:
@@ -262,8 +373,17 @@ def discover(snapshot: dict, expected: dict[str, str]) -> tuple[list[dict], list
                         columns[str(header)] = column
                         prices.append(str(header))
                 if not prices and not pivot:
-                    issues.append(f"Лист {snapshot['id']}: классы/колонки цен требуют ручной настройки")
+                    if not duration:
+                        issues.append(f"Лист {snapshot['id']}: классы/колонки цен требуют ручной настройки")
                     continue
+            if role == "bookings":
+                # «Длительность» в записях нужна для занятости по интервалам; колонка
+                # опциональна и распознаётся по названию даже на пустом листе.
+                used_bookings = set(columns.values())
+                for column, header in enumerate(headers, 1):
+                    if header and column not in used_bookings and is_duration_header(header):
+                        columns["Длительность"] = column
+                        break
             rule = {"role": role, "sheet_id": snapshot["id"], "sheet_title": snapshot["title"],
                     "header_row": row_no, "first_data_row": row_no + 1, "end_row": None,
                     "columns": columns, "transforms": {"Дата": "date", "Время": "time"},
@@ -276,22 +396,65 @@ def discover(snapshot: dict, expected: dict[str, str]) -> tuple[list[dict], list
                     rule["unresolved_fields"] = [field for field in prices if normalize_header(field) not in KNOWN_PRICE_CLASSES]
                 if pivot:
                     rule["pivot_prices"] = {"class_field": "Класс", "value_field": "Сумма"}
+            if role == "tariffs":
+                duration = detect_duration_column(snapshot, row_no, headers, set(columns.values()))
+                if duration:
+                    columns["Длительность"] = duration[1]
             rule["structure"] = structure(snapshot, rule)
             rule["fingerprint"] = fingerprint(rule["structure"])
             rules.append(rule)
     if not rules:
-        grid = discover_grid(snapshot)
-        if grid:
-            rules.append(grid)
+        schedule = discover_schedule(snapshot)
+        if schedule:
+            rules.append(schedule)
         else:
-            issues.append(f"Лист {snapshot['id']}: структура не распознана; нужна ручная настройка")
+            grid = discover_grid(snapshot)
+            if grid:
+                rules.append(grid)
+            else:
+                issues.append(f"Лист {snapshot['id']}: структура не распознана; нужна ручная настройка")
     # Более одной таблицы одного назначения на листе не выбираем молча.
-    for role in ROLE_FIELDS:
+    for role in ALL_ROLE_FIELDS:
         candidates = [row_index for row_index in rules if row_index["role"] == role]
         if len(candidates) > 1:
             rules = [row_index for row_index in rules if row_index["role"] != role]
             issues.append(f"Лист {snapshot['id']}: несколько областей {role}; задайте границы вручную")
     return rules, issues
+
+
+def discover_schedule(snapshot: dict) -> dict | None:
+    """Лист графика работы: Начало + Конец, опционально Дата и Постов.
+
+    Строки без «Дата» задают ежедневный график; строка с датой переопределяет его
+    на эту дату. «Постов» — число параллельных ресурсов в этот интервал.
+    """
+    for row_no, headers in enumerate(snapshot["values"][:20], 1):
+        columns, errors = {}, []
+        for field in ("Начало", "Конец", "Дата", "Постов"):
+            aliases = {normalize_header(alias) for alias in ALIASES[field]}
+            hits = [index for index, header in enumerate(headers, 1) if normalize_header(header) in aliases]
+            if len(hits) == 1:
+                columns[field] = hits[0]
+            elif len(hits) > 1:
+                errors.append(f"Несколько колонок для {field}")
+        if errors or not SCHEDULE_REQUIRED <= set(columns):
+            continue
+        if "Время" in columns or "Telegram ID" in header_mapping(headers, "bookings")[0]:
+            continue
+        source = None
+        if "Дата" not in columns and title_date(snapshot["title"]):
+            source = {"title": True}
+        rule = {"role": "slots", "sheet_id": snapshot["id"], "sheet_title": snapshot["title"],
+                "header_row": row_no, "first_data_row": row_no + 1, "end_row": None,
+                "columns": columns, "schedule_mode": "hours",
+                "transforms": {"Дата": "date", "Начало": "time", "Конец": "time"},
+                "status_map": dict(STATUS_MAP), "write_statuses": {"new": "Новая", "cancelled": "Отмена"},
+                "date_source": source, "permissions": {"read": True, "write": False},
+                "validation": {"read": False, "write": False, "issues": []}}
+        rule["structure"] = structure(snapshot, rule)
+        rule["fingerprint"] = fingerprint(rule["structure"])
+        return rule
+    return None
 
 
 def discover_grid(snapshot: dict) -> dict | None:
@@ -347,7 +510,7 @@ class AdaptiveSheets:
         except (ValueError, OSError):
             raise MappingError("Некорректная или чужая конфигурация Sheets; проверьте файл mappings") from None
         for rule in document["regions"]:
-            if not isinstance(rule, dict) or rule.get("role") not in ROLE_FIELDS:
+            if not isinstance(rule, dict) or rule.get("role") not in ALL_ROLE_FIELDS:
                 raise MappingError("Некорректная область mappings")
             validation = rule.get("validation")
             if (rule.get("validated_rule") != rule_signature(rule) or not isinstance(validation, dict) or
@@ -430,7 +593,7 @@ class AdaptiveSheets:
     def _rule_structure(self, rule: dict, snapshot: dict) -> list[str]:
         errors = []
         columns = rule.get("columns", {})
-        if rule.get("role") not in ROLE_FIELDS or not isinstance(columns, dict):
+        if rule.get("role") not in ALL_ROLE_FIELDS or not isinstance(columns, dict):
             raise MappingError("Неверное назначение области или columns")
         if any(
             not isinstance(field, str) or type(column_index) is not int
@@ -453,9 +616,14 @@ class AdaptiveSheets:
             errors.append("Некорректные номера колонок")
         if len(set(columns.values())) != len(columns):
             errors.append("Два поля ссылаются на одну колонку")
-        allowed = set(ROLE_FIELDS[rule["role"]]) | set(rule.get("price_fields", []))
+        allowed = set(ROLE_FIELDS.get(rule["role"], OPTIONAL_ROLE_FIELDS.get(rule["role"], set())))
+        allowed = allowed | set(rule.get("price_fields", []))
         if rule.get("pivot_prices"):
             allowed.update({"Класс", "Сумма"})
+        if rule.get("schedule_mode") == "hours":
+            allowed.update({"Начало", "Конец"})
+        if "Длительность" in columns:
+            allowed.add("Длительность")
         if set(columns) - allowed:
             errors.append("Неизвестные поля columns")
         first = rule.get("first_data_row")
@@ -508,8 +676,10 @@ class AdaptiveSheets:
             ):
                 errors.append("Некорректные grid_columns")
             present.add("Постов")
+        time_transforms = {"time", "serial_time"}
+        valid = {"Дата": {"date", "serial_date"}, "Время": time_transforms,
+                 "Начало": time_transforms, "Конец": time_transforms}
         for field, transform in rule.get("transforms", {}).items():
-            valid = {"Дата": {"date", "serial_date"}, "Время": {"time", "serial_time"}}
             if (
                 field not in valid
                 or not isinstance(transform, str)
@@ -519,7 +689,8 @@ class AdaptiveSheets:
                 )
             ):
                 errors.append("Некорректное преобразование даты/времени")
-        missing = READ_REQUIRED[rule["role"]] - present
+        required = SCHEDULE_REQUIRED if rule.get("schedule_mode") == "hours" else READ_REQUIRED[rule["role"]]
+        missing = required - present
         if missing:
             errors.append("Не хватает полей: " + ", ".join(sorted(missing)))
         if rule["role"] == "services" and not rule.get("price_fields") and not rule.get("pivot_prices"):
@@ -621,6 +792,14 @@ class AdaptiveSheets:
         previous_headers = rule["structure"]["headers"]
         current_headers = trim_headers(snapshot["values"][rule["header_row"] - 1]) if rule["header_row"] <= len(snapshot["values"]) else []
         aliases, ambiguous = header_mapping(current_headers, rule["role"])
+        for extra_field in ("Начало", "Конец", "Длительность"):
+            if extra_field in rule.get("columns", {}) and extra_field not in aliases:
+                extra_aliases = {normalize_header(alias) for alias in ALIASES[extra_field]}
+                hits = [index for index, header in enumerate(current_headers, 1) if normalize_header(header) in extra_aliases]
+                if len(hits) == 1:
+                    aliases[extra_field] = hits[0]
+                elif len(hits) > 1:
+                    ambiguous.append(f"Несколько колонок для {extra_field}")
         if rule.get("pivot_prices"):
             extras, extra_errors = header_mapping(current_headers, "bookings")
             aliases.update({field_name: field_value for field_name, field_value in extras.items() if field_name in {"Класс", "Сумма"}})
@@ -735,7 +914,7 @@ class AdaptiveSheets:
                        and not all(rule.get("date_source") for rule in group)]
         self.document["ambiguous_roles"] = ambiguous_roles
         self.document["validation_status"] = "valid" if not self.document.get("missing_roles") and not ambiguous_roles and all(
-            rule["validation"]["read"] for rule in self.document["regions"]) else "needs_review"
+            rule["validation"]["read"] for rule in self.document["regions"] if rule["role"] in ROLE_FIELDS) else "needs_review"
         self.document["writes_enabled"] = (self.document["validation_status"] == "valid" and
             all(rule["validation"].get("write") for rule in self.document["regions"] if rule["role"] == "bookings"))
 
@@ -779,14 +958,17 @@ class AdaptiveSheets:
                 continue
             if has_date_source:
                 record["Дата"] = self._date_source(rule, values, title)
-            elif "Дата" in record:
+            elif "Дата" in record and str(record["Дата"]).strip():
                 record["Дата"] = date_value(record["Дата"], date_transform)
             if free is not None:
                 record["Постов"] = str(sum(str(value_at(values, row, column_index)).strip().casefold() in free
                                           for column_index in rule["grid_columns"]))
                 record["__free_capacity__"] = True
-            if "Время" in record:
+            if "Время" in record and str(record["Время"]).strip():
                 record["Время"] = time_value(record["Время"], time_transform)
+            for field in ("Начало", "Конец"):
+                if field in record and str(record[field]).strip():
+                    record[field] = time_value(record[field], transforms.get(field, "time"))
             if statuses is not None:
                 record["Статус"] = statuses.get(normalize_header(record["Статус"]), record["Статус"])
             record["__row__"], record["__sheet_id__"] = row, sheet_id
@@ -864,7 +1046,7 @@ class AdaptiveSheets:
                     raise MappingError("Для длинного прайса нужна одна область services")
                 headers, records = self._pivot_prices(rules[0], records)
             if role == "services":
-                classes = [header for header in headers if header not in {"Услуга", "Описание", "Доступна"}]
+                classes = [header for header in headers if header not in {"Услуга", "Описание", "Доступна", "Длительность"}]
                 if len({header.casefold() for header in classes}) != len(classes):
                     raise MappingError("Повторяющиеся классы автомобилей")
             self._validate_records(role, records)
@@ -903,7 +1085,8 @@ class AdaptiveSheets:
                 if available not in yes_no:
                     raise MappingError("Неизвестное значение доступности услуги/тарифа")
                 if role == "services":
-                    price_fields = [field_name for field_name in record if field_name not in {"Услуга", "Описание", "Доступна", "__row__", "__sheet_id__"}]
+                    price_fields = [field_name for field_name in record if field_name not in
+                                    {"Услуга", "Описание", "Доступна", "Длительность", "__row__", "__sheet_id__"}]
                     if len({field_name.casefold() for field_name in price_fields}) != len(price_fields):
                         raise MappingError("Повторяющиеся классы автомобилей")
                     for field in price_fields:
@@ -924,10 +1107,31 @@ class AdaptiveSheets:
             if any(not name for name in names) or len(names) != len(set(names)):
                 raise MappingError(f"Пустые или повторяющиеся названия {role}")
             return
+        if role == "durations":
+            names = [record.get("Услуга", "").casefold() for record in records]
+            if any(not name for name in names) or len(names) != len(set(names)):
+                raise MappingError("Пустые или повторяющиеся услуги в длительностях")
+            return
         if role not in {"slots", "bookings"}:
             return
         identifiers = set()
         for record in records:
+            if role == "slots" and "Начало" in record:
+                start_text, end_text = str(record.get("Начало", "")).strip(), str(record.get("Конец", "")).strip()
+                if not start_text and not end_text:
+                    continue
+                start, end = parse_time(start_text), parse_time(end_text)
+                if not start or not end or start >= end:
+                    raise MappingError(f"Некорректный интервал графика работы, лист {record['__sheet_id__']}, строка {record['__row__']}")
+                raw = str(record.get("Постов", "")).strip()
+                if raw:
+                    try:
+                        number = float(raw.replace(",", "."))
+                        if number < 0 or not number.is_integer():
+                            raise ValueError
+                    except ValueError:
+                        raise MappingError("Некорректное количество постов") from None
+                continue
             if not parse_date(record.get("Дата", "")) or not parse_time(record.get("Время", "")):
                 raise MappingError(f"Некорректная дата/время {role}, лист {record['__sheet_id__']}, строка {record['__row__']}")
             if role == "bookings":

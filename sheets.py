@@ -12,7 +12,7 @@ import threading
 import time
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -23,7 +23,8 @@ from requests.exceptions import ConnectionError as HTTPConnectionError, Timeout 
 from google.auth.exceptions import TransportError
 
 from config import Config
-from adaptive import AdaptiveSheets, BOOKING_FIELDS, MappingError, SlotUnavailable, cell_name
+from adaptive import (AdaptiveSheets, BOOKING_FIELDS, MappingError, SlotUnavailable, cell_name,
+                      is_duration_header, parse_duration_minutes)
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +33,8 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 WORK_START_HOUR = 9
 WORK_END_HOUR = 19
+# Шаг перебора вариантов начала для записи по длительности услуги.
+FREE_START_STEP_MIN = 30
 WORK_HOURS_HINT = "Мы работаем ежедневно с 9:00 до 19:00. Выберите время в этом интервале."
 
 
@@ -60,7 +63,7 @@ def within_work_hours(value: str) -> bool:
     return WORK_START_HOUR <= hour <= WORK_END_HOUR and 0 <= minute <= 59
 
 # Служебные колонки листа «Услуги». ВСЕ остальные колонки — это классы (габариты) автомобилей.
-SERVICE_FIXED_COLS = {"услуга", "описание", "доступна"}
+SERVICE_FIXED_COLS = {"услуга", "описание", "доступна", "длительность"}
 
 # Колонки листа «Записи». Порядок в таблице может быть любым — бот ищет колонки по названию.
 BOOKING_HEADERS = BOOKING_FIELDS
@@ -155,6 +158,38 @@ class FreeCapacity(int):
     """Число уже свободных боксов, а не общая вместимость."""
 
 
+def time_to_minutes(value: str) -> int | None:
+    parsed = parse_time(value)
+    if not parsed:
+        return None
+    hour, minute = (int(part) for part in parsed.split(":"))
+    return hour * 60 + minute
+
+
+def minutes_label(value: int) -> str:
+    return f"{value // 60:02d}:{value % 60:02d}"
+
+
+@dataclass
+class DurationSchedule:
+    """График работы для записи по длительности услуги.
+
+    «daily» — интервалы и ресурсы для дней без отдельной строки; строка с датой
+    переопределяет график на эту дату. Значения берутся из таблицы, не выводятся.
+    """
+
+    daily: tuple[tuple[int, int], ...] = ()
+    daily_posts: int = 1
+    by_date: dict[date, tuple[tuple[int, int], ...]] = field(default_factory=dict)
+    posts_by_date: dict[date, int] = field(default_factory=dict)
+
+    def intervals(self, day: date) -> tuple[tuple[int, int], ...]:
+        return self.by_date.get(day, self.daily)
+
+    def posts(self, day: date) -> int:
+        return self.posts_by_date.get(day, self.daily_posts)
+
+
 # ───────────────────────────── модель данных ─────────────────────────────
 
 @dataclass
@@ -163,6 +198,7 @@ class Service:
     description: str
     available: bool
     prices: dict[str, int]          # класс автомобиля -> цена
+    duration_minutes: int | None = None  # из таблицы; None — данных нет, не выводим
 
 
 @dataclass
@@ -171,6 +207,7 @@ class Tariff:
     items: list[str]                # названия услуг из листа «Услуги»
     discount: float                 # скидка в % за комплекс
     enabled: bool
+    duration_minutes: int | None = None  # суммарная длительность пакета, если указана
 
 
 @dataclass
@@ -180,6 +217,8 @@ class Catalog:
     tariffs: dict[str, Tariff]
     # Пары «автомобиль, класс» из необязательного листа «Классы».
     class_rules: list[tuple[str, str]] = field(default_factory=list)
+    # В таблице есть достоверные длительности: запись по длительности возможна.
+    durations_present: bool = False
 
     # ---- классы автомобилей
     def match_class(self, value: str) -> str | None:
@@ -307,7 +346,7 @@ class Catalog:
 
         if not lines:
             return self._catalog_error("Не выбран ни тариф, ни услуги")
-        return {
+        result = {
             "ok": True,
             "size_class": size_class,
             "tariff": tariff_name,
@@ -315,6 +354,52 @@ class Catalog:
             "lines": lines,
             "total": int(round(total)),
         }
+        if self.durations_present:
+            duration, missing = self._duration_for(tariff_name, covered, extras)
+            if duration is not None and not missing:
+                result["duration_minutes"] = duration
+            if missing:
+                result["duration_missing"] = missing
+        return result
+
+    def _duration_for(self, tariff_name: str | None, covered: set[str], extras: list[str]) -> tuple[int | None, list[str]]:
+        """Длительность заказа: пакет целиком плюс доп. услуги, иначе сумма услуг.
+
+        Нет достоверного значения хотя бы для одной позиции — «missing», ничего не выводим.
+        """
+        missing: list[str] = []
+        total = 0
+        if tariff_name:
+            selected = self.tariffs.get(tariff_name.lower())
+            if selected and selected.duration_minutes is not None:
+                total += selected.duration_minutes
+            else:
+                for item in sorted(covered):
+                    service = self.services.get(item)
+                    if service is None or service.duration_minutes is None:
+                        missing.append(service.name if service else item)
+                    else:
+                        total += service.duration_minutes
+        for name in extras:
+            service = self.services.get(name.lower())
+            if service is None or service.duration_minutes is None:
+                missing.append(service.name if service else name)
+            else:
+                total += service.duration_minutes
+        return (total if total and not missing else None), missing
+
+    def shortest_duration(self) -> int | None:
+        """Минимальная известная длительность — оценка «а куда вообще можно успеть»."""
+        known = [service.duration_minutes for service in self.services.values() if service.duration_minutes]
+        known += [tariff.duration_minutes for tariff in self.tariffs.values() if tariff.duration_minutes]
+        return min(known) if known else None
+
+    def duration_for(self, tariff: str | None, services: list[str] | None) -> int | None:
+        """Длительность выбранного заказа или None, если данных недостаточно."""
+        if not self.durations_present:
+            return None
+        duration, missing = self._duration_for((tariff or "").strip() or None, set(), list(services or []))
+        return duration if not missing else None
 
     def _catalog_error(self, text: str) -> dict:
         return _failure(
@@ -502,6 +587,7 @@ class Store:
         if self._adaptive and observed is None:
             observed = self._adaptive.observe(roles=("services", "tariffs"))
         headers, rows = self._table(self.config.sheet_services, observed)
+        service_duration_header = next((header for header in headers if is_duration_header(header)), None)
         # Классы без повторов: две колонки с одинаковым названием (даже в
         # разном регистре) не должны удваивать выбор в прайсе и подсказках.
         classes: list[str] = []
@@ -530,9 +616,11 @@ class Store:
                 description=pick(record, "Описание"),
                 available=is_yes(pick(record, "Доступна"), default=True),
                 prices=prices,
+                duration_minutes=self._duration_value(record.get(service_duration_header, "")) if service_duration_header else None,
             )
 
-        _, tariff_rows = self._table(self.config.sheet_tariffs, observed)
+        tariff_headers, tariff_rows = self._table(self.config.sheet_tariffs, observed)
+        tariff_duration_header = next((header for header in tariff_headers if is_duration_header(header)), None)
         tariffs: dict[str, Tariff] = {}
         for record in tariff_rows:
             name = pick(record, "Тариф")
@@ -548,8 +636,71 @@ class Store:
                 items=items,
                 discount=to_number(pick(record, "Скидка %", "Скидка")) or 0.0,
                 enabled=is_yes(pick(record, "Доступен", "Доступна"), default=True),
+                duration_minutes=self._duration_value(record.get(tariff_duration_header, "")) if tariff_duration_header else None,
             )
-        return Catalog(classes, services, tariffs, self._load_class_rules(classes))
+        self._apply_duration_overrides(services)
+        durations_present = any(service.duration_minutes for service in services.values()) or any(
+            tariff.duration_minutes for tariff in tariffs.values())
+        return Catalog(classes, services, tariffs, self._load_class_rules(classes), durations_present)
+
+    @staticmethod
+    def _duration_value(raw: Any) -> int | None:
+        """Минуты из ячейки; нечитаемое значение — «данных нет», а не догадка."""
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        minutes = parse_duration_minutes(text)
+        if minutes is None:
+            log.warning("Не удалось прочитать длительность «%s» — значение пропущено", text)
+        return minutes
+
+    def _apply_duration_overrides(self, services: dict[str, Service]) -> None:
+        """Лист «Длительности»: «Услуга» + «Длительность». Противоречие отключает значение."""
+        for name, minutes in self._duration_overrides().items():
+            service = services.get(name)
+            if service is None:
+                log.warning("Длительность «%s» отброшена: услуги нет в прайсе", name)
+                continue
+            if service.duration_minutes is not None and service.duration_minutes != minutes:
+                log.warning("Противоречивые длительности «%s» (%s и %s) — значение не используется",
+                            service.name, service.duration_minutes, minutes)
+                services[name] = replace(service, duration_minutes=None)
+            else:
+                services[name] = replace(service, duration_minutes=minutes)
+
+    def _duration_overrides(self) -> dict[str, int]:
+        if self._adaptive:
+            try:
+                _, rows = self._adaptive.table("durations")
+            except MappingError:
+                return {}  # листа длительностей нет или он не подтверждён: это допустимо
+        else:
+            try:
+                values = self._get_spreadsheet().worksheet(self.config.sheet_durations).get_all_values()
+            except (WorksheetNotFound, StopIteration):
+                return {}
+            except Exception as error:
+                log.warning("Не удалось прочитать лист «%s» (%s)", self.config.sheet_durations, type(error).__name__)
+                return {}
+            if not values:
+                return {}
+            headers = [str(header).strip() for header in values[0]]
+            service_column = next((index for index, header in enumerate(headers)
+                                   if header.lower() in {"услуга", "service", "название"}), None)
+            duration_column = next((index for index, header in enumerate(headers) if is_duration_header(header)), None)
+            if service_column is None or duration_column is None:
+                log.warning("Лист «%s»: нужны колонки «Услуга» и «Длительность»", self.config.sheet_durations)
+                return {}
+            rows = [{headers[service_column]: (raw[service_column] if service_column < len(raw) else ""),
+                     headers[duration_column]: (raw[duration_column] if duration_column < len(raw) else "")}
+                    for raw in values[1:]]
+        overrides: dict[str, int] = {}
+        for record in rows:
+            name = str(pick(record, "Услуга") or "").strip()
+            minutes = self._duration_value(pick(record, "Длительность"))
+            if name and minutes:
+                overrides[name.lower()] = minutes
+        return overrides
 
     # ---------- правила классов (лист «Классы») ----------
     def _load_class_rules(self, classes: list[str]) -> list[tuple[str, str]]:
@@ -618,8 +769,12 @@ class Store:
         return result
 
     # ---------- слоты и записи ----------
-    def _load_slots(self) -> dict[tuple[date, str], int]:
+    def _load_slots(self) -> dict[tuple[date, str], int] | DurationSchedule:
         _, rows = self._table(self.config.sheet_slots)
+        if any("Начало" in record for record in rows):
+            if any("Время" in record for record in rows):
+                raise MappingError("Смешаны часовая вместимость и график работы; нужна одна раскладка")
+            return self._load_duration_schedule(rows)
         slots: dict[tuple[date, str], int] = {}
         for record in rows:
             booking_date, booking_time = parse_date(pick(record, "Дата")), parse_time(pick(record, "Время"))
@@ -634,6 +789,113 @@ class Store:
             total = slots.get(key, 0) + capacity
             slots[key] = FreeCapacity(total) if free else total
         return slots
+
+    @staticmethod
+    def _load_duration_schedule(rows: list[dict[str, Any]]) -> DurationSchedule:
+        """График работы: строки «Начало/Конец», опционально «Дата» и «Постов»."""
+        daily: list[tuple[int, int]] = []
+        daily_posts: int | None = None
+        by_date: dict[date, list[tuple[int, int]]] = {}
+        posts_by_date: dict[date, int] = {}
+        for record in rows:
+            start, end = time_to_minutes(str(record.get("Начало", "")).strip()), time_to_minutes(str(record.get("Конец", "")).strip())
+            if start is None and end is None:
+                continue
+            if start is None or end is None or start >= end:
+                raise MappingError("Некорректный интервал графика работы")
+            raw = str(record.get("Постов", "")).strip()
+            posts = 1
+            if raw:
+                value = to_number(raw)
+                if value is None or value < 0 or not float(value).is_integer():
+                    raise MappingError("Некорректное количество постов")
+                posts = int(value)
+            day_text = str(record.get("Дата", "")).strip()
+            day = parse_date(day_text) if day_text else None
+            if day:
+                if posts_by_date.get(day, posts) != posts:
+                    raise MappingError("Противоречивое число постов для одной даты")
+                by_date.setdefault(day, []).append((start, end))
+                posts_by_date[day] = posts
+            else:
+                if daily_posts not in (None, posts):
+                    raise MappingError("Противоречивое число постов в графике работы")
+                daily_posts = posts
+                daily.append((start, end))
+        if not daily and not by_date:
+            raise MappingError("В графике работы нет ни одного интервала")
+        return DurationSchedule(tuple(daily), daily_posts if daily_posts is not None else 1,
+                                {day: tuple(spans) for day, spans in by_date.items()}, posts_by_date)
+
+    # ---------- запись по длительности услуги ----------
+    def _booking_intervals(self, rows: list[dict[str, Any]], exclude: dict[str, Any] | None = None) -> tuple[list[tuple[date, int, int]], set[date]]:
+        """Занятые интервалы активных записей и дни с записями без длительности."""
+        intervals: list[tuple[date, int, int]] = []
+        missing: set[date] = set()
+        for record in rows:
+            if exclude is not None and record is exclude:
+                continue
+            if not self._is_active(record):
+                continue
+            booking_date, booking_time = parse_date(pick(record, "Дата")), parse_time(pick(record, "Время"))
+            if not booking_date or not booking_time:
+                continue
+            raw = str(pick(record, "Длительность") or "").strip()
+            minutes = parse_duration_minutes(raw) if raw else None
+            start = time_to_minutes(booking_time)
+            if minutes is None or start is None:
+                missing.add(booking_date)
+                continue
+            intervals.append((booking_date, start, start + minutes))
+        return intervals, missing
+
+    def _duration_free_starts(self, schedule: DurationSchedule, day: date,
+                              intervals: list[tuple[date, int, int]], duration: int) -> list[int]:
+        """Начала, куда услуга целиком помещается в график и лимит ресурсов."""
+        same_day = [(start, end) for booked_day, start, end in intervals if booked_day == day]
+        candidates: set[int] = set()
+        for begin, end in schedule.intervals(day):
+            cursor = begin
+            while cursor + duration <= end:
+                candidates.add(cursor)
+                cursor += FREE_START_STEP_MIN
+            for booked_start, booked_end in same_day:
+                if begin < booked_start and booked_end <= end and booked_start + duration <= end:
+                    candidates.add(booked_start)  # старт сразу после освобождения ресурса
+        free = []
+        for start in sorted(candidates):
+            busy = sum(1 for booked_start, booked_end in same_day if booked_start < start + duration and start < booked_end)
+            if busy < schedule.posts(day):
+                free.append(start)
+        return free
+
+    def _duration_free_times(self, schedule: DurationSchedule, intervals: list[tuple[date, int, int]],
+                             missing: set[date], day: date, duration: int) -> list[str]:
+        if day in missing:
+            return []
+        return [minutes_label(start) for start in self._duration_free_starts(schedule, day, intervals, duration)
+                if self._is_future(day, minutes_label(start))]
+
+    def _quote_duration(self, quote: dict) -> tuple[int | None, list[str]]:
+        return quote.get("duration_minutes"), list(quote.get("duration_missing", []))
+
+    def _check_duration_start(self, schedule: DurationSchedule, rows: list[dict[str, Any]], day: date,
+                              time_text: str, duration: int, exclude: dict | None = None) -> str | None:
+        """None — старт подходит; иначе причина отказа (без выдуманных правил)."""
+        start = time_to_minutes(time_text)
+        if start is None:
+            return "Неверное время записи"
+        intervals, missing = self._booking_intervals(rows)
+        if day in missing:
+            return "В записях за этот день нет длительности; обратитесь к администратору"
+        same_day = [(booked_start, booked_end) for booked_day, booked_start, booked_end in intervals if booked_day == day]
+        for begin, end in schedule.intervals(day):
+            if begin <= start and start + duration <= end:
+                busy = sum(1 for booked_start, booked_end in same_day if booked_start < start + duration and start < booked_end)
+                if busy < schedule.posts(day):
+                    return None
+                return "Интервал занят: нет свободного поста на всю длительность услуги"
+        return "Это время вне графика работы"
 
     def analytics_snapshot(self) -> tuple[list[dict[str, Any]], dict]:
         """Свежие строки «Записи» и вместимость «Слоты» для статистики (только чтение)."""
@@ -696,7 +958,7 @@ class Store:
             if slot_date == requested_date and self._capacity_left(slots, busy, (slot_date, slot_time)) > 0 and self._is_future(slot_date, slot_time)
         )
 
-    def free_slots(self, date_str: str | None = None, days: int = 7) -> dict:
+    def free_slots(self, date_str: str | None = None, days: int = 7, duration_minutes: int | None = None) -> dict:
         if date_str:
             booking_date = parse_date(date_str)
             if not booking_date:
@@ -713,6 +975,8 @@ class Store:
                 _, booking_rows = self._get_bookings()
             finally:
                 self._observed = previous
+        if isinstance(slots, DurationSchedule):
+            return self._free_slots_duration(slots, booking_rows, dates[0] if date_str else None, days, duration_minutes)
         busy = self._booked_capacity(booking_rows)
         if not date_str:
             today = self.now().date()
@@ -735,6 +999,48 @@ class Store:
             )
         return output
 
+    def _free_slots_duration(self, schedule: DurationSchedule, booking_rows: list[dict[str, Any]],
+                             requested: date | None, days: int, duration_minutes: int | None) -> dict:
+        """Свободные старты для записи по длительности; без данных — безопасный отказ.
+
+        Без выбранной услуги длительность не выдумывается: используется минимальная
+        известная длительность, а финальная проверка при записи считает точно.
+        """
+        duration = duration_minutes
+        if not duration:
+            duration = self.get_catalog().shortest_duration()
+        if not duration:
+            return _failure("Нет данных о длительности услуг: свободное время посчитать нельзя. "
+                            "Уточните услугу или обратитесь к администратору.")
+        if requested:
+            dates = [requested]
+        else:
+            today = self.now().date()
+            dates = [today + timedelta(days=index) for index in range(days)]
+        intervals, missing = self._booking_intervals(booking_rows)
+        result = []
+        for day in dates:
+            times = self._duration_free_times(schedule, intervals, missing, day, duration)
+            if times or requested:
+                result.append({
+                    "date": day.isoformat(),
+                    "weekday": WEEKDAYS_RU[day.weekday()],
+                    "free_times": times,
+                })
+        output: dict[str, Any] = {"ok": True, "days": result}
+        notes = []
+        if not any(day["free_times"] for day in result):
+            notes.append("Свободного времени на эту дату нет." if requested
+                         else f"На ближайшие {days} дней свободного времени нет.")
+        if missing:
+            notes.append("Есть записи без длительности: такие дни требуют ручной проверки администратором.")
+        if requested and duration_minutes is None and duration != duration_minutes:
+            notes.append(f"Показаны варианты для минимальной длительности {duration} мин; "
+                         "точная проверка будет по выбранной услуге.")
+        if notes:
+            output["note"] = " ".join(notes)
+        return output
+
     # ---------- создание записи ----------
     def create_booking(
         self, *, date_str: str, time_str: str, name: str, phone: str, car: str,
@@ -745,8 +1051,6 @@ class Store:
         booking_date, booking_time = parse_date(date_str), parse_time(to_work_time(time_str))
         if not booking_date or not booking_time:
             return _failure("Неверная дата или время. Нужно: дата ГГГГ-ММ-ДД, время ЧЧ:ММ")
-        if not within_work_hours(booking_time):
-            return _failure(WORK_HOURS_HINT)
         name, car = (name or "").strip(), (car or "").strip()
         if not name:
             return _failure("Не указано имя клиента")
@@ -778,15 +1082,35 @@ class Store:
                               and pick(record, "Автомобиль").casefold() == car.casefold() and self._is_active(record)), None)
             if duplicate:
                 return _failure("У клиента уже есть такая запись", booking_id=pick(duplicate, "ID"))
-            busy = self._booked_capacity(booking_rows)
-            if self._capacity_left(slots, busy, (booking_date, booking_time)) <= 0:
-                return _failure(
-                    "Это время недоступно или уже занято",
-                    free_times_that_day=self._free_times(booking_date, slots, busy),
-                )
+            duration_minutes = None
+            if isinstance(slots, DurationSchedule):
+                if not catalog.durations_present:
+                    return _failure("Нет данных о длительности услуг; обратитесь к администратору")
+                duration_minutes, duration_missing = self._quote_duration(quote)
+                if duration_missing or not duration_minutes:
+                    detail = ", ".join(duration_missing) if duration_missing else "не выбрана услуга или тариф"
+                    return _failure(f"Нет данных о длительности: {detail}. Уточните у администратора.")
+                if "Длительность" not in headers:
+                    return _failure("В таблице записей нет колонки «Длительность»; обратитесь к администратору")
+                problem = self._check_duration_start(slots, booking_rows, booking_date, booking_time, duration_minutes)
+                if problem:
+                    intervals, missing = self._booking_intervals(booking_rows)
+                    return _failure(problem, free_times_that_day=self._duration_free_times(
+                        slots, intervals, missing, booking_date, duration_minutes))
+            else:
+                if not within_work_hours(booking_time):
+                    return _failure(WORK_HOURS_HINT)
+                busy = self._booked_capacity(booking_rows)
+                if self._capacity_left(slots, busy, (booking_date, booking_time)) <= 0:
+                    return _failure(
+                        "Это время недоступно или уже занято",
+                        free_times_that_day=self._free_times(booking_date, slots, busy),
+                    )
 
             if expected_quote is not None:
-                fields = ("size_class", "tariff", "extras", "lines", "total")
+                fields = ["size_class", "tariff", "extras", "lines", "total"]
+                if quote.get("duration_minutes") is not None or expected_quote.get("duration_minutes") is not None:
+                    fields.append("duration_minutes")
                 if any(quote.get(field_name) != expected_quote.get(field_name) for field_name in fields):
                     return _failure("Цена или состав услуги изменились; нужно новое подтверждение",
                                  quote_changed=True, quote=dict(quote, currency=self.config.currency))
@@ -826,6 +1150,7 @@ class Store:
                 "telegram id": str(telegram_id),
                 "username": f"@{username}" if username else "",
                 "статус": "Новая",
+                **({} if duration_minutes is None else {"длительность": str(duration_minutes)}),
             }
             if self._adaptive:
                 try:
@@ -1121,10 +1446,22 @@ class Store:
                     self._adaptive.validate_reschedule(record, new_date.isoformat())
                 except MappingError as error:
                     return _failure(str(error))
-            busy = self._booked_capacity([row for row in rows if row is not record])
-            if self._capacity_left(slots, busy, (new_date, new_time)) <= 0:
-                return _failure("Новое время занято. Исходная запись сохранена",
-                                free_times_that_day=self._free_times(new_date, slots, busy))
+            if isinstance(slots, DurationSchedule):
+                raw = str(pick(record, "Длительность") or "").strip()
+                moved_duration = parse_duration_minutes(raw) if raw else None
+                if not moved_duration:
+                    return _failure("В записи нет длительности; перенести нельзя. Обратитесь к администратору")
+                problem = self._check_duration_start(slots, rows, new_date, new_time, moved_duration, exclude=record)
+                if problem:
+                    intervals, missing = self._booking_intervals(rows)
+                    return _failure(f"{problem}. Исходная запись сохранена",
+                                    free_times_that_day=self._duration_free_times(
+                                        slots, intervals, missing, new_date, moved_duration))
+            else:
+                busy = self._booked_capacity([row for row in rows if row is not record])
+                if self._capacity_left(slots, busy, (new_date, new_time)) <= 0:
+                    return _failure("Новое время занято. Исходная запись сохранена",
+                                    free_times_that_day=self._free_times(new_date, slots, busy))
             result = {"ok": True, "booking": current, "booking_id": str(booking_id),
                       "date": new_date.isoformat(), "time": new_time, "car": current["car"],
                       "total": current["total"], "currency": self.config.currency}
