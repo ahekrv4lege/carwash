@@ -112,8 +112,8 @@
 
 - Чистка и починка проверок перенесены с dev на main (rebase): удалены
   mapping_ai, proofread, outputs/ и debug-отчёт; 465 тестов зелёные.
-- Добавлены шаблоны `env.example` и `credentials.json.example` для публикации
-  без секретов.
+- Добавлен шаблон `credentials.json.example` для публикации без секретов.
+  (Шаблон `env.example` позже удалён: конфигурация ведётся только в реальном `.env`.)
 - Удалён отладочный скрипт `checks/debug_tables.py`: те же 28 сценариев
   порчи покрывают `test_corrupted_tables.py` и `test_bad_tables_isolated.py`.
 - README и USAGE.txt синхронизированы с актуальным набором тестов и именами.
