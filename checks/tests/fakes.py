@@ -5,15 +5,17 @@ from dataclasses import replace
 from itertools import count
 from pathlib import Path
 import re
+import secrets
 import shutil
 import tempfile
 
-from config import Config
+from config import ROOT, Config
 from sheets import BOOKING_HEADERS, Store
 
-# Уникальный префикс токена на фикстуру: сводки предложений пишутся в
-# .runtime/proposals-<префикс>/, и без уникальности тесты наследуют
-# чужие предложения через общий каталог.
+# Уникальный префикс токена на процесс и фикстуру: сводки предложений пишутся в
+# .runtime/proposals-<префикс>/, и повтор префикса между запусками наследовал бы
+# чужие предложения через общий каталог (это давало редкий сбой test_phase2).
+_TOKEN_PREFIX = 100_000_000 + secrets.randbelow(900_000_000)
 _TOKENS = count(1)
 # Файлы памяти клиентов тестов: отдельная временная папка, не рабочая директория.
 _MEMORY_DIR = Path(tempfile.mkdtemp(prefix="carwash-memory-"))
@@ -139,7 +141,9 @@ class Spreadsheet:
 
 
 def config(path, **kwargs):
-    token = f"123456{next(_TOKENS):04d}:synthetic_token_never_used_12345"
+    prefix = f"{_TOKEN_PREFIX}{next(_TOKENS):04d}"
+    token = f"{prefix}:synthetic_token_never_used_12345"
+    atexit.register(shutil.rmtree, ROOT / ".runtime" / f"proposals-{prefix}", True)
     cfg = Config(bot_token=token, ai_api_key="synthetic",
                  ai_model="existing-model", spreadsheet_id="synthetic-spreadsheet",
                  google_credentials_file="unused", timezone="Europe/Moscow", carwash_name="Test",
