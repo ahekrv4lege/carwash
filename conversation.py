@@ -212,7 +212,11 @@ def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
             result[field] = value
             continue
         if field == "car_model":
-            if not grounded.get("car") or folded(grounded["car"]) not in folded(source):
+            # Grounding car_model: значение должно быть дословными словами клиента,
+            # а известная машина — согласованной с ним (цитата модели может быть короче).
+            car_known = grounded.get("car") or known.get("car") or ""
+            if (not car_known or folded(car_known) not in folded(source)) \
+                    and folded(value) not in folded(text_value):
                 raise ValueError("missing_car_source")
         elif field in CATALOG_FIELDS:
             if catalog is None:
