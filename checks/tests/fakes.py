@@ -1,9 +1,12 @@
 """Только синтетические таблицы. Сетевые клиенты здесь не создаются."""
+import atexit
 from copy import deepcopy
 from dataclasses import replace
 from itertools import count
 from pathlib import Path
 import re
+import shutil
+import tempfile
 
 from config import Config
 from sheets import BOOKING_HEADERS, Store
@@ -12,6 +15,9 @@ from sheets import BOOKING_HEADERS, Store
 # .runtime/proposals-<префикс>/, и без уникальности тесты наследуют
 # чужие предложения через общий каталог.
 _TOKENS = count(1)
+# Файлы памяти клиентов тестов: отдельная временная папка, не рабочая директория.
+_MEMORY_DIR = Path(tempfile.mkdtemp(prefix="carwash-memory-"))
+atexit.register(shutil.rmtree, _MEMORY_DIR, True)
 
 
 def coord(cell):
@@ -142,7 +148,7 @@ def config(path, **kwargs):
                  sheet_services="Услуги", sheet_tariffs="Тарифы", sheet_slots="Слоты", sheet_bookings="Записи",
                  sheet_classes="Классы",
                  sheets_adaptive_enabled=True, sheets_mapping_file=str(Path(path) / "mapping.json"),
-                 vehicle_memory_file=str(Path(path) / f"vehicles-{next(_TOKENS)}.sqlite3"))
+                 vehicle_memory_file=str(_MEMORY_DIR / f"vehicles-{next(_TOKENS)}.sqlite3"))
     return replace(cfg, **kwargs)
 
 
