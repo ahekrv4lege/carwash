@@ -23,7 +23,7 @@ from requests.exceptions import ConnectionError as HTTPConnectionError, Timeout 
 from google.auth.exceptions import TransportError
 
 from config import Config
-from adaptive import AdaptiveSheets, BOOKING_FIELDS, MappingError, cell_name
+from adaptive import AdaptiveSheets, BOOKING_FIELDS, MappingError, SlotUnavailable, cell_name
 
 log = logging.getLogger(__name__)
 
@@ -683,10 +683,17 @@ class Store:
                 busy[(booking_date, booking_time)] += 1
         return busy
 
+    @staticmethod
+    def _capacity_left(slots: dict, busy: Counter, key: tuple) -> int:
+        capacity = slots.get(key, 0)
+        if isinstance(capacity, FreeCapacity):
+            return int(capacity)  # сетка: уже учитывает занятые клетки
+        return capacity - busy.get(key, 0)
+
     def _free_times(self, requested_date: date, slots: dict, busy: Counter) -> list[str]:
         return sorted(
-            slot_time for (slot_date, slot_time), capacity in slots.items()
-            if slot_date == requested_date and capacity - (0 if isinstance(capacity, FreeCapacity) else busy.get((slot_date, slot_time), 0)) > 0 and self._is_future(slot_date, slot_time)
+            slot_time for (slot_date, slot_time) in slots
+            if slot_date == requested_date and self._capacity_left(slots, busy, (slot_date, slot_time)) > 0 and self._is_future(slot_date, slot_time)
         )
 
     def free_slots(self, date_str: str | None = None, days: int = 7) -> dict:
@@ -772,7 +779,7 @@ class Store:
             if duplicate:
                 return _failure("У клиента уже есть такая запись", booking_id=pick(duplicate, "ID"))
             busy = self._booked_capacity(booking_rows)
-            if slots.get((booking_date, booking_time), 0) - busy.get((booking_date, booking_time), 0) <= 0:
+            if self._capacity_left(slots, busy, (booking_date, booking_time)) <= 0:
                 return _failure(
                     "Это время недоступно или уже занято",
                     free_times_that_day=self._free_times(booking_date, slots, busy),
@@ -821,7 +828,10 @@ class Store:
                 "статус": "Новая",
             }
             if self._adaptive:
-                self._adaptive.create(data, expected_bookings=booking_rows)
+                try:
+                    self._adaptive.create(data, expected_bookings=booking_rows)
+                except SlotUnavailable as error:
+                    return _failure(str(error), free_times_that_day=self._free_times(booking_date, slots, busy))
             else:
                 self._invalidate("slots", "bookings")
                 if self._get_slots() != slots or self._get_bookings() != (headers, booking_rows):
@@ -1053,8 +1063,9 @@ class Store:
             column = next((index for index, header in enumerate(headers, 1) if header.strip().lower() == "статус"), None)
             if not column:
                 return _failure("В таблице нет колонки «Статус»")
+            grid_released = None
             if self._adaptive:
-                self._adaptive.cancel(record, telegram_id)
+                grid_released = self._adaptive.cancel(record, telegram_id)
             else:
                 worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
                 self._invalidate("bookings")
@@ -1070,7 +1081,8 @@ class Store:
                 "booking_id": str(booking_id),
                 "date": booking_date.isoformat() if booking_date else "",
                 "time": booking_time or "",
-                "message": "Запись отменена, слот освобождён",
+                "message": ("Запись отменена, слот освобождён" if grid_released in (None, True)
+                            else "Запись отменена; место в сетке постов не освобождено автоматически, проверьте таблицу"),
             }
 
     def reschedule_booking(self, booking_id: Any, telegram_id: int, date_str: str, time_str: str,
@@ -1110,7 +1122,7 @@ class Store:
                 except MappingError as error:
                     return _failure(str(error))
             busy = self._booked_capacity([row for row in rows if row is not record])
-            if slots.get((new_date, new_time), 0) - busy.get((new_date, new_time), 0) <= 0:
+            if self._capacity_left(slots, busy, (new_date, new_time)) <= 0:
                 return _failure("Новое время занято. Исходная запись сохранена",
                                 free_times_that_day=self._free_times(new_date, slots, busy))
             result = {"ok": True, "booking": current, "booking_id": str(booking_id),
@@ -1121,7 +1133,10 @@ class Store:
             user_no = str(self._user_booking_position(rows, telegram_id, new_date, new_time, exclude=record))
             result["user_no"] = user_no
             if self._adaptive:
-                self._adaptive.reschedule(record, telegram_id, new_date.isoformat(), new_time)
+                try:
+                    self._adaptive.reschedule(record, telegram_id, new_date.isoformat(), new_time)
+                except SlotUnavailable as error:
+                    return _failure(f"{error}. Исходная запись сохранена", free_times_that_day=self._free_times(new_date, slots, busy))
             else:
                 columns = {header.strip().lower(): index for index, header in enumerate(headers, 1)}
                 if not {"дата", "время"} <= columns.keys():

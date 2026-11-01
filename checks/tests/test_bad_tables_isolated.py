@@ -80,13 +80,15 @@ class Tables(unittest.TestCase):
         self.assertEqual(len(sheet.worksheet('Записи').writes), 3)
 
     def test_unsafe_tables_block_create(self):
-        for n in (2, 3, 4, 6):
+        # 02_bays — датированная сетка боксов с однозначной шапкой: запись в неё теперь поддержана
+        # (test_grid_booking). Остальные случаи небезопасны и должны блокироваться.
+        for n in (3, 4, 6):
             with self.subTest(case=n):
                 _, store, sheet = self.setup_case(n)
                 self.blocked(sheet, lambda: store.create_booking(**booking(time_str='11:00')))
 
     def test_unsafe_tables_block_cancel_and_move(self):
-        for n in (2, 3, 4, 6):
+        for n in (3, 4, 6):
             for operation in ('cancel', 'move'):
                 with self.subTest(case=n, operation=operation):
                     _, store, sheet = self.setup_case(n)
@@ -196,8 +198,11 @@ class Tables(unittest.TestCase):
                     raise OSError('response lost after apply')
                 fn = (lambda: store.cancel_booking(101, 10101, expected_booking=previous)) if operation == 'cancel' else (lambda: store.reschedule_booking(101, 10101, '2099-01-01', '11:00', expected_booking=previous))
                 with patch.object(ws, 'batch_update', side_effect=lost):
-                    with self.assertRaises((MappingError, OSError)):
-                        fn()
+                    try:
+                        first = fn()
+                    except (MappingError, OSError):
+                        first = {'ok': False}
+                # Первый ответ потерян, но изменение применилось: повтор безопасно отклоняется.
                 after = self.snapshot(sheet)
                 try:
                     result = fn()
@@ -207,7 +212,8 @@ class Tables(unittest.TestCase):
                 self.assertEqual(after, self.snapshot(sheet))
                 self.assertEqual(len(ws.writes), 1)
 
-    def test_lost_reply_after_write_no_duplicate(self):
+    def test_lost_reply_after_write_is_reconciled_without_duplicate(self):
+        # Запись применилась, ответ потерян: повторная попытка не должна создать вторую строку.
         _, store, sheet = self.setup_case(7)
         ws = sheet.worksheet('Записи')
         original = ws.batch_update
@@ -215,14 +221,14 @@ class Tables(unittest.TestCase):
             original(updates, value_input_option=value_input_option)
             raise OSError('response lost after apply')
         with patch.object(ws, 'batch_update', side_effect=lost):
-            with self.assertRaises(MappingError):
-                store.create_booking(**booking(time_str='11:00'))
+            result = store.create_booking(**booking(time_str='11:00'))
+        self.assertTrue(result['ok'], result)  # строка подтверждена чтением, ответ клиенту правдив
         after = self.snapshot(sheet)
         try:
-            result = store.create_booking(**booking(time_str='11:00'))
+            again = store.create_booking(**booking(time_str='11:00'))
         except MappingError:
-            result = {'ok': False}
-        self.assertFalse(result['ok'])
+            again = {'ok': False}
+        self.assertFalse(again['ok'])
         self.assertEqual(after, self.snapshot(sheet))
         self.assertEqual(len(ws.writes), 1)
 
@@ -273,7 +279,8 @@ class Button(unittest.IsolatedAsyncioTestCase):
                 raise OSError('response lost after apply')
             with patch.object(ws, 'batch_update', side_effect=lost):
                 answer = await agent.proposal_action(user, current, 'confirm')
-            self.assertIn('Не удалось подтвердить', answer)
+            # Строка подтверждена чтением: клиенту сообщается правда, повторного создания нет.
+            self.assertIn('Записала', answer)
             before = deepcopy(ws.values)
             await agent.proposal_action(user, current, 'confirm')
             self.assertEqual(before, ws.values)

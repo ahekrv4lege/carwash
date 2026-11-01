@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 import hashlib
 import json
+import logging
 import math
 import os
 import tempfile
@@ -14,6 +15,8 @@ import re
 import threading
 import time
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 VERSION = 1
 MAX_DISCOVERY_CELLS = 1_000_000
@@ -66,6 +69,10 @@ STATUS_MAP = {"новая": "Новая", "new": "Новая", "confirmed": "П�
 
 class MappingError(RuntimeError):
     pass
+
+
+class SlotUnavailable(MappingError):
+    """Время или пост занят, запись не создана. Текст безопасен для показа клиенту."""
 
 
 @lru_cache(maxsize=4096)
@@ -301,7 +308,7 @@ def discover_grid(snapshot: dict) -> dict | None:
                 "columns": {"Время": columns["Время"]}, "grid_columns": bays,
                 "free_markers": ["", "свободно", "free", "open"], "date_source": {"title": True},
                 "transforms": {"Дата": "date", "Время": "time"},
-                "permissions": {"read": True, "write": False},
+                "permissions": {"read": True, "write": True},
                 "validation": {"read": False, "write": False, "issues": []}}
         rule["structure"] = structure(snapshot, rule)
         rule["fingerprint"] = fingerprint(rule["structure"])
@@ -565,11 +572,16 @@ class AdaptiveSheets:
             write_errors.append("Требуется ручное сопоставление изменённых полей")
         if formula_headers & set(columns.values()):
             write_errors.append("Формулы в шапке записи")
-        if rule["role"] != "bookings" or rule.get("grid_columns"):
+        if rule["role"] == "slots" and rule.get("grid_columns"):
+            # Сетка постов: клетка занимается маркером записи. Формулы в теле сетки блокируют запись.
+            if any(row_index >= first and (end_row is None or row_index <= end_row) and column_index in set(rule["grid_columns"]) | {columns.get("Время")}
+                   for row_index, column_index in snapshot["formulas"]):
+                write_errors.append("Формулы в сетке постов: запись заблокирована")
+        elif rule["role"] != "bookings":
             write_errors.append("Область доступна только для чтения")
-        if set(BOOKING_FIELDS) - present:
+        if rule["role"] == "bookings" and set(BOOKING_FIELDS) - present:
             write_errors.append("Для создания записей нужны все поля записи")
-        if any(
+        if rule["role"] == "bookings" and any(
             column_index in columns.values()
             and row_index >= first
             and (end_row is None or row_index <= end_row)
@@ -725,8 +737,7 @@ class AdaptiveSheets:
         self.document["validation_status"] = "valid" if not self.document.get("missing_roles") and not ambiguous_roles and all(
             rule["validation"]["read"] for rule in self.document["regions"]) else "needs_review"
         self.document["writes_enabled"] = (self.document["validation_status"] == "valid" and
-            all(rule["validation"].get("write") for rule in self.document["regions"] if rule["role"] == "bookings") and
-            not any(rule.get("grid_columns") for rule in self.document["regions"]))
+            all(rule["validation"].get("write") for rule in self.document["regions"] if rule["role"] == "bookings"))
 
     def _rules(self, role: str) -> list[dict]:
         self.refresh()
@@ -946,8 +957,6 @@ class AdaptiveSheets:
         tables = {}
         for role in ("services", "tariffs", "slots", "bookings"):
             tables[role] = self.table(role, _observed=observed)
-        if any(rule.get("grid_columns") for rule in self._rules("slots")):
-            raise MappingError("Сетка постов доступна только для чтения; создание/отмена записей заблокированы")
         return observed, tables
 
     def _target(self, day: str | None = None, sheet_id: int | None = None) -> dict:
@@ -988,6 +997,95 @@ class AdaptiveSheets:
             except ValueError:
                 raise MappingError("Журнал операций повреждён; нужна ручная проверка") from None
         return path, {}
+
+    # ---- сетка постов: клетка занимается маркером «Запись <ID>», освобождается при отмене/переносе
+
+    def _grid_rules(self, day: str) -> list[dict]:
+        """Сетка постов на дату. Сетка без права записи блокирует запись на эту дату."""
+        wanted = date_value(day)
+        rules = [rule for rule in self._rules("slots")
+                 if rule.get("grid_columns") and self._date_source(rule, [], rule["sheet_title"]) == wanted]
+        if any(not rule["validation"].get("write") for rule in rules):
+            raise MappingError("Сетка постов на эту дату доступна только для чтения; проверьте mappings")
+        if len(rules) > 1:
+            raise MappingError("На эту дату несколько сеток постов; запись заблокирована")
+        return rules
+
+    def _grid_row_for_time(self, rule: dict, values: list[list], time_text: str) -> int:
+        transform = rule.get("transforms", {}).get("Время", "time")
+        end_row = min(len(values), rule.get("end_row") or len(values))
+        rows = []
+        for row in range(rule["first_data_row"], end_row + 1):
+            raw = value_at(values, row, rule["columns"]["Время"])
+            if str(raw).strip() and time_value(raw, transform) == time_text:
+                rows.append(row)
+        if not rows:
+            raise SlotUnavailable("Этого времени нет в сетке постов")
+        if len(rows) > 1:
+            raise MappingError("Время повторяется в сетке постов; запись заблокирована")
+        return rows[0]
+
+    @staticmethod
+    def _grid_cell_free(rule: dict, value: Any) -> bool:
+        text = str(value).strip()
+        if text.startswith("="):
+            return False  # формула в клетке поста: не считаем её свободной
+        return text.casefold() in {str(marker).strip().casefold() for marker in rule["free_markers"]}
+
+    def _grid_claim(self, rule: dict, day: str, time_text: str, marker: str) -> dict:
+        worksheet = self._worksheet(rule["sheet_id"])
+        values = worksheet.get_all_values(value_render_option="FORMULA", date_time_render_option="FORMATTED_STRING")
+        row = self._grid_row_for_time(rule, values, time_text)
+        column = next((index for index in rule["grid_columns"] if self._grid_cell_free(rule, value_at(values, row, index))), None)
+        if column is None:
+            raise SlotUnavailable("На это время свободных постов нет")
+        cell = cell_name(row, column)
+        current = worksheet.get(f"{cell}:{cell}", value_render_option="FORMULA")
+        if not self._grid_cell_free(rule, current[0][0] if current and current[0] else ""):
+            raise SlotUnavailable("Пост только что занят; выберите другое время")
+        worksheet.batch_update([{"range": cell, "values": [[marker]]}], value_input_option="RAW")
+        return {"sheet_id": rule["sheet_id"], "row": row, "column": column, "marker": marker}
+
+    def _grid_release(self, claim: dict) -> bool:
+        worksheet = self._worksheet(claim["sheet_id"])
+        cell = cell_name(claim["row"], claim["column"])
+        current = worksheet.get(f"{cell}:{cell}", value_render_option="FORMULA")
+        value = current[0][0] if current and current[0] else ""
+        if str(value).strip() != claim["marker"]:
+            return False  # клетку уже изменили вручную: её не трогаем
+        worksheet.batch_update([{"range": cell, "values": [[""]]}], value_input_option="RAW")
+        return True
+
+    def _grid_release_by_booking(self, rule: dict, time_text: str, booking_id: str) -> bool:
+        worksheet = self._worksheet(rule["sheet_id"])
+        values = worksheet.get_all_values(value_render_option="FORMULA", date_time_render_option="FORMATTED_STRING")
+        row = self._grid_row_for_time(rule, values, time_text)
+        marker = f"Запись {booking_id}"
+        columns = [index for index in rule["grid_columns"] if str(value_at(values, row, index)).strip() == marker]
+        if len(columns) != 1:
+            return False
+        return self._grid_release({"sheet_id": rule["sheet_id"], "row": row, "column": columns[0], "marker": marker})
+
+    def _booking_row_state(self, rule: dict, row: int, expected: dict) -> bool | None:
+        """True — строка содержит ожидаемые значения; False — нет; None — проверить не удалось."""
+        try:
+            worksheet = self._worksheet(rule["sheet_id"])
+            raw = worksheet.get(f"A{row}:{cell_name(row, max(rule['columns'].values()))}", value_render_option="FORMATTED_VALUE")
+            values = raw[0] if raw else []
+            for field, wanted in expected.items():
+                column = rule["columns"].get(field)
+                if column is None:
+                    return None
+                cell = value_at([values], 1, column)
+                if field == "Дата":
+                    cell = date_value(cell, rule.get("transforms", {}).get("Дата", "date"))
+                elif field == "Время":
+                    cell = time_value(cell, rule.get("transforms", {}).get("Время", "time"))
+                if str(cell).strip() != str(wanted).strip():
+                    return False
+            return True
+        except Exception:
+            return None
 
     def create(self, data: dict, expected_bookings: list[dict] | None = None) -> None:
         with self.lock:
@@ -1037,12 +1135,19 @@ class AdaptiveSheets:
                     hour, minute = map(int, value.split(":"))
                     value = (hour * 60 + minute) / 1440
                 updates.append({"range": cell_name(row, column), "values": [[value]]})
+            claim = None
+            grid_rules = self._grid_rules(data["дата"])
+            if grid_rules:
+                claim = self._grid_claim(grid_rules[0], data["дата"], data["время"], f"Запись {data['id']}")
             journal[key] = {"state": "pending", "sheet_id": rule["sheet_id"], "row": row, "at": time.time()}
             atomic_json(journal_path, journal)
             try:
                 worksheet.batch_update(updates, value_input_option="RAW")
             except Exception:
-                raise MappingError("Результат записи неизвестен. Проверьте Sheets и локальный журнал перед повтором") from None
+                # Отсутствие строки не доказывает отсутствие записи: запрос мог дойти позже.
+                # Подтверждённая строка — успех; во всех остальных случаях клетка и журнал остаются.
+                if self._booking_row_state(rule, row, {"ID": data["id"]}) is not True:
+                    raise MappingError("Результат записи неизвестен. Проверьте Sheets и локальный журнал перед повтором") from None
             journal[key]["state"] = "done"
             atomic_json(journal_path, journal)
 
@@ -1069,13 +1174,22 @@ class AdaptiveSheets:
             if len(candidates) != 1 or any(candidates[0].get(field) != current.get(field) for field in rule["columns"]):
                 raise MappingError("Строка записи перемещена или изменена; отмена заблокирована")
             journal_path, journal = self._journal()
+            grid_rules = self._grid_rules(current["Дата"]) if current.get("Дата") else []
             worksheet.batch_update([{"range": cell_name(row, rule["columns"]["Статус"]),
                               "values": [[rule["write_statuses"]["cancelled"]]]}], value_input_option="RAW")
+            grid_released = None
+            if grid_rules:
+                try:
+                    grid_released = self._grid_release_by_booking(grid_rules[0], current["Время"], str(current["ID"]))
+                except Exception:
+                    log.warning("Клетку поста не удалось освободить при отмене записи")
+                    grid_released = False
             key = fingerprint({field_name.lower(): str(current.get(field_name, "")).strip().casefold()
                           for field_name in ("Telegram ID", "Дата", "Время", "Автомобиль")})
             if journal.get(key, {}).get("state") == "done":
                 del journal[key]
                 atomic_json(journal_path, journal)
+            return grid_released
 
     def validate_reschedule(self, record: dict, new_date: str) -> dict:
         rule = self._target(sheet_id=record["__sheet_id__"])
@@ -1125,15 +1239,31 @@ class AdaptiveSheets:
             key = fingerprint({"move": record, "date": new_date, "time": new_time})
             if journal.get(key, {}).get("state") == "pending":
                 raise MappingError("Результат прошлого переноса неизвестен; нужна ручная сверка")
+            new_day = date.strftime("%d.%m.%Y")
+            new_grid = self._grid_rules(new_day)
+            old_grid = self._grid_rules(record["Дата"]) if record.get("Дата") else []
+            claim = self._grid_claim(new_grid[0], new_day, new_time, f"Запись {record['ID']}") if new_grid else None
             journal[key] = {"state": "pending", "sheet_id": rule["sheet_id"], "row": row, "at": time.time()}
             atomic_json(path, journal)
             try:
                 worksheet.batch_update(updates, value_input_option="RAW")
             except Exception:
-                raise MappingError("Результат переноса неизвестен. Проверьте таблицу перед повтором") from None
+                expected = {field_name: value for field_name, value in (("Дата", new_day), ("Время", new_time))
+                            if field_name in rule["columns"]}
+                if not expected or self._booking_row_state(rule, row, expected) is not True:
+                    # Результат неизвестен: новая клетка и старая запись остаются до ручной сверки.
+                    raise MappingError("Результат переноса неизвестен. Проверьте таблицу перед повтором") from None
             journal[key]["state"] = "done"
+            grid_released = None
+            if old_grid and (record["Дата"], record["Время"]) != (new_day, new_time):
+                try:
+                    grid_released = self._grid_release_by_booking(old_grid[0], record["Время"], str(record["ID"]))
+                except Exception:
+                    log.warning("Старую клетку поста не удалось освободить после переноса")
+                    grid_released = False
             original = fingerprint({field.lower(): str(record.get(field, "")).strip().casefold()
                                     for field in ("Telegram ID", "Дата", "Время", "Автомобиль")})
             if journal.get(original, {}).get("state") == "done":
                 journal.pop(original)
             atomic_json(path, journal)
+            return grid_released

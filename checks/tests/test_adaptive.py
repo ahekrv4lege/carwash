@@ -195,13 +195,12 @@ class AdaptiveTests(unittest.TestCase):
         self.a.refresh(validate=True)
         self.assertEqual(self.a.table("slots")[1][0]["Дата"], "01.01.2099")
 
-    def test_grid_read_only(self):
+    def test_grid_free_times_still_read_without_writes(self):
+        # Запись в сетку покрыта в test_grid_booking; здесь — только чтение свободных постов.
         worksheet = self.spreadsheet.worksheet("Слоты")
         worksheet.title = "2099-01-01"
         worksheet.values = [["Время", "Пост 1", "Бокс 2"], ["10:00", "free", "занято"]]
         self.assertEqual(self.store.free_slots("2099-01-01")["days"][0]["free_times"], ["10:00"])
-        with self.assertRaisesRegex(MappingError, "только для чтения"):
-            self.store.create_booking(**booking())
         self.assertFalse(self.worksheet.writes)
 
     def test_ambiguous_headers_are_not_guessed(self):
