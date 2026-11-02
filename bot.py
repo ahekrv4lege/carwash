@@ -246,6 +246,9 @@ async def on_slot_pick(callback: CallbackQuery, agent: Agent, reporter: AdminRep
     elif len(parts) == 5 and parts[1] == "time":
         label = "Выбор времени"
         answer, rows = await agent.pick_time(user, parts[2], ":".join(parts[3:]))
+    elif len(parts) == 3 and parts[1] == "back" and parts[2] == "dates":
+        label = "Возврат к выбору дня"
+        answer, rows = await agent.slot_back(user)
     else:
         return
     if callback.message.reply_markup:
