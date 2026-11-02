@@ -1365,6 +1365,8 @@ class Store:
                 color = (0.85, 0.94, 0.82)  # новая за сутки - зелёный
             elif booking_date and booking_date >= today:
                 color = (1.0, 0.97, 0.78)  # предстоящая - жёлтый
+            elif not any(str(cell).strip() for cell in row):
+                color = (1.0, 1.0, 1.0)  # пустой ряд сбрасываем в белый: старая краска не должна висеть
             else:
                 color = (0.93, 0.93, 0.93)
             colors.setdefault(color, []).append(f"A{sheet_row}:{last_col}{sheet_row}")
@@ -1502,7 +1504,7 @@ class Store:
         трогается (удаление сдвинуло бы чужие ссылки); строка с данными правее
         зоны бота не удаляется. Возвращает число удалённых строк.
         """
-        deleted = 0
+        deleted, tails = 0, []
         if self._adaptive:
             grouped: dict = {sheet_id: [] for sheet_id in self._adaptive.booking_sheet_ids()}
             for record in records:
@@ -1555,6 +1557,19 @@ class Store:
             for row_number in sorted(set(row_numbers), reverse=True):
                 delete(row_number)
                 deleted += 1
+            tails.append((worksheet, values, deleted))
+        # После удаления строк под данными может остаться старая краска (серые
+        # ряды прошлых чисток): сбрасываем фон хвоста в белый, чтобы таблица
+        # выглядела опрятно независимо от того, кто и когда её красил.
+        last_col = chr(ord("A") + max(15, len(headers) - 1)) if 0 < len(headers) <= 26 else "Z"
+        for worksheet, values, removed in tails:
+            if not hasattr(worksheet, "format"):
+                continue
+            tail_start = len(values) - removed + 1  # первый ряд без данных после удаления
+            last_row = getattr(worksheet, "row_count", None) or len(values) + 200
+            if last_row >= tail_start:
+                worksheet.format(f"A{tail_start}:{last_col}{last_row}",
+                                 {"backgroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}})
         if deleted:
             self._invalidate("bookings")
         return deleted
