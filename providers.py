@@ -1,6 +1,8 @@
 """Общие параметры OpenAI-совместимого API; без выбора провайдера или модели."""
 from __future__ import annotations
 
+import httpx2 as httpx
+
 import logging
 import math
 import re
@@ -45,7 +47,11 @@ def client_options(config) -> dict:
     private_sdk_logging()
     if not config.ai_api_key:
         raise RuntimeError("Для выбранного адреса AI нужен AI_API_KEY")
-    return dict(api_key=config.ai_api_key, base_url=config.ai_base_url, timeout=config.ai_timeout_sec, max_retries=0)
+    # connect=5: путь до провайдера местами теряет SYN (диагностика 02.11.2026:
+    # mtr/tcpdump, 19 SYN -> 1 SYN-ACK); мёртвые попытки соединения обрываем
+    # быстро, на генерацию остаётся ai_timeout_sec без изменений.
+    return dict(api_key=config.ai_api_key, base_url=config.ai_base_url,
+                timeout=httpx.Timeout(config.ai_timeout_sec, connect=5.0), max_retries=0)
 
 
 _COMPLETION_CACHE: dict[tuple, dict] = {}

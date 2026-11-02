@@ -127,7 +127,10 @@ class ProviderTests(unittest.TestCase):
                         AI_BASE_URL="https://provider.invalid/v1", AI_TIMEOUT_SEC="12.5")
         options = client_options(cfg)
         self.assertEqual(options["api_key"], "new-key")
-        self.assertEqual(options["timeout"], 12.5)
+        # Генерации остаётся AI_TIMEOUT_SEC; фаза соединения укорочена до 5 c
+        # (потери SYN на пути до провайдера, диагностика 02.11.2026).
+        self.assertEqual(options["timeout"].read, 12.5)
+        self.assertEqual(options["timeout"].connect, 5.0)
         self.assertNotIn("default_headers", options)
         self.assertEqual(completion_options(cfg)["model"], "selected-later")
 
