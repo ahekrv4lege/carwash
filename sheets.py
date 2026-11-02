@@ -1422,6 +1422,68 @@ class Store:
             self._invalidate("bookings")
             return changed
 
+    def move_aged_bookings_to_archive(self) -> int:
+        """Записи старше недели переносятся в отдельный архивный лист.
+
+        Архив хранит id и все данные записи (услуги, состав, сумму, статус) с той же
+        шапкой, что у «Записей»; лист создаётся при первом переносе (имя —
+        SHEET_ARCHIVE, по умолчанию «Архив»). Перенос идемпотентен: записи с ID,
+        которые уже лежат в архиве, не дублируются, поэтому повторные запуски
+        обслуживания ничего не копируют заново. Источник остаётся как есть —
+        статус «Архив» в «Записях» ставит archive_old_bookings, строки не
+        сдвигаются. Записи без распознанного ID не переносятся: их нельзя
+        защитить от дубля. Архивный лист — служебный, вне карт адаптива.
+        Возвращает число скопированных записей.
+        """
+        cutoff = self.now().date() - timedelta(days=7)
+        with self._lock:
+            headers, rows = self._table(self.config.sheet_bookings)
+            if not rows:
+                return 0
+            candidates = []
+            for record in rows:
+                booking_date = parse_date(str(record.get("Дата", "")))
+                booking_id = pick(record, "ID")
+                if booking_date and booking_date < cutoff and booking_id:
+                    candidates.append((booking_id, record))
+            if not candidates:
+                return 0
+            spreadsheet = self._get_spreadsheet()
+            try:
+                archive = spreadsheet.worksheet(self.config.sheet_archive)
+                existing = archive.get_all_values()
+            except (WorksheetNotFound, StopIteration):
+                try:
+                    archive = spreadsheet.add_worksheet(self.config.sheet_archive,
+                                                        rows=max(100, len(rows) + 1), cols=max(16, len(headers)))
+                except AttributeError:
+                    log.warning("Архив: лист «%s» не создан — перенос пропущен", self.config.sheet_archive)
+                    return 0
+                archive.append_row(list(headers), value_input_option="RAW")
+                existing = [list(headers)]
+            if not existing:
+                archive.append_row(list(headers), value_input_option="RAW")
+                existing = [list(headers)]
+            archive_headers = [str(header).strip() for header in existing[0]]
+            if "ID" not in archive_headers:
+                log.warning("Архив: в шапке листа «%s» нет колонки «ID» — перенос пропущен",
+                            self.config.sheet_archive)
+                return 0
+            id_column = archive_headers.index("ID") + 1
+            known = {str(row_values[id_column - 1]).strip() for row_values in existing[1:]
+                     if len(row_values) >= id_column and str(row_values[id_column - 1]).strip()}
+            copied = 0
+            for booking_id, record in candidates:
+                if booking_id in known:
+                    continue
+                archive.append_row([pick(record, header) for header in archive_headers],
+                                   value_input_option="RAW")
+                known.add(booking_id)
+                copied += 1
+            if copied:
+                log.info("В архивный лист «%s» перенесено записей: %d", self.config.sheet_archive, copied)
+            return copied
+
     def clean_expired_slots(self) -> int:
         """Физическая очистка устаревших дат в листе «Слоты».
 

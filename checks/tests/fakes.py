@@ -136,6 +136,11 @@ class Spreadsheet:
     def get_worksheet_by_id(self, id):
         return next(s for s in self.sheets if s.id == id)
 
+    def add_worksheet(self, title, rows=100, cols=26):
+        sheet = Worksheet(len(self.sheets) + 1, title, [])
+        self.sheets.append(sheet)
+        return sheet
+
     def worksheet(self, title):
         return next(s for s in self.sheets if s.title == title)
 
