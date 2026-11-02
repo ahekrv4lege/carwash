@@ -107,6 +107,10 @@ class Worksheet:
         self.values.append(deepcopy(row))
         self.writes.append(deepcopy(row))
 
+    def delete_rows(self, index, count=1):
+        del self.values[index - 1:index - 1 + count]
+        self.writes.append(["__deleted_row__", index, count])
+
 
 class Spreadsheet:
     def __init__(self, sheets):

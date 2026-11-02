@@ -1490,6 +1490,15 @@ class AdaptiveSheets:
                 fields.update(rule["columns"])
             return fields
 
+    def booking_sheet_ids(self) -> list:
+        """Физические листы всех подтвержённых областей записей (для обслуживания)."""
+        with self.lock:
+            try:
+                rules = self._rules("bookings")
+            except MappingError:
+                return []
+            return [rule["sheet_id"] for rule in rules]
+
     def _date_cell_values(self, rule: dict) -> list[list]:
         """Сетка, содержащая только ячейку-источник даты, вместо чтения всего листа."""
         cell = (rule.get("date_source") or {}).get("cell")

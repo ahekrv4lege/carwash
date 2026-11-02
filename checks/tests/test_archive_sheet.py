@@ -33,7 +33,7 @@ class ArchiveSheetTests(unittest.TestCase):
     def bookings_sheet(self):
         return self.spreadsheet.worksheet("Записи")
 
-    def test_marked_records_move_and_sources_are_cleared(self):
+    def test_marked_records_move_and_sources_are_deleted(self):
         # Прошедшая дата без статуса: archive_old_bookings ставит «Архив», перенос после метки.
         self.seed(booking_row("1", "01.01.2020", status=""),
                   booking_row("2", "15.06.2021", status="Архив", services="Пылесос салона", total="500"),
@@ -51,14 +51,10 @@ class ArchiveSheetTests(unittest.TestCase):
         self.assertEqual(by_id["1"][BOOKING_HEADERS.index("Статус")], "Архив")
         self.assertEqual(by_id["2"][BOOKING_HEADERS.index("Доп. услуги")], "Пылесос салона")
         self.assertEqual(by_id["2"][BOOKING_HEADERS.index("Сумма")], "500")
-        # Источники очищены: в «Записях» только живые записи, строки не сдвигались.
+        # Источники удалены физически: без пустых рядов, только живые записи.
         values = self.bookings_sheet().values
-        self.assertEqual(len(values), 6)
-        for row_number in (1, 2):
-            self.assertFalse(any(str(cell).strip() for cell in values[row_number]),
-                             f"строка {row_number + 1} не очищена")
-        for row_number, booking_id in ((3, "3"), (4, "4"), (5, "5")):
-            self.assertEqual(values[row_number][0], booking_id)
+        self.assertEqual([row[0] for row in values[1:]], ["3", "4", "5"])
+        self.assertTrue(all(any(str(cell).strip() for cell in row) for row in values[1:]))
 
     def test_repeated_runs_do_not_duplicate(self):
         self.seed(booking_row("1", "01.01.2020", status="Архив"),
@@ -66,8 +62,7 @@ class ArchiveSheetTests(unittest.TestCase):
         self.assertEqual(self.store.move_archived_bookings(), 2)
         self.assertEqual(self.store.move_archived_bookings(), 0)
         self.assertEqual(len(self.archive_values()), 3)  # шапка + 2 записи
-        self.assertTrue(all(not any(str(cell).strip() for cell in self.bookings_sheet().values[row])
-                            for row in (1, 2)))
+        self.assertEqual(self.bookings_sheet().values, [list(BOOKING_HEADERS)])
 
     def test_new_marked_record_archived_on_later_run(self):
         self.seed(booking_row("1", "01.01.2020", status="Архив"))
@@ -75,8 +70,7 @@ class ArchiveSheetTests(unittest.TestCase):
         self.seed(booking_row("2", "02.01.2020", status="Архив"))
         self.assertEqual(self.store.move_archived_bookings(), 1)
         self.assertEqual([row[0] for row in self.archive_values()[1:]], ["1", "2"])
-        self.assertTrue(all(not any(str(cell).strip() for cell in self.bookings_sheet().values[row])
-                            for row in (1, 2)))
+        self.assertEqual(self.bookings_sheet().values, [list(BOOKING_HEADERS)])
 
     def test_other_statuses_and_fresh_dates_are_not_moved(self):
         self.seed(booking_row("1", "01.01.2020", status="Выполнена"),
@@ -86,21 +80,30 @@ class ArchiveSheetTests(unittest.TestCase):
         self.assertFalse(any(sheet.title == "Архив" for sheet in self.spreadsheet.sheets))
         self.assertEqual([row[0] for row in self.bookings_sheet().values[1:]], ["1", "2", "3"])
 
-    def test_legacy_non_numeric_id_is_archived_and_source_cleared(self):
+    def test_pre_existing_gaps_are_swept_even_without_new_moves(self):
+        # Дырки от прежних чисток убираются при каждом цикле, даже если переносить нечего.
+        self.spreadsheet.worksheet("Записи").values.append(booking_row("1", "01.01.2099", status="Новая"))
+        self.spreadsheet.worksheet("Записи").values.append([""] * len(BOOKING_HEADERS))
+        self.spreadsheet.worksheet("Записи").values.append(booking_row("2", "02.01.2099", status="Новая"))
+        self.assertEqual(self.store.move_archived_bookings(), 0)
+        self.assertEqual([row[0] for row in self.bookings_sheet().values[1:]], ["1", "2"])
+
+    def test_legacy_non_numeric_id_is_archived_and_source_deleted(self):
         self.seed(booking_row("наследство", "01.01.2020", status="Архив"))
         self.assertEqual(self.store.move_archived_bookings(), 1)
         self.assertEqual([row[0] for row in self.archive_values()[1:]], ["наследство"])
-        self.assertFalse(any(str(cell).strip() for cell in self.bookings_sheet().values[1]))
+        self.assertEqual(self.bookings_sheet().values, [list(BOOKING_HEADERS)])
 
-    def test_formula_row_is_copied_but_source_stays(self):
-        # Формулу в источнике не затираем: копия в архиве есть, строка остаётся с пометкой.
+    def test_formulas_block_deletion_but_copy_still_happens(self):
+        # В листе формулы: удаление строк опасно (сдвинет чужие ссылки),
+        # копия в архив всё равно выполняется, источник остаётся как был.
         self.seed(booking_row("1", "01.01.2020", status="Архив"))
         self.bookings_sheet().values[1][BOOKING_HEADERS.index("Сумма")] = "=C2*2"
         self.assertEqual(self.store.move_archived_bookings(), 1)
         self.assertEqual(self.archive_values()[1][0], "1")
         self.assertEqual(self.bookings_sheet().values[1][0], "1")
         self.assertEqual(self.bookings_sheet().values[1][BOOKING_HEADERS.index("Сумма")], "=C2*2")
-        # Повтор: дубля в архиве нет, строка по-прежнему не очищается.
+        # Повтор: дубля в архиве нет.
         self.assertEqual(self.store.move_archived_bookings(), 0)
         self.assertEqual(len(self.archive_values()), 2)
 

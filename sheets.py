@@ -1431,140 +1431,133 @@ class Store:
         создаётся при первом переносе (имя — SHEET_ARCHIVE, по умолчанию
         «Архив»). Перенос идемпотентен: записи с ID, которые уже лежат
         в архиве, не дублируются. После успешной копии исходная строка
-        в «Записях» очищается адресно (без сдвига строк, с защитой формул):
-        в актуальной таблице остаются только живые записи. Записи без
-        распознанного ID не переносятся. Архивный лист — служебный, вне
-        карт адаптива. Возвращает число скопированных записей.
+        удаляется из «Записей» физически; пустые ряды (в том числе оставшиеся
+        от прежних чисток) убираются при каждом цикле — без пустых
+        промежутков. Строки с формулами или данными правее зоны бота
+        не трогаются. Записи без распознанного ID не переносятся.
+        Архивный лист — служебный, вне карт адаптива. Возвращает число
+        скопированных записей.
         """
         with self._lock:
             headers, rows = self._table(self.config.sheet_bookings)
-            if not rows:
-                return 0
             candidates = []
             for record in rows:
                 booking_id = pick(record, "ID")
                 if pick(record, "Статус").lower().startswith("архив") and booking_id:
                     candidates.append((booking_id, record))
-            if not candidates:
-                return 0
-            spreadsheet = self._get_spreadsheet()
-            try:
-                archive = spreadsheet.worksheet(self.config.sheet_archive)
-                existing = archive.get_all_values()
-            except (WorksheetNotFound, StopIteration):
-                try:
-                    archive = spreadsheet.add_worksheet(self.config.sheet_archive,
-                                                        rows=max(100, len(rows) + 1), cols=max(16, len(headers)))
-                except AttributeError:
-                    log.warning("Архив: лист «%s» не создан — перенос пропущен", self.config.sheet_archive)
-                    return 0
-                archive.append_row(list(headers), value_input_option="RAW")
-                existing = [list(headers)]
-            if not existing:
-                archive.append_row(list(headers), value_input_option="RAW")
-                existing = [list(headers)]
-            archive_headers = [str(header).strip() for header in existing[0]]
-            if "ID" not in archive_headers:
-                log.warning("Архив: в шапке листа «%s» нет колонки «ID» — перенос пропущен",
-                            self.config.sheet_archive)
-                return 0
-            id_column = archive_headers.index("ID") + 1
-            known = {str(row_values[id_column - 1]).strip() for row_values in existing[1:]
-                     if len(row_values) >= id_column and str(row_values[id_column - 1]).strip()}
             copied, to_clear = 0, []
-            for booking_id, record in candidates:
-                if booking_id in known:
-                    to_clear.append(record)  # копия уже в архиве с прошлого запуска
-                    continue
+            if candidates:
+                spreadsheet = self._get_spreadsheet()
                 try:
-                    archive.append_row([pick(record, header) for header in archive_headers],
-                                       value_input_option="RAW")
-                except Exception as error:
-                    log.warning("Архив: запись %s не скопирована (%s) — источник не очищается",
-                                booking_id, type(error).__name__)
-                    continue
-                known.add(booking_id)
-                copied += 1
-                to_clear.append(record)
-            cleared = self._clear_moved_bookings(to_clear, headers)
-            if copied or cleared:
-                log.info("В архивный лист «%s» перенесено записей: %d, очищено в «Записях»: %d",
-                         self.config.sheet_archive, copied, cleared)
+                    archive = spreadsheet.worksheet(self.config.sheet_archive)
+                    existing = archive.get_all_values()
+                except (WorksheetNotFound, StopIteration):
+                    try:
+                        archive = spreadsheet.add_worksheet(self.config.sheet_archive,
+                                                            rows=max(100, len(rows) + 1),
+                                                            cols=max(16, len(headers)))
+                    except AttributeError:
+                        log.warning("Архив: лист «%s» не создан — перенос пропущен",
+                                    self.config.sheet_archive)
+                        return 0
+                    archive.append_row(list(headers), value_input_option="RAW")
+                    existing = [list(headers)]
+                if not existing:
+                    archive.append_row(list(headers), value_input_option="RAW")
+                    existing = [list(headers)]
+                archive_headers = [str(header).strip() for header in existing[0]]
+                if "ID" not in archive_headers:
+                    log.warning("Архив: в шапке листа «%s» нет колонки «ID» — перенос пропущен",
+                                self.config.sheet_archive)
+                    return 0
+                id_column = archive_headers.index("ID") + 1
+                known = {str(row_values[id_column - 1]).strip() for row_values in existing[1:]
+                         if len(row_values) >= id_column and str(row_values[id_column - 1]).strip()}
+                for booking_id, record in candidates:
+                    if booking_id in known:
+                        to_clear.append(record)  # копия уже в архиве с прошлого запуска
+                        continue
+                    try:
+                        archive.append_row([pick(record, header) for header in archive_headers],
+                                           value_input_option="RAW")
+                    except Exception as error:
+                        log.warning("Архив: запись %s не скопирована (%s) — источник не очищается",
+                                    booking_id, type(error).__name__)
+                        continue
+                    known.add(booking_id)
+                    copied += 1
+                    to_clear.append(record)
+            deleted = self._remove_moved_bookings(to_clear, headers)
+            if copied or deleted:
+                log.info("В архивный лист «%s» перенесено записей: %d, удалено из «Записей»: %d",
+                         self.config.sheet_archive, copied, deleted)
             return copied
 
-    def _clear_moved_bookings(self, records, headers) -> int:
-        """Очистка перенесённых строк в «Записях»: адресные пустые значения.
+    def _remove_moved_bookings(self, records, headers) -> int:
+        """Физическое удаление перенесённых строк и пустых рядов из «Записей».
 
-        Строки не сдвигаются (как у clean_expired_slots). Адаптив: очищаются
-        колонки области из карты (writable_column по полям записи), записи могут
-        лежать в нескольких областях. Офлайн: ширина шапки. Строка с формулой
-        не очищается — копия в архиве уже есть, источник остаётся с пометкой.
-        Возвращает число очищенных строк.
+        Данные каждой удалённой строки уже лежат в архиве; пустые ряды (в том
+        числе оставшиеся от прежних чисток) убираются при каждом цикле, чтобы
+        в таблице не было промежутков. Безопасность: лист с формулами не
+        трогается (удаление сдвинуло бы чужие ссылки); строка с данными правее
+        зоны бота не удаляется. Возвращает число удалённых строк.
         """
-        from adaptive import MappingError, cell_name
-
-        def has_formula(values, row_number):
-            return (values is not None and row_number <= len(values)
-                    and any(str(cell).startswith("=") for cell in values[row_number - 1]))
-
-        updates_by_sheet: dict = {}
-        cleared = 0
+        deleted = 0
         if self._adaptive:
-            grouped: dict = {}
+            grouped: dict = {sheet_id: [] for sheet_id in self._adaptive.booking_sheet_ids()}
             for record in records:
                 grouped.setdefault(record["__sheet_id__"], []).append(record)
-            for sheet_id, sheet_records in grouped.items():
-                worksheet = self._get_spreadsheet().get_worksheet_by_id(sheet_id)
-                try:
-                    values = worksheet.get_all_values(value_render_option="FORMULA")
-                except Exception as error:
-                    log.warning("Архив: не удалось проверить формулы области %s (%s)", sheet_id, type(error).__name__)
-                    continue
-                cells = []
-                for record in sheet_records:
-                    if has_formula(values, record["__row__"]):
-                        log.warning("Архив: строка %d с формулой не очищается", record["__row__"])
-                        continue
-                    row_cells = []
-                    for field in record:
-                        if field.startswith("__"):
-                            continue
-                        try:
-                            column = self._adaptive.writable_column(sheet_id, field)
-                        except MappingError:
-                            continue
-                        if column:
-                            row_cells.append((record["__row__"], column))
-                    if row_cells:
-                        cells.extend(row_cells)
-                        cleared += 1
-                if cells:
-                    updates_by_sheet[sheet_id] = (worksheet, cells)
+            jobs = [(sheet_id, self._get_spreadsheet().get_worksheet_by_id(sheet_id), sheet_records)
+                    for sheet_id, sheet_records in grouped.items()]
         else:
-            worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
+            jobs = [(0, self._get_spreadsheet().worksheet(self.config.sheet_bookings), records)]
+        for sheet_id, worksheet, sheet_records in jobs:
+            delete = getattr(worksheet, "delete_rows", None)
+            if delete is None:
+                log.warning("Архив: лист %s не поддерживает удаление строк", sheet_id)
+                continue
             try:
                 values = worksheet.get_all_values(value_render_option="FORMULA")
-            except (AttributeError, TypeError):
-                values = None
-            cells = []
-            for record in records:
-                if has_formula(values, record["__row__"]):
-                    log.warning("Архив: строка %d с формулой не очищается", record["__row__"])
+            except Exception as error:
+                log.warning("Архив: не удалось прочитать область %s (%s)", sheet_id, type(error).__name__)
+                continue
+            if any(str(cell).startswith("=") for row in values for cell in row):
+                log.warning("Архив: в области %s есть формулы — строки не удаляются", sheet_id)
+                continue
+            mapped_by_row = {}
+            for record in sheet_records:
+                mapped = set()
+                for field in record:
+                    if field.startswith("__"):
+                        continue
+                    try:
+                        mapped.add(self._adaptive.writable_column(sheet_id, field) if self._adaptive else 0)
+                    except Exception as error:
+                        log.warning("Архив: колонка поля %s не найдена (%s)", field, type(error).__name__)
+                mapped_by_row[record["__row__"]] = mapped or set(range(1, len(headers) + 1))
+            row_numbers = []
+            for record in sheet_records:
+                row_number = record["__row__"]
+                mapped = mapped_by_row.get(row_number, set())
+                row_values = values[row_number - 1] if row_number <= len(values) else []
+                outside = [str(cell).strip() for index, cell in enumerate(row_values, 1)
+                           if index not in mapped and str(cell).strip()]
+                if outside:
+                    log.warning("Архив: строка %d содержит данные вне зоны бота — не удаляется", row_number)
                     continue
-                cells.extend((record["__row__"], column) for column in range(1, len(headers) + 1))
-                cleared += 1
-            if cells:
-                updates_by_sheet[0] = (worksheet, cells)
-        for worksheet, sheet_cells in updates_by_sheet.values():
-            try:
-                worksheet.batch_update([{"range": cell_name(row_number, column), "values": [[""]]}
-                                        for row_number, column in sheet_cells], value_input_option="RAW")
-            except AttributeError:
-                for row_number, column in sheet_cells:
-                    worksheet.update_cell(row_number, column, "")
-        if cleared:
+                row_numbers.append(row_number)
+            # Пустые ряды (в том числе от прежних чисток) убираем, чтобы не было промежутков.
+            moved = set(row_numbers)
+            for index in range(2, len(values) + 1):
+                if index in moved or any(str(cell).strip() for cell in values[index - 1]):
+                    continue
+                row_numbers.append(index)
+            for row_number in sorted(set(row_numbers), reverse=True):
+                delete(row_number)
+                deleted += 1
+        if deleted:
             self._invalidate("bookings")
-        return cleared
+        return deleted
 
     def clean_expired_slots(self) -> int:
         """Физическая очистка устаревших дат в листе «Слоты».
