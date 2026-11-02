@@ -1891,6 +1891,74 @@ class AdaptiveSheets:
         return any(entry.get("marker") == marker and entry.get("state") in {"pending", "done"}
                    for entry in journal.values())
 
+    def clean_expired_slots(self, today) -> int:
+        """Физическая очистка устаревших дат в слотовых областях (линейная раскладка).
+
+        Сеточные раскладки не трогаются: их дата живёт в названии листа. Прошедшие
+        строки очищаются адресной записью пустых значений только в колонки
+        раскладки — строки листа не сдвигаются, будущие слоты, непонятные строки,
+        строки с формулами и данные вне раскладки остаются без изменений.
+        today — локальный день в часовом поясе бота (сравнение строгое: только
+        даты раньше сегодняшней). Возвращает число очищенных строк.
+        """
+        with self.lock:
+            try:
+                rules = self._rules("slots")
+            except MappingError:
+                return 0
+            cleared_rows = 0
+            for rule in rules:
+                if rule.get("grid_columns") or "Дата" not in rule["columns"]:
+                    continue  # дата содержится в названии листа — очисткой не занимаемся
+                worksheet = self._worksheet(rule["sheet_id"])
+                try:
+                    values = worksheet.get_all_values(value_render_option="FORMULA",
+                                                      date_time_render_option="FORMATTED_STRING")
+                except Exception as error:
+                    log.warning("Слоты «%s» не прочитаны; очистка пропущена (%s)",
+                                rule["sheet_title"], type(error).__name__)
+                    continue
+                end_row = min(len(values), rule.get("end_row") or len(values))
+                date_transform = rule.get("transforms", {}).get("Дата", "date")
+                date_column = rule["columns"]["Дата"]
+                updates: list[dict] = []
+                for row in range(rule["first_data_row"], end_row + 1):
+                    row_values = values[row - 1] if row <= len(values) else []
+                    if not any(str(field_value).strip() for field_value in row_values):
+                        continue  # и так пустая
+                    try:
+                        expired = datetime.strptime(date_value(value_at(values, row, date_column), date_transform),
+                                                    "%d.%m.%Y").date()
+                    except (MappingError, ValueError, TypeError):
+                        continue  # строка не датируется: не очищаем
+                    if expired >= today:
+                        continue  # будущий или сегодняшний день не трогаем
+                    if any(str(field_value).startswith("=") for field_value in row_values):
+                        log.warning("Слоты «%s», строка %d: формула в прошедшей строке — не очищается",
+                                    rule["sheet_title"], row)
+                        continue
+                    for column in rule["columns"].values():
+                        updates.append({"range": cell_name(row, column), "values": [[""]]})
+                    cleared_rows += 1
+                if updates:
+                    try:
+                        worksheet.batch_update(updates, value_input_option="RAW")
+                    except AttributeError:
+                        # Синтетические листы в тестах умеют только поячеечную запись.
+                        for update in updates:
+                            match = re.fullmatch(r"([A-Z]+)(\d+)", update["range"])
+                            if not match:
+                                continue
+                            column_number = 0
+                            for letter in match.group(1):
+                                column_number = column_number * 26 + ord(letter) - 64
+                            worksheet.update_cell(int(match.group(2)), column_number, update["values"][0][0])
+                    except Exception as error:
+                        log.warning("Слоты «%s»: очистка не удалась (%s)", rule["sheet_title"], type(error).__name__)
+                        continue
+                    log.info("Слоты «%s»: очищено устаревших строк: %d", rule["sheet_title"], cleared_rows)
+            return cleared_rows
+
     def reconcile_cancel(self, record: dict) -> bool | None:
         """Доводим прерванную отмену: запись уже «Отмена», клетка могла остаться занятой.
 

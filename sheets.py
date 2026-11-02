@@ -1415,6 +1415,68 @@ class Store:
             self._invalidate("bookings")
             return changed
 
+    def clean_expired_slots(self) -> int:
+        """Физическая очистка устаревших дат в листе «Слоты».
+
+        Локальный день бота — часовой пояс задан в .env. Линейную раскладку
+        («Дата, Время, Постов») чистим адресно: прошлые строки пустеют, лист не
+        сдвигается. Сеточные раскладки (дата в названии листа), график
+        «Начало/Конец» без колонки «Дата», строки с формулами и данные вне
+        раскладки остаются без изменений. Возвращает число очищенных строк.
+        """
+        today = self.now().date()
+        with self._lock:
+            if self._adaptive:
+                cleared = self._adaptive.clean_expired_slots(today)
+                if cleared:
+                    self._invalidate("slots")
+                return cleared
+            try:
+                worksheet = self._get_spreadsheet().worksheet(self.config.sheet_slots)
+                values = worksheet.get_all_values(value_render_option="FORMULA",
+                                                  date_time_render_option="FORMATTED_STRING")
+            except Exception as error:
+                log.warning("Слоты не прочитаны; очистка пропущена (%s)", type(error).__name__)
+                return 0
+            if not values:
+                return 0
+            headers = [str(header).strip() for header in values[0]]
+            if "Дата" not in headers:
+                return 0  # график работы или незнакомая раскладка
+            date_column = headers.index("Дата") + 1
+            columns = {index + 1 for index, header in enumerate(headers)
+                       if header in {"Дата", "Время", "Постов", "Мест", "Боксов"}}
+            updates, cleared_rows = [], 0
+            for row, row_values in enumerate(values[1:], 2):
+                if not any(str(field_value).strip() for field_value in row_values):
+                    continue
+                slot_date = parse_date(str(row_values[date_column - 1]).strip()) if len(row_values) >= date_column else None
+                if not slot_date or slot_date >= today:
+                    continue  # будущий или сегодняшний день не трогаем
+                if any(str(field_value).startswith("=") for field_value in row_values):
+                    log.warning("Слоты, строка %d: формула в прошедшей строке — не очищается", row)
+                    continue
+                for column in columns:
+                    updates.append({"range": cell_name(row, column), "values": [[""]]})
+                cleared_rows += 1
+            if not updates:
+                return 0
+            try:
+                worksheet.batch_update(updates, value_input_option="RAW")
+            except AttributeError:
+                # Синтетические листы в тестах умеют только поячеечную запись.
+                for update in updates:
+                    match = re.fullmatch(r"([A-Z]+)(\d+)", update["range"])
+                    if not match:
+                        continue
+                    column_number = 0
+                    for letter in match.group(1):
+                        column_number = column_number * 26 + ord(letter) - 64
+                    worksheet.update_cell(int(match.group(2)), column_number, update["values"][0][0])
+            self._invalidate("slots")
+            log.info("Слоты: очищено устаревших строк: %d", cleared_rows)
+            return cleared_rows
+
     def my_bookings(self, telegram_id: int) -> dict:
         with self._lock:
             self._invalidate("bookings")

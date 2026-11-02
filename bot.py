@@ -376,7 +376,7 @@ async def maintain_grid_consistency(store: Store) -> None:
 
 
 async def archive_old_bookings(store: Store) -> None:
-    """Раз в 6 часов помечаем прошедшие заявки как «Архив»."""
+    """Раз в 6 часов: прошедшие заявки «Архив», затем физическая очистка слотов."""
     while True:
         try:
             archived = await asyncio.to_thread(store.archive_old_bookings)
@@ -387,6 +387,12 @@ async def archive_old_bookings(store: Store) -> None:
                 log.info("Архивировано устаревших записей: %d", archived)
         except Exception as error:
             log.warning("Не удалось архивировать старые записи (%s)", type(error).__name__)
+        try:
+            cleaned = await asyncio.to_thread(store.clean_expired_slots)
+            if cleaned:
+                log.info("Очищено устаревших строк расписания: %d", cleaned)
+        except Exception as error:
+            log.warning("Не удалось очистить устаревшие строки расписания (%s)", type(error).__name__)
         await asyncio.sleep(6 * 3600)
 
 
