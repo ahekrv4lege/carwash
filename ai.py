@@ -421,7 +421,10 @@ class Agent:
             return
         facts = state.get("facts", {})
         if facts.get("date") and facts.get("time"):
-            return  # клиент уже указал подходящий слот: повторный выбор не нужен
+            day, hour = parse_date(str(facts["date"])), parse_time(str(facts["time"]))
+            # Дата прошлой записи или прошедшее время — не «подходящий слот»: нужен повторный выбор.
+            if day and hour and self.store._is_future(day, hour):
+                return  # клиент уже указал подходящий слот: повторный выбор не нужен
         if menu != "date" and not (facts.get("date") or state.get("slot_pick")):
             menu = "date"  # часа без дня не бывает: сначала выбирается день
         state["slot_menu"] = menu
@@ -893,7 +896,11 @@ car — слова клиента с исходной цитатой; car_model 
             day = parse_date(date_str or "")
             if not day:
                 return "Не удалось определить дату. Напишите её сообщением, пожалуйста.", None
-            result = await asyncio.to_thread(self.store.free_slots, day.isoformat())
+            try:
+                result = await asyncio.to_thread(self.store.free_slots, day.isoformat())
+            except Exception as error:
+                log.warning("Расписание недоступно при выборе дня (%s)", type(error).__name__)
+                return "Не удалось посмотреть расписание. Попробуйте ещё раз позже.", None
             if not result.get("ok"):
                 return "Не удалось посмотреть расписание. Попробуйте ещё раз позже.", None
             if state.get("facts", {}).get("date") != day.isoformat():
@@ -924,7 +931,11 @@ car — слова клиента с исходной цитатой; car_model 
             day, chosen = parse_date(date_str or ""), parse_time(time_str or "")
             if not day or not chosen:
                 return "Не удалось определить время. Напишите его сообщением, пожалуйста.", None
-            result = await asyncio.to_thread(self.store.free_slots, day.isoformat())
+            try:
+                result = await asyncio.to_thread(self.store.free_slots, day.isoformat())
+            except Exception as error:
+                log.warning("Расписание недоступно при выборе времени (%s)", type(error).__name__)
+                return "Не удалось проверить расписание. Попробуйте ещё раз позже.", None
             if not result.get("ok"):
                 return "Не удалось проверить расписание. Попробуйте ещё раз позже.", None
             note = f"Выбрал время кнопкой: {chosen} ({self._day_label(day)})."
