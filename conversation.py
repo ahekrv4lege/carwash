@@ -9,7 +9,7 @@ from sheets import digits, parse_date, parse_time, valid_phone
 
 
 FIELDS = {"client_name", "phone", "car", "car_model", "size_class", "requested_service", "tariff",
-          "services", "date", "time", "comment", "requested_datetime"}
+          "services", "date", "time", "comment", "requested_datetime", "plate"}
 CATALOG_FIELDS = {"size_class", "tariff", "services"}
 QUOTE_FIELDS = {"car", "size_class", "tariff", "services", "requested_service"}
 HIDDEN = dict.fromkeys([*range(0x200b, 0x2010), *range(0x202a, 0x202f), *range(0x2060, 0x2070), 0xfeff])
@@ -332,7 +332,7 @@ def redact_phone(text, known=None):
     return PHONE.sub(hide, text)
 
 
-def model_state(state):
+def model_state(state, plate_required: bool = False):
     result = {field_name: field_value for field_name, field_value in state.items() if field_name not in
               {"details", "facts", "tentative", "outstanding", "consumed_offers", "slot_menu", "slot_pick"}}
     for key in ("facts", "tentative"):
@@ -350,6 +350,9 @@ def model_state(state):
                          if not facts.get(field_name) or field_name in guesses or field_name in {"date", "time"} and "requested_datetime" in guesses]
     if not facts.get("tariff") and not facts.get("services") or "requested_service" in guesses:
         result["missing"].append("tariff_or_services")
+    # Госномер показывается только когда обязателен у этой автомойки; известный не повторяется.
+    if plate_required and not facts.get("plate") and "plate" not in guesses:
+        result["missing"].append("plate")
     if state.get("unavailable_time") == {field_name: facts.get(field_name) for field_name in ("date", "time")}:
         result["missing"].append("available_time")
     return result

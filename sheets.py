@@ -1105,7 +1105,7 @@ class Store:
     def create_booking(
         self, *, date_str: str, time_str: str, name: str, phone: str, car: str,
         size_class: str, tariff: str | None, services: list[str], comment: str,
-        telegram_id: int, username: str | None,
+        telegram_id: int, username: str | None, plate: str = "",
         expected_quote: dict | None = None,
     ) -> dict:
         booking_date, booking_time = parse_date(date_str), parse_time(to_work_time(time_str))
@@ -1137,6 +1137,12 @@ class Store:
             self._invalidate("slots", "bookings")  # слоты и записи — только свежие данные
             slots = self._get_slots()
             headers, booking_rows = self._get_bookings()
+            # Госномер обязателен только если настройка включена и в таблице есть колонка:
+            # старые таблицы без поля продолжают работать.
+            plate = (plate or "").strip()[:40]
+            plate_column_present = ("Госномер" in self._adaptive.booking_fields()) if self._adaptive else "Госномер" in headers
+            if self.config.car_plate_required and not plate and plate_column_present:
+                return _failure("Не указан госномер автомобиля")
             duplicate = next((record for record in booking_rows if pick(record, "Telegram ID") == str(telegram_id)
                               and parse_date(pick(record, "Дата")) == booking_date and parse_time(pick(record, "Время")) == booking_time
                               and pick(record, "Автомобиль").casefold() == car.casefold() and self._is_active(record)), None)
@@ -1214,6 +1220,7 @@ class Store:
                 "telegram id": str(telegram_id),
                 "username": f"@{username}" if username else "",
                 "статус": "Новая",
+                "госномер": plate,
                 **({} if duration_minutes is None else {"длительность": str(duration_minutes)}),
             }
             if self._adaptive:

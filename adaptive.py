@@ -27,6 +27,9 @@ NON_PRICE_HEADERS = {"id", "duration", "duration minutes", "duration hours", "д
                      "длительность работы", "время мин", "время работы", "минуты", "часы", "номер", "код"}
 BOOKING_FIELDS = ["ID", "Создано", "Дата", "Время", "Имя", "Телефон", "Автомобиль", "Класс",
                   "Тариф", "Доп. услуги", "Состав", "Сумма", "Комментарий", "Telegram ID", "Username", "Статус"]
+# Дополнительные поля записей: колонка может отсутствовать в старых таблицах,
+# поэтому не обязана для записи и не участвует в канонической раскладке.
+EXTRA_ROLE_FIELDS = {"bookings": ["Госномер"]}
 ALIASES = {
     "ID": ["id", "номер записи", "booking id", "номер брони"],
     "Создано": ["создано", "created", "created at", "дата создания"],
@@ -44,6 +47,8 @@ ALIASES = {
     "Telegram ID": ["telegram id", "tg id", "telegram_id", "tg_id", "id клиента"],
     "Username": ["username", "ник", "telegram username"],
     "Статус": ["статус", "status", "состояние"],
+    "Госномер": ["госномер", "гос номер", "госномер автомобиля", "номер авто", "номер машины",
+                 "plate", "license plate", "car plate"],
     "Постов": ["постов", "мест", "боксов", "capacity", "bays", "пост", "бокс"],
     "Услуга": ["услуга", "service", "service name", "название услуги"],
     "Описание": ["описание", "description", "details"],
@@ -269,7 +274,8 @@ def atomic_json(path: Path, data: dict) -> None:
 def header_mapping(headers: list, role: str) -> tuple[dict, list[str]]:
     columns = {}
     errors = []
-    for field in ALL_ROLE_FIELDS[role]:
+    # Дополнительные поля (например «Госномер») мапятся, только когда колонка есть в листе.
+    for field in (*ALL_ROLE_FIELDS[role], *EXTRA_ROLE_FIELDS.get(role, ())):
         aliases = {normalize_header(alias) for alias in ALIASES[field]}
         hits = [index for index, header in enumerate(headers, 1) if normalize_header(header) in aliases]
         if len(hits) == 1:
@@ -670,6 +676,8 @@ class AdaptiveSheets:
         if len(set(columns.values())) != len(columns):
             errors.append("Два поля ссылаются на одну колонку")
         allowed = set(ROLE_FIELDS.get(rule["role"], OPTIONAL_ROLE_FIELDS.get(rule["role"], set())))
+        # Дополнительные поля (например «Госномер») разрешены, когда колонка есть в листе.
+        allowed |= set(EXTRA_ROLE_FIELDS.get(rule["role"], ()))
         allowed = allowed | set(rule.get("price_fields", []))
         if rule.get("pivot_prices"):
             allowed.update({"Класс", "Сумма"})
@@ -1469,6 +1477,18 @@ class AdaptiveSheets:
         if field not in rule["columns"]:
             raise MappingError(f"В области «{rule['sheet_title']}» нет колонки {field}")
         return int(rule["columns"][field])
+
+    def booking_fields(self) -> set:
+        """Знать канонические поля записей всех подтвержённых областей (для проверок Store)."""
+        with self.lock:
+            try:
+                rules = self._rules("bookings")
+            except MappingError:
+                return set()
+            fields: set = set()
+            for rule in rules:
+                fields.update(rule["columns"])
+            return fields
 
     def _date_cell_values(self, rule: dict) -> list[list]:
         """Сетка, содержащая только ячейку-источник даты, вместо чтения всего листа."""

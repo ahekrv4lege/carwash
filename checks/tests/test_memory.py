@@ -359,7 +359,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
 
     async def test_revision_schema_allows_known_fields_without_changing_facts(self):
-        self.agent._state[111] = {"facts": dict(ARGS), "stage": "collecting", "quote": {"total": 630}}
+        self.agent._state[111] = {"facts": {**ARGS, "plate": "а 123 ав 77"}, "stage": "collecting", "quote": {"total": 630}}
         schema = next(tool["function"]["parameters"] for tool in self.agent._tools(self.user)
                       if tool["function"]["name"] == "create_booking")
         self.assertIn("time", schema["properties"])
@@ -446,13 +446,14 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
             return next(tool["function"]["parameters"] for tool in self.agent._tools(self.user)
                         if tool["function"]["name"] == "create_booking")
         self.agent._state[111] = {"facts": {key: value for key, value in ARGS.items() if key != "phone"}}
-        self.assertEqual(schema()["required"], ["phone"])
+        # Госномер обязателен по умолчанию (CAR_PLATE_REQUIRED=true).
+        self.assertEqual(schema()["required"], ["phone", "plate"])
         self.assertIn("phone", schema()["properties"])
         self.assertNotIn("car", schema()["properties"])
         self.agent._state[111]["facts"]["phone"] = ARGS["phone"]
-        self.assertEqual(schema()["required"], [])
+        self.assertEqual(schema()["required"], ["plate"])
         self.agent._state[111]["facts"].clear()
-        self.assertEqual(set(schema()["required"]), {"date", "time", "client_name", "phone", "car", "size_class"})
+        self.assertEqual(set(schema()["required"]), {"date", "time", "client_name", "phone", "car", "size_class", "plate"})
         self.assertEqual(SCHEMAS["create_booking"]["required"], [])
 
     async def test_memory_repair_sends_only_the_forced_tool_schema(self):

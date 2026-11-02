@@ -416,7 +416,7 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(m['role']=='tool' and '630' in m['content'] for m in messages))
 
     async def test_repeated_occupied_proposal_is_memoized_after_snapshot_update(self):
-        self.agent._state[111]={'facts':dict(ARGS)}
+        self.agent._state[111]={'facts':{**ARGS,'plate':'а 123 ав 777'}}
         self.spreadsheet.worksheet('Слоты').values[1][2]='0'
         self.transport.side_effect=[response(calls=[('create_booking',{})]) for _ in range(6)]
         with patch.object(self.store,'calculate_price',wraps=self.store.calculate_price) as quote:
