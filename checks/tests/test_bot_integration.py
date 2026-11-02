@@ -201,6 +201,7 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
         for minimum, elapsed, expected in ((1.5, 0.2, 1.3), (1.5, 3, 0), (0, 0.2, 0)):
             with self.subTest(minimum=minimum, elapsed=elapsed):
                 agent = Mock(config=N(reply_min_delay_sec=minimum), reply=AsyncMock(return_value="Подскажу цены."))
+                agent.slot_keyboard = AsyncMock(return_value=None)
                 message = Mock(from_user=N(id=111, username=None, full_name="Тест"), chat=N(id=111), answer=AsyncMock())
                 reporter = Mock(dialog=AsyncMock())
                 sender = Mock(__aenter__=AsyncMock(), __aexit__=AsyncMock())
@@ -389,6 +390,7 @@ class MessageBatchingTests(unittest.IsolatedAsyncioTestCase):
                         "from": {"id": 999, "is_bot": True, "first_name": "Carwash"},
                         "text": "Предложение"}, "data": "booking:edit:offer-1"})
         self.agent.proposal_action = AsyncMock(return_value="Что изменить?")
+        self.agent.slot_keyboard = AsyncMock(return_value=None)
         self.agent.delivery_token.return_value = None
         reporter = Mock(dialog=AsyncMock())
         with patch.object(Message, "answer", new_callable=AsyncMock):

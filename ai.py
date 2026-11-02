@@ -81,6 +81,15 @@ TOOLS = [
 MUTATIONS = {"create_booking", "cancel_booking", "reschedule_booking"}
 SCHEMAS = {tool["function"]["name"]: tool["function"]["parameters"] for tool in TOOLS}
 
+# Вопросы о дне и о времени записи: под такие ответы показываются кнопки выбора слота.
+SLOT_DATE_QUESTION = re.compile(
+    r"на\s+какой\s+день|какая\s+дата|какой\s+день|какое\s+число|"
+    r"когда\s+(?:вас\s+)?записать|когда\s+вам\s+удобно|"
+    r"(?:на\s+)?(?:какой\s+)?(?:день|дату|число)\s+и\s+время", re.I)
+SLOT_TIME_QUESTION = re.compile(
+    r"на\s+какое\s+время|какое\s+(?:другое\s+)?время|"
+    r"(?:день|время|дата)\s+(?:вам\s+)?(?:подход\w*|удобн\w*)|как\s+время", re.I)
+
 
 def _service_names(value: Any) -> list[str]:
     if value is None or value == "":
@@ -98,6 +107,11 @@ def _clean_text(text: str) -> str:
     text = text.replace("*", "").replace("`", "")
     text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _button_rows(buttons) -> list | None:
+    """Сетка кнопок: по 5 в строке, максимум 2 строки (10 кнопок)."""
+    return [buttons[start:start + 5] for start in range(0, min(len(buttons), 10), 5)] or None
 
 
 _VEHICLE_NUMBERS = {
@@ -400,6 +414,29 @@ class Agent:
         self._state[user_id]["pending"] = {"action": pending["action"], "delivered": False}
         return answer
 
+    def _offer_slot_menu(self, user_id, menu="date"):
+        """Пометить следующий ответ кнопками выбора слота, если время ещё не выбрано."""
+        state = self._state[user_id]
+        if state.get("stage") in {"booked", "cancelled", "uncertain", "awaiting_confirmation", "writing"}:
+            return
+        facts = state.get("facts", {})
+        if facts.get("date") and facts.get("time"):
+            return  # клиент уже указал подходящий слот: повторный выбор не нужен
+        if menu != "date" and not (facts.get("date") or state.get("slot_pick")):
+            menu = "date"  # часа без дня не бывает: сначала выбирается день
+        state["slot_menu"] = menu
+
+    def _maybe_slot_menu(self, user_id, answer):
+        if user_id in self._pending:
+            return
+        if SLOT_DATE_QUESTION.search(answer or ""):
+            menu = "date"
+        elif SLOT_TIME_QUESTION.search(answer or ""):
+            menu = "time"
+        else:
+            return
+        self._offer_slot_menu(user_id, menu)
+
     @staticmethod
     def _build_static_prompt(config: Config, contacts: str) -> str:
         return plain_text(f"""РОЛЬ И КОНТЕКСТ
@@ -449,7 +486,7 @@ car — слова клиента с исходной цитатой; car_model 
 Пример «Никита, 79000000001, Toyota RAV4, тариф Стандарт»: за ОДИН respond сохрани все поля: {{"reply":"","facts":{{"client_name":["Никита","Никита"],"phone":["79000000001","79000000001"],"car":["Toyota RAV4","Toyota RAV4"],"car_model":["Toyota RAV4","Toyota RAV4"],"size_class":["Кроссовер","Toyota RAV4"],"tariff":["Стандарт","Стандарт"]}},"tentative":{{}}}}. Класс в примере допустим, только если это подтверждает прайс. Дату и время тоже сохраняй, если они названы. Не создавай отдельный respond для каждого поля.
 
 ПРИМЕРЫ МАНЕРЫ, НЕ ИСТОЧНИК ФАКТОВ
-Клиент: «Что входит в стандарт?» → Получи состав из каталога. Затем: «В «Стандарт» входят:\\n— [услуга из каталога]\\n— [следующая услуга]\\n\\nДля вашего автомобиля — [проверенная сумма] ₽». Не отправляй квадратные скобки клиенту.
+Клиент: «Что входит в стандарт?» → Получи состав из каталога. Затем: «В «Стандарт» входят:\n— [услуга из каталога]\n— [следующая услуга]\n\nДля вашего автомобиля — [проверенная сумма] ₽». Не отправляй квадратные скобки клиенту.
 Клиент после этого: «Давайте» → Сохрани выбранный тариф. Если времени ещё нет: «На какой день и время вас записать?»
 Клиент: «Не в 14, а в 16» → Измени только время, проверь 16:00 и подготовь новую сводку, если остальные данные есть. Имя и телефон заново не спрашивай.
 Клиент: «Просто цены посмотреть» → Покажи нужные цены, не запрашивай контакты и не оформляй запись.
@@ -457,7 +494,6 @@ car — слова клиента с исходной цитатой; car_model 
 Перед ответом молча проверь: ответила ли на вопрос; использовала ли уже известные данные; подтверждены ли числа инструментом; не объявила ли запись раньше кнопки; понятен ли текст без служебных слов. Клиенту показывай только готовый ответ.
 
 """)
-
     def _system_prompt(self) -> str:
         now = self.store.now()
         return self._prompt_static + self._PROMPT_TAIL + plain_text(
@@ -624,6 +660,8 @@ car — слова клиента с исходной цитатой; car_model 
                         return self._remember(user.id, text, slots.get("note", "Свободного времени не нашла."))
                     blocks = [day["date"] + " (" + day["weekday"] + "):\n" + "\n".join("— " + hour for hour in day["free_times"]) for day in days]
                     question = "Во сколько вы заканчиваете работу?" if re.search(r"после\s+работы", text, re.I) else "Какое время вам подходит?"
+                    facts_now = state.get("facts", {})
+                    self._offer_slot_menu(user.id, "time" if (facts_now.get("date") or state.get("slot_pick")) else "date")
                     return self._remember(user.id, text, "Свободное время:\n\n" + "\n\n".join(blocks) + "\n\n" + question)
             except Exception as error:
                 log.warning("Не удалось прочитать расписание (%s)", api_error_label(error))
@@ -737,6 +775,7 @@ car — слова клиента с исходной цитатой; car_model 
                     answer = clarification
                 elif state.get("ambiguous_time"):
                     answer = "Уточните, пожалуйста, это утро или вечер?"
+            self._maybe_slot_menu(user.id, answer)
             return self._remember(user.id, text, answer)
 
     async def proposal_action(self, user: ChatUser, offer_id: str, action: str) -> str:
@@ -756,6 +795,7 @@ car — слова клиента с исходной цитатой; car_model 
                 state.pop("pending", None)
                 state.pop("outstanding", None)
                 state.update(stage="collecting", confirmed=False)
+                self._offer_slot_menu(user.id, "date")
                 return "Предложение устарело. Уточните желаемую дату и время, я проверю их заново."
             consumed = [*state.get("consumed_offers", [])[-7:], offer_id]
             state["consumed_offers"] = consumed
@@ -775,6 +815,156 @@ car — слова клиента с исходной цитатой; car_model 
                 self._state.pop(user.id, None)
                 return "Диалог сброшен. Результат операции проверьте в своих записях."
             return self._remember(user.id, "Нажата кнопка «Подтвердить».", answer)
+
+    # ---------- кнопки выбора даты и времени (данные только из таблицы) ----------
+
+    @staticmethod
+    def _day_label(value) -> str:
+        return f"{value:%d.%m.%Y}, {WEEKDAYS_RU[value.weekday()]}"
+
+    @staticmethod
+    def _day_button(value) -> str:
+        return f"{value:%d.%m} ({WEEKDAYS_RU[value.weekday()]})"
+
+    @staticmethod
+    def _time_buttons(day, times) -> list | None:
+        buttons = [(time_value, f"slots:time:{day.isoformat()}:{time_value}")
+                   for time_value in times if within_work_hours(time_value)]
+        return _button_rows(buttons)
+
+    @staticmethod
+    def _free_times_of(result, date_str) -> list:
+        return next((entry.get("free_times") or [] for entry in result.get("days", [])
+                     if entry.get("date") == date_str), [])
+
+    async def _date_rows(self, user) -> list | None:
+        """Строки кнопок ближайших дней со свободными часами; None, если таблица недоступна."""
+        result = await asyncio.to_thread(self.store.free_slots)
+        if not result.get("ok"):
+            return None
+        self._remember_slots(user, result)
+        buttons = []
+        for entry in result.get("days", []):
+            day = parse_date(entry.get("date"))
+            if day and entry.get("free_times"):
+                buttons.append((self._day_button(day), f"slots:date:{entry['date']}"))
+        return _button_rows(buttons)
+
+    async def _time_rows(self, user, date_str) -> list | None:
+        """Строки кнопок свободных часов даты; None, если день заполнен или таблица недоступна."""
+        day = parse_date(date_str)
+        if not day:
+            return None
+        result = await asyncio.to_thread(self.store.free_slots, day.isoformat())
+        if not result.get("ok"):
+            return None
+        self._remember_slots(user, result, self._state[user.id].get("facts", {}))
+        return self._time_buttons(day, self._free_times_of(result, day.isoformat())) or None
+
+    async def slot_keyboard(self, user: ChatUser) -> list | None:
+        """Строки кнопок выбора даты/времени по актуальным слотам таблицы; None, если они не нужны."""
+        state = self._state.get(user.id)
+        menu = state.pop("slot_menu", None) if state else None
+        if not menu or user.id in self._pending:
+            return None
+        if state.get("stage") in {"booked", "cancelled", "uncertain", "awaiting_confirmation", "writing"}:
+            return None
+        facts = state.get("facts", {})
+        try:
+            if menu == "time":
+                rows = await self._time_rows(user, facts.get("date") or (state.get("slot_pick") or {}).get("date"))
+                if rows:
+                    return rows
+            return await self._date_rows(user)
+        except Exception as error:
+            log.warning("Не удалось построить кнопки расписания (%s)", type(error).__name__)
+            return None
+
+    async def pick_date(self, user: ChatUser, date_str: str) -> tuple[str, list | None]:
+        """Клиент выбрал день кнопкой: показываем только свободные часы этого дня."""
+        async with self._session(user.id):
+            if not self.config.ai_enabled:
+                return "Автоматический помощник сейчас отключён. Для записи свяжитесь с администратором.", None
+            state = self._state[user.id]
+            if self._pending.get(user.id):
+                return "Сводка уже на экране: нажмите «Подтвердить» или напишите правку в чат.", None
+            if state.get("stage") in {"booked", "cancelled"}:
+                return "Эта запись уже оформлена. Напишите, если нужно перенести или отменить её.", None
+            day = parse_date(date_str or "")
+            if not day:
+                return "Не удалось определить дату. Напишите её сообщением, пожалуйста.", None
+            result = await asyncio.to_thread(self.store.free_slots, day.isoformat())
+            if not result.get("ok"):
+                return "Не удалось посмотреть расписание. Попробуйте ещё раз позже.", None
+            if state.get("facts", {}).get("date") != day.isoformat():
+                apply_patch(state, {"date": day.isoformat()}, {})
+            self._remember_slots(user, result, state.get("facts", {}))
+            state["slot_pick"] = {"date": day.isoformat()}
+            times = self._free_times_of(result, day.isoformat())
+            if not times:
+                return (f"На {self._day_label(day)} свободного времени не осталось. Выберите другой день.",
+                        await self._date_rows(user))
+            state.pop("unavailable_time", None)
+            text = (f"Свободное время на {self._day_label(day)}:\n\n"
+                    + "\n".join("— " + time_value for time_value in times)
+                    + "\n\nКакое вам подходит?")
+            return self._remember(user.id, f"Выбрал дату кнопкой: {self._day_label(day)}.", text), \
+                self._time_buttons(day, times)
+
+    async def pick_time(self, user: ChatUser, date_str: str, time_str: str) -> tuple[str, list | None]:
+        """Клиент выбрал время кнопкой: сверяемся с таблицей и готовим запись или следующий вопрос."""
+        async with self._session(user.id):
+            if not self.config.ai_enabled:
+                return "Автоматический помощник сейчас отключён. Для записи свяжитесь с администратором.", None
+            state = self._state[user.id]
+            if self._pending.get(user.id):
+                return "Сводка уже на экране: нажмите «Подтвердить» или напишите правку в чат.", None
+            if state.get("stage") in {"booked", "cancelled"}:
+                return "Эта запись уже оформлена. Напишите, если нужно перенести или отменить её.", None
+            day, chosen = parse_date(date_str or ""), parse_time(time_str or "")
+            if not day or not chosen:
+                return "Не удалось определить время. Напишите его сообщением, пожалуйста.", None
+            result = await asyncio.to_thread(self.store.free_slots, day.isoformat())
+            if not result.get("ok"):
+                return "Не удалось проверить расписание. Попробуйте ещё раз позже.", None
+            note = f"Выбрал время кнопкой: {chosen} ({self._day_label(day)})."
+            times = self._free_times_of(result, day.isoformat())
+            if chosen not in times:
+                # Слот заняли (или ушёл из графика) между показом кнопок и нажатием: сверились с таблицей.
+                state["slot_pick"] = {"date": day.isoformat()}
+                state.pop("unavailable_time", None)
+                if times:
+                    text = f"К сожалению, {chosen} на {self._day_label(day)} уже заняли. Выберите другое время."
+                    return self._remember(user.id, note, text), self._time_buttons(day, times)
+                text = f"На {self._day_label(day)} всё заняли. Выберите другой день."
+                return self._remember(user.id, note, text), await self._date_rows(user)
+            apply_patch(state, {"date": day.isoformat(), "time": chosen}, {})
+            state.pop("slot_pick", None)
+            state.pop("unavailable_time", None)
+            self._remember_slots(user, result, state.get("facts", {}))
+            return await self._after_slot_choice(user, note)
+
+    async def _after_slot_choice(self, user, note) -> tuple[str, None]:
+        """После выбора слота: сводка с кнопкой «Подтвердить», если данных хватает; иначе следующий вопрос."""
+        state = self._state[user.id]
+        facts = state.get("facts", {})
+        if not all(facts.get(field) for field in BOOKING_REQUIRED) or not (facts.get("tariff") or facts.get("services")):
+            return self._remember(user.id, note, self._clarification(user.id)), None
+        result = await self._call_tool("create_booking", "{}", user)
+        if result.get("confirmation_required"):
+            return self._remember(user.id, note, self._offer(user.id, self._pending[user.id])), None
+        if result.get("table_unavailable"):
+            return self._remember(user.id, note, result["error"]), None
+        field = result.get("field")
+        if field == "available_time" or "время недоступно" in str(result.get("error", "")):
+            rows = await self._time_rows(user, facts.get("date"))
+            return self._remember(user.id, note, self._clarification(user.id, "available_time")), rows
+        if field:
+            return self._remember(user.id, note, self._clarification(user.id, field)), None
+        error = str(result.get("error", ""))
+        if error and not re.search(r"аргумент|инструмент", error, re.I):
+            return self._remember(user.id, note, error), None
+        return self._remember(user.id, note, self._clarification(user.id)), None
 
     @staticmethod
     def _receipt(state):

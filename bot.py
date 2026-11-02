@@ -159,17 +159,34 @@ def split_text(text: str, limit: int = TG_LIMIT) -> list[str]:
     return parts
 
 
+def markup_from_rows(rows) -> InlineKeyboardMarkup | None:
+    """Строки кнопок (подпись, callback_data) в разметку Telegram; None, если данных нет."""
+    try:
+        if not isinstance(rows, list) or not rows:
+            return None
+        keyboard = [[(str(label), str(data)) for label, data in row] for row in rows]
+    except Exception:
+        return None
+    if any(not label or not data or len(data.encode()) > 64 for row in keyboard for label, data in row):
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=label, callback_data=data) for label, data in row] for row in keyboard])
+
+
 async def send_answer(message: Message, agent: Agent, reporter: AdminReporter,
-                      user: ChatUser, text: str, answer: str) -> None:
+                      user: ChatUser, text: str, answer: str,
+                      keyboard: InlineKeyboardMarkup | None = None) -> None:
     delivery_token = agent.delivery_token(user.id, answer)
     answer = plain_text(answer)
     pending = agent._pending.get(user.id, {})
     offer_id = pending.get("offer_id") if delivery_token is not None else None
-    keyboard = None
-    if isinstance(offer_id, str):
+    if keyboard is None and isinstance(offer_id, str):
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="Подтвердить", callback_data=f"booking:confirm:{offer_id}"),
         ]])
+    if keyboard is None:
+        # Кнопки выбора даты/времени строятся по актуальным слотам таблицы.
+        keyboard = markup_from_rows(await agent.slot_keyboard(user))
     chunks = split_text(answer)
     for index, chunk in enumerate(chunks):
         if keyboard is not None and index == len(chunks) - 1:
@@ -213,6 +230,32 @@ async def on_proposal(callback: CallbackQuery, agent: Agent, reporter: AdminRepo
     label = "Подтвердить" if parts[1] == "confirm" else "Изменить"
     if answer:
         await send_answer(callback.message, agent, reporter, user, label, answer)
+
+
+@router.callback_query(Filter.data.startswith("slots:"))
+async def on_slot_pick(callback: CallbackQuery, agent: Agent, reporter: AdminReporter) -> None:
+    """Выбор дня и времени кнопками: показываются только свободные слоты из таблицы."""
+    if not isinstance(callback.message, Message) or callback.message.chat.type != "private":
+        return
+    parts = (callback.data or "").split(":")
+    telegram_user = callback.from_user
+    user = ChatUser(id=telegram_user.id, username=telegram_user.username, full_name=telegram_user.full_name)
+    if len(parts) == 3 and parts[1] == "date":
+        label = "Выбор даты"
+        answer, rows = await agent.pick_date(user, parts[2])
+    elif len(parts) == 5 and parts[1] == "time":
+        label = "Выбор времени"
+        answer, rows = await agent.pick_time(user, parts[2], ":".join(parts[3:]))
+    else:
+        return
+    if callback.message.reply_markup:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception as error:
+            log.warning("Не удалось убрать старые кнопки (%s)", type(error).__name__)
+    if answer:
+        await send_answer(callback.message, agent, reporter, user, label, answer,
+                          keyboard=markup_from_rows(rows))
 
 
 @router.message(CommandStart())

@@ -125,6 +125,7 @@ class DeliveryAndTimeouts(unittest.IsolatedAsyncioTestCase):
         from bot import ask_agent
         agent = Mock()
         agent.reply = AsyncMock(return_value="synthetic-answer")
+        agent.slot_keyboard = AsyncMock(return_value=None)
         agent.delivery_token.return_value = "synthetic-token"
         message = Mock()
         message.from_user.id = 111
