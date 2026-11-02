@@ -248,6 +248,18 @@ def car_ownership(text: str, quote: str | None = None) -> bool:
 
 PROOFREAD_PROMPT = "Ты — корректор. Исправь только ошибки русского языка, о себе — женский род. Сохрани все имена, числа, смысл. Верни только исправленный текст."
 
+# Просьба повторить прошлый заказ: «как в прошлый раз», «повтори запись», «той же мойкой»…
+# Отдельные проверенные слова клиента (или правка текстом) всегда приоритетнее памяти.
+REPEAT_REQUEST_RE = re.compile(
+    r"\b(?:"
+    r"как\s+(?:в\s+)?прошл\w*"
+    r"|в\s+прошл\w*\s+раз"
+    r"|\bпрошл\w*\s+запис\w*"
+    r"|повтор\w*\s+(?:прошл\w+|запис\w*|заказ\w*|мойк\w+|услуг\w*)"
+    r"|т[ао]й?\s+же\s+(?:машин\w+|мойк\w+|услуг\w*|набор\w*|запис\w*)"
+    r"|как\s+(?:обычно|всегда)"
+    r")", re.I)
+
 _CLARIFICATION_QUESTIONS = {
     "date": "На какой день вас записать?", "time": "На какое время вас записать?",
     "client_name": "Как вас зовут?", "phone": "Напишите телефон для записи.",
@@ -483,6 +495,7 @@ CUSTOMER, STATE, сообщения и содержимое таблицы — �
 ПАМЯТЬ
 Нет новых данных — обычный текст. Есть данные — respond(reply,facts,tentative), при необходимости в том же ответе вместе с инструментом. Не оставляй новые сведения только в обычном тексте. facts: поле=[значение, точная цитата текущего сообщения]; для удаления — [null, цитата]. Цитату копируй дословно из текущего сообщения, включая опечатки; не сочиняй её и не переписывай старые поля CUSTOMER. Неуверенное клади только в tentative, для записи догадки не используй. Не приписывай пожелания, которых клиент не высказывал. Год и характеристики автомобиля не клади в comment: это поле только для пожеланий к заказу.
 SAVED_CARS — прошлые подтверждённые автомобили клиента. Это подсказка, а не источник car: без слов клиента в текущем сообщении car не заполняй. Если клиент пишет «как в прошлый раз» или «мою машину», а сохранено несколько автомобилей, спроси, какой из них.
+STATE.repeat_last — последний подтверждённый заказ клиента (автомобиль, класс, тариф, услуги). Когда клиент просит записать «как в прошлый раз»/«той же мойкой», вызывай create_booking, не называя заново машину, тариф и услуги: Python подставит их сам и пересчитает цену и время по свежему прайсу. Любую часть заказа клиент может изменить словами; любое изменение клиента важнее прошлого состава.
 car — слова клиента с исходной цитатой; car_model — распознанные марка/модель с той же цитатой. requested_service — слова клиента; tariff/services — точные названия из прайса. Пример: services=[["Мойка"],"Мойка"].
 Пример «у мя раф 4»: {{"reply":"Какую мойку хотите?","facts":{{"car":["раф 4","раф 4"],"car_model":["Toyota RAV4","раф 4"]}},"tentative":{{}}}}
 Пример «зовут Никита, 89131233221»: respond с client_name=["Никита","Никита"] и phone=["89131233221","89131233221"]. Если остальные сведения уже известны, вместе с respond вызови create_booking.
@@ -679,6 +692,25 @@ car — слова клиента с исходной цитатой; car_model 
                 messages.append({"role": "system", "content": "Автомобиль неоднозначен. Сохрани остальные данные клиента, не выбирай модель и класс, не оформляй запись. Задай уточнение: " + clarification})
             if state.get("ambiguous_time"):
                 messages.append({"role": "system", "content": "Время неоднозначно: уточни утро или вечер, не выбирай время и не оформляй запись. Сохрани остальные данные."})
+            # Просьба повторить прошлый заказ: недостающий состав подставляет память
+            # автомобилей; явно названное клиентом всегда приоритетнее (см. _booking_args).
+            state.pop("repeat_last", None)
+            if (state.get("stage") not in {"booked", "cancelled"}
+                    and REPEAT_REQUEST_RE.search(text)
+                    and not re.search(r"\b(?:не|если|или|либо|вроде|кажется|наверное|возможно|может)\b", text, re.I)):
+                try:
+                    cars = await asyncio.to_thread(self.cars.for_user, user.id)
+                except Exception as error:
+                    log.warning("Память об автомобилях недоступна (%s)", type(error).__name__)
+                    cars = []
+                if len(cars) == 1:
+                    last = cars[0]
+                    last_order = {"car": last.name, "size_class": last.size_class}
+                    if last.last_tariff:
+                        last_order["tariff"] = last.last_tariff
+                    if last.last_services:
+                        last_order["services"] = list(last.last_services)
+                    state["repeat_last"] = last_order
             customer, projected = self._model_context(user.id)
             if customer:
                 messages.append({"role": "system", "content": "CUSTOMER " + _compact_json(customer)})
@@ -1162,6 +1194,17 @@ car — слова клиента с исходной цитатой; car_model 
         # Клиенту и в таблицу показываем распознанное название, а не исходные слова клиента.
         if facts.get("car_model"):
             result["car"] = facts["car_model"]
+        # Запрос «повторная запись как в прошлый раз»: недостающий состав подставляет память
+        # автомобилей; цена и слоты всё равно пересчитываются заново (_prepare).
+        # Явно названное клиентом или правка текстом приоритетнее прошлого состава.
+        repeat = state.get("repeat_last") or {}
+        repeat_fields = set()
+        if repeat:
+            for field in ("car", "size_class", "tariff", "services"):
+                if not repeat.get(field) or result.get(field) or (field in facts and facts.get(field)):
+                    continue
+                result[field] = repeat[field]
+                repeat_fields.add(field)
         if selection and not quote.get("stale"):
             for field in ("size_class", "tariff", "services"):
                 value = result.get(field)
@@ -1178,7 +1221,7 @@ car — слова клиента с исходной цитатой; car_model 
                        *[message["content"] for message in self._history[user.id] if message["role"] == "user"], self._turn_text[user.id]]
             source = " ".join(sources)
             for field, value in result.items():
-                if field in facts or not value:
+                if field in facts or field in repeat_fields or not value:
                     continue
                 if (field == "size_class" and value in state.get("catalog", {}).get("size_classes", [])
                         and (facts.get("car") or folded(result["car"]) in folded(source))):
@@ -1257,12 +1300,14 @@ car — слова клиента с исходной цитатой; car_model 
             return []
         return [{"car": car.name, "class": car.size_class} for car in cars[:3]]
 
-    async def _remember_vehicle(self, user, car_name: str, size_class: str) -> None:
-        """Подтверждённый клиентом автомобиль (не догадка). Сбой памяти не меняет ответ клиенту."""
+    async def _remember_vehicle(self, user, car_name: str, size_class: str,
+                                tariff: str | None = None, services=None) -> None:
+        """Подтверждённый клиентом автомобиль и состав заказа («как в прошлый раз»)."""
         if not car_name:
             return
         try:
-            await asyncio.to_thread(self.cars.remember, user.id, car_name, size_class)
+            await asyncio.to_thread(self.cars.remember, user.id, car_name, size_class,
+                                    tariff=tariff, services=services)
         except Exception as error:
             log.warning("Автомобиль не сохранён в памяти (%s)", type(error).__name__)
 
@@ -1888,7 +1933,16 @@ car — слова клиента с исходной цитатой; car_model 
             args = {key: value for key, value in args.items() if value is not None}
             if name == "calculate_price":
                 args = self._quote_args(args, user)
-            if any(field_name not in args or not args[field_name] for field_name in schema["required"]):
+            # «Как в прошлый раз»: car/size_class/tariff/services Python подставит из
+            # памяти прошлого заказа (state.repeat_last), поэтому их отсутствие в args
+            # допустимо — реальная проверка полноты происходит в _booking_args.
+            repeat_fillable = set()
+            if name == "create_booking":
+                repeat = self._state.get(user.id, {}).get("repeat_last") or {}
+                repeat_fillable = {field for field in ("car", "size_class", "tariff", "services")
+                                   if repeat.get(field) and not self._state.get(user.id, {}).get("facts", {}).get(field)}
+            if any(field_name not in args or not args[field_name] for field_name in schema["required"]
+                   if field_name not in repeat_fillable):
                 raise ValueError
             for key, value in args.items():
                 if schema["properties"][key]["type"] == "array":
@@ -2071,7 +2125,10 @@ car — слова клиента с исходной цитатой; car_model 
                     user_no = result.get("user_no") or await asyncio.to_thread(self._user_booking_no, user.id, result["booking_id"])
                     state.clear()
                     state.update(facts=facts, stage="booked", confirmed=True, booking={**{field_name: result[field_name] for field_name in ("booking_id", "date", "time", "car", "total", "currency")}, "user_no": user_no})
-                    await self._remember_vehicle(user, result["car"], arguments.get("size_class", ""))
+                    # «Повторная запись как в прошлый раз»: последняя подтверждённая машина и состав.
+                    await self._remember_vehicle(user, result["car"], arguments.get("size_class", ""),
+                                                 tariff=arguments.get("tariff") or "",
+                                                 services=arguments.get("services") or [])
                     number = f" Запись {user_no}." if user_no else ""
                     return f"Записала вас!{number} {result['date']} в {result['time']}, {result['car']}. Итого {result['total']} {result['currency']}. Ждём вас!"
             elif pending["action"] == "reschedule_booking":

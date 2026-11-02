@@ -62,6 +62,31 @@ class DatabaseTests(unittest.TestCase):
         self.open_db()
         self.assertFalse(self.path.exists())
 
+    def test_v1_schema_is_migrated_and_last_order_is_saved(self):
+        old = sqlite3.connect(self.path)
+        old.execute("CREATE TABLE vehicles ("
+                    " id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER NOT NULL, car_key TEXT NOT NULL,"
+                    " car_name TEXT NOT NULL, size_class TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active',"
+                    " created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        old.execute("PRAGMA user_version = 1")
+        old.execute("INSERT INTO vehicles (telegram_id, car_key, car_name, size_class, status, created_at, updated_at)"
+                    " VALUES (111, 'toyota camry 3.5', 'Toyota Camry 3.5', 'Легковой', 'active', 'x', 'x')")
+        old.commit()
+        old.close()
+        db = self.open_db()
+        cars = db.list_active(111)  # миграция v1 -> v2 не теряет данные
+        self.assertEqual([(c.name, c.last_tariff, c.last_services) for c in cars],
+                         [("Toyota Camry 3.5", "", ())])
+        saved = db.upsert(111, "Toyota Camry 3.5", "Легковой", "2026-01-02 10:00:00",
+                          tariff="Базовый", services=["Мойка"])
+        self.assertEqual(db.list_active(111)[0].last_tariff, "Базовый")
+        self.assertEqual(db.list_active(111)[0].last_services, ("Мойка",))
+        # Прошлый заказ не затирается пустым повтором без подтверждённого состава.
+        db.upsert(111, "Toyota Camry 3.5", "Легковой", "2026-01-03 10:00:00")
+        car = db.list_active(111)[0]
+        self.assertEqual((car.last_tariff, car.last_services), ("Базовый", ("Мойка",)))
+        self.assertEqual(saved.size_class, "Легковой")
+
     def test_upsert_deduplicates_and_updates_class(self):
         db = self.open_db()
         first = db.upsert(111, "Toyota Camry 3.5", "Легковой", "2026-01-01 10:00:00")
@@ -404,7 +429,35 @@ class AgentIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_confirmed_booking_is_remembered_in_database(self):
         self.assertIn("Записала", await self.book_camry())
         self.assertEqual([(c.name, c.size_class) for c in self.agent.cars.for_user(111)], [("Toyota Camry 3.5", "Легковой")])
+        self.assertEqual(self.agent.cars.for_user(111)[0].last_tariff, "Базовый")  # состав прошлого заказа
         self.assertEqual(len(self.spreadsheet.worksheet("Записи").writes), 1)  # бронирование записано в таблицу один раз
+
+    async def test_repeat_request_reuses_saved_order_and_rechecks_freshly(self):
+        await self.book_camry()
+        self.spreadsheet.worksheet("Слоты").values.append(["01.01.2099", "11:00", "2"])
+        state = self.agent._state[111]
+        state.clear()
+        # Новый запрос «как в прошлый раз»: клиент назвал только день и время.
+        state.update(stage="collecting", confirmed=False,
+                     facts={"client_name": "Synthetic", "phone": "00000000000",
+                            "date": "2099-01-01", "time": "11:00"},
+                     repeat_last={"car": "Toyota Camry 3.5", "size_class": "Легковой",
+                                  "tariff": "Базовый", "services": []})
+        result = await self.agent._call_tool("create_booking", "{}", self.user)
+        self.assertTrue(result.get("confirmation_required"), result)
+        args = self.agent._pending[self.user.id]["args"]
+        self.assertEqual(args["car"], "Toyota Camry 3.5")  # автомобиль из памяти прошлого заказа
+        self.assertEqual(args["tariff"], "Базовый")  # та же услуга
+        # «Повторная» цена и слоты — свежий расчёт и проверка таблицы, а не значения прошлой записи.
+        self.assertEqual(args["date"], "2099-01-01")
+        self.assertEqual(args["time"], "11:00")
+        self.assertEqual(args.get("services"), [])  # память не приписала лишних услуг
+        self.agent._offer(self.user.id, self.agent._pending[self.user.id])  # сводка клиенту
+        self.agent.mark_delivered(self.user.id, self.agent.delivery_token(self.user.id))
+        offer = self.agent._pending[self.user.id]["offer_id"]
+        answer = await self.agent.proposal_action(self.user, offer, "confirm")
+        self.assertIn("Записала", answer)
+        self.assertEqual(len(self.spreadsheet.worksheet("Записи").writes), 2)  # вторая запись создана, не отредактирована
 
     async def test_memory_failure_does_not_change_booking_answer(self):
         with patch.object(VehicleMemory, "remember", side_effect=sqlite3.OperationalError("disk full")):
