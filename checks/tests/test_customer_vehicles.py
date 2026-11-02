@@ -244,7 +244,12 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(restarted.db_reads, 1)            # дальше читается из кэша
 
     def test_two_connections_can_write_concurrently_without_corruption(self):
-        first, second = VehicleDatabase(self.path), VehicleDatabase(self.path)
+        def database():
+            db = VehicleDatabase(self.path)
+            self.addCleanup(db.close)  # на Windows открытый WAL блокирует уборку папки
+            return db
+
+        first, second = database(), database()
         errors = []
 
         def worker(db, user):
@@ -261,8 +266,8 @@ class MemoryTests(unittest.TestCase):
         for thread in threads:
             thread.join()
         self.assertEqual(errors, [])
-        self.assertEqual(len(VehicleDatabase(self.path).list_active(111)), 10)
-        self.assertEqual(len(VehicleDatabase(self.path).list_active(222)), 10)
+        self.assertEqual(len(database().list_active(111)), 10)
+        self.assertEqual(len(database().list_active(222)), 10)
         raw = sqlite3.connect(self.path)
         self.assertEqual(raw.execute("PRAGMA integrity_check").fetchone()[0], "ok")
         raw.close()
