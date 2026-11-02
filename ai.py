@@ -877,7 +877,7 @@ car — слова клиента с исходной цитатой; car_model 
 
     @staticmethod
     def _day_button(value) -> str:
-        return f"{value:%d.%m} {WEEKDAYS_SHORT[value.weekday()]}"
+        return f"{value:%d.%m}({WEEKDAYS_SHORT[value.weekday()]})"
 
     @staticmethod
     def _time_buttons(day, times) -> list | None:

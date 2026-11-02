@@ -32,8 +32,8 @@ def upcoming_day(store, offset=2):
 
 
 def day_label(day):
-    """Подпись кнопки дня: короткий weekday, как в раскладке."""
-    return f"{day:%d.%m} {WEEKDAYS_SHORT[day.weekday()]}"
+    """Подпись кнопки дня: короткий weekday в скобках, как в раскладке."""
+    return f"{day:%d.%m}({WEEKDAYS_SHORT[day.weekday()]})"
 
 
 def add_slot(spreadsheet, day, time_value, posts="2"):
@@ -280,7 +280,7 @@ class SlotButtonUnitTests(unittest.IsolatedAsyncioTestCase):
         for row in rows:
             for label, data in row:
                 self.assertLessEqual(len(data.encode()), 64)
-                self.assertRegex(label, r"^\d{2}\.\d{2} (пн|вт|ср|чт|пт|сб|вс)$")
+                self.assertRegex(label, r"^\d{2}\.\d{2}\((пн|вт|ср|чт|пт|сб|вс)\)$")
 
     async def test_back_button_returns_to_dates_and_drops_picked_day(self):
         import bot
