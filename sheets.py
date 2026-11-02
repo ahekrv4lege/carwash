@@ -1422,29 +1422,28 @@ class Store:
             self._invalidate("bookings")
             return changed
 
-    def move_aged_bookings_to_archive(self) -> int:
-        """Записи старше недели переносятся в отдельный архивный лист.
+    def move_archived_bookings(self) -> int:
+        """Записи со статусом «Архив» переносятся в отдельный архивный лист.
 
-        Архив хранит id и все данные записи (услуги, состав, сумму, статус) с той же
-        шапкой, что у «Записей»; лист создаётся при первом переносе (имя —
-        SHEET_ARCHIVE, по умолчанию «Архив»). Перенос идемпотентен: записи с ID,
-        которые уже лежат в архиве, не дублируются, поэтому повторные запуски
-        обслуживания ничего не копируют заново. Источник остаётся как есть —
-        статус «Архив» в «Записях» ставит archive_old_bookings, строки не
+        Статус «Архив» ставит archive_old_bookings прошедшим датам — архивом
+        считаем всё, что код уже пометил. Лист хранит id и все данные записи
+        (услуги, состав, сумму, статус) с той же шапкой, что у «Записей»;
+        создаётся при первом переносе (имя — SHEET_ARCHIVE, по умолчанию
+        «Архив»). Перенос идемпотентен: записи с ID, которые уже лежат
+        в архиве, не дублируются, поэтому повторные запуски обслуживания
+        ничего не копируют заново. Источник остаётся как есть, строки не
         сдвигаются. Записи без распознанного ID не переносятся: их нельзя
         защитить от дубля. Архивный лист — служебный, вне карт адаптива.
         Возвращает число скопированных записей.
         """
-        cutoff = self.now().date() - timedelta(days=7)
         with self._lock:
             headers, rows = self._table(self.config.sheet_bookings)
             if not rows:
                 return 0
             candidates = []
             for record in rows:
-                booking_date = parse_date(str(record.get("Дата", "")))
                 booking_id = pick(record, "ID")
-                if booking_date and booking_date < cutoff and booking_id:
+                if pick(record, "Статус").lower().startswith("архив") and booking_id:
                     candidates.append((booking_id, record))
             if not candidates:
                 return 0
