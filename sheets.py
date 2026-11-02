@@ -1141,6 +1141,10 @@ class Store:
                               and parse_date(pick(record, "Дата")) == booking_date and parse_time(pick(record, "Время")) == booking_time
                               and pick(record, "Автомобиль").casefold() == car.casefold() and self._is_active(record)), None)
             if duplicate:
+                # Повтор запроса после потерянного ответа: сверяем незакрытый журнал создания
+                # по постоянному ID и подтверждаем оригинал, вторая строка не создаётся.
+                if self._adaptive:
+                    self._adaptive.settle_create(pick(duplicate, "ID"), telegram_id)
                 return _failure("У клиента уже есть такая запись", booking_id=pick(duplicate, "ID"))
             duration_minutes = None
             if isinstance(slots, DurationSchedule):

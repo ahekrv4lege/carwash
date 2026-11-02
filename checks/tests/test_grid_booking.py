@@ -105,14 +105,18 @@ class GridBookingTests(unittest.TestCase):
         self.assertEqual(self.cell(2, 2), f"Запись {original['booking_id']}")
         self.assertEqual(self.bookings().values[1][3], "10:00")
 
-    def test_unknown_write_keeps_claim_and_blocks_retry(self):
+    def test_unknown_write_keeps_claim_and_resume_completes_row(self):
         self.bookings().fail_write = True
         with self.assertRaisesRegex(MappingError, "неизвестен"):
             self.store.create_booking(**booking())
-        self.assertTrue(self.cell(2, 2).startswith("Запись "))
+        marker = self.cell(2, 2)
+        self.assertTrue(marker.startswith("Запись "))
         self.bookings().fail_write = False
-        with self.assertRaises(MappingError):
-            self.store.create_booking(**booking())
+        # Сверка по ID: строка записи не дошла до листа — повтор подхватывает свою клетку.
+        result = self.store.create_booking(**booking())
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.cell(2, 2), marker)  # клетка осталась своей же
+        self.assertEqual(len(self.bookings().values) - 1, 1)
 
     def test_write_that_landed_before_error_is_reconciled_as_success(self):
         original = self.bookings().batch_update
@@ -214,24 +218,31 @@ class GridBookingTests(unittest.TestCase):
         real_atomic_json = adaptive.atomic_json
         return write
 
-    def test_claim_failure_before_write_keeps_no_marker_and_blocks_retry(self):
+    def test_claim_failure_before_write_falls_back_to_a_fresh_claim_on_retry(self):
         self.grid.fail_write = True
         with self.assertRaises(OSError):
             self.store.create_booking(**booking())
         self.assertEqual(self.cell(2, 2), "")
         self.assertEqual(len(self.bookings().values), 1)
-        # Журнал уже записан до занятия клетки: повтор требует ручной сверки.
-        with self.assertRaisesRegex(MappingError, "повтор заблокирован"):
-            self.store.create_booking(**booking())
+        # Строка записи отсутствует и клетка пуста: сверка по ID разрешает повтор.
+        self.grid.fail_write = False
+        result = self.store.create_booking(**booking())
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(self.bookings().values) - 1, 1)
+        self.assertTrue(self.cell(2, 2).startswith("Запись "))
 
-    def test_claim_failure_after_write_keeps_marker_and_blocks_retry(self):
+    def test_claim_failure_after_write_resume_reuses_own_claim(self):
         self.fail_after_apply(self.grid)
         with self.assertRaises(OSError):
             self.store.create_booking(**booking())
-        self.assertTrue(self.cell(2, 2).startswith("Запись "))
+        marker = self.cell(2, 2)
+        self.assertTrue(marker.startswith("Запись "))
         self.assertEqual(len(self.bookings().values), 1)
-        with self.assertRaisesRegex(MappingError, "повтор заблокирован"):
-            self.store.create_booking(**booking())
+        # Своя клетка прошлой попытки: повтор не ищет новый пост и завершает строку записи.
+        result = self.store.create_booking(**booking())
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.cell(2, 2), marker)
+        self.assertEqual(len(self.bookings().values) - 1, 1)
 
     def test_journal_failure_before_claim_leaves_no_marker_and_allows_retry(self):
         with patch.object(adaptive, "atomic_json", side_effect=self.journal_writer(1)):

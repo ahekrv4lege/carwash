@@ -1542,7 +1542,11 @@ class AdaptiveSheets:
             raise SlotUnavailable("На это время свободных постов нет")
         cell = cell_name(row, column)
         current = worksheet.get(f"{cell}:{cell}", value_render_option="FORMULA")
-        if not self._grid_cell_free(rule, current[0][0] if current and current[0] else ""):
+        value = current[0][0] if current and current[0] else ""
+        if not self._grid_cell_free(rule, value):
+            if str(value).strip() == marker.strip():
+                # Своё занятие прошлой попытки (ответ потерян): повтор законен, клетку не трогаем.
+                return {"sheet_id": rule["sheet_id"], "row": row, "column": column, "marker": marker}
             raise SlotUnavailable("Пост только что занят; выберите другое время")
         worksheet.batch_update([{"range": cell, "values": [[marker]]}], value_input_option="RAW")
         return {"sheet_id": rule["sheet_id"], "row": row, "column": column, "marker": marker}
@@ -1611,7 +1615,10 @@ class AdaptiveSheets:
             key = fingerprint({field_name: str(data[field_name]).strip().casefold() for field_name in ("telegram id", "дата", "время", "автомобиль")})
             journal_path, journal = self._journal()
             if key in journal:
-                raise MappingError("Такая операция уже выполнена или ожидает ручной сверки; повтор заблокирован")
+                # Неопределённый итог прошлой попытки: своряем факт по постоянному ID,
+                # а не повторяем запись вслепую.
+                if self._reconcile_create(rule, data, journal, journal_path, key):
+                    return  # строка с этим ID уже на листе: повторная запись не выполнялась
             # Сравниваем в том же режиме, что и таблица (FORMATTED_VALUE): в FORMULA телефон «+7…»,
             # в отображении «7…», и любая сверка ложно видит «строки изменились».
             values = worksheet.get_all_values(value_render_option="FORMATTED_VALUE")
@@ -1649,7 +1656,8 @@ class AdaptiveSheets:
             grid_rules = self._grid_rules(data["дата"])
             # Журнал пишем до занятия клетки: сбой между занятием и журналом оставлял бы
             # маркер без записи и без доказательства для ручной сверки.
-            journal[key] = {"state": "pending", "sheet_id": rule["sheet_id"], "row": row, "at": time.time()}
+            journal[key] = {"state": "pending", "sheet_id": rule["sheet_id"], "row": row, "at": time.time(),
+                            "id": str(data["id"])}
             atomic_json(journal_path, journal)
             if grid_rules:
                 try:
@@ -1680,6 +1688,53 @@ class AdaptiveSheets:
             except Exception:
                 # Строка уже подтверждена; сбой журнала не должен превращать успех в отказ.
                 log.warning("Журнал операций не обновлён после подтверждённой записи")
+
+    def _reconcile_create(self, rule: dict, data: dict, journal: dict, path, key: str) -> bool | None:
+        """Неопределённый итог создания: сверяем лист по постоянному ID записи.
+
+        Строка с этим ID и той же личностью есть — операция уже состоялась, ответ был
+        потерян: журнал закрывается, повтор не выполняется. Строк с этим ID нет, а
+        адресованная строка журнала пуста — первая попытка не доехала до листа:
+        журнал снимается, повтор разрешается. Иначе исход спорный: остаётся
+        заблокированным до ручной сверки, журнал не изменяется.
+        Возвращает True — запись уже на листе; None — можно повторять.
+        """
+        worksheet = self._worksheet(rule["sheet_id"])
+        try:
+            values = worksheet.get_all_values(value_render_option="FORMATTED_VALUE")
+        except Exception as error:
+            log.warning("Сверка прошлой записи %s не удалась (%s)", data["id"], type(error).__name__)
+            raise MappingError("Не удалось сверить прошлую запись; повторите позже") from None
+        id_column = rule["columns"].get("ID")
+        last_row = min(len(values), rule.get("end_row") or len(values))
+        matches = [row_index for row_index in range(rule["first_data_row"], last_row + 1)
+                   if id_column and str(value_at(values, row_index, id_column)).strip() == str(data["id"]).strip()]
+        entry = journal.get(key) or {}
+        if len(matches) > 1:
+            raise MappingError("Несколько строк с этим ID записи; нужна ручная сверка") from None
+        if len(matches) == 1:
+            identity = {"ID": str(data["id"]), "Telegram ID": str(data["telegram id"]),
+                        "Дата": data["дата"], "Время": data["время"]}
+            if self._booking_row_state(rule, matches[0], identity) is not True:
+                raise MappingError("Строка с этим ID хранит другие данные; нужна ручная сверка") from None
+            entry["state"] = "done"
+            try:
+                atomic_json(path, journal)
+            except Exception:
+                # Строка подтверждена листом; сбой журнала не отменяет восстановление.
+                log.warning("Журнал операций не обновлён после сверки создания")
+            log.info("Создание восстановлено: запись %s уже на листе, повтор не выполнялся", data["id"])
+            return True
+        row = int(entry.get("row") or 0)
+        if row and any(str(field_value).strip() for field_value in (values[row - 1] if row <= len(values) else [])):
+            raise MappingError("Строка прошлой попытки занята другими данными; нужна ручная сверка") from None
+        journal.pop(key, None)
+        try:
+            atomic_json(path, journal)
+        except Exception:
+            log.warning("Не удалось очистить журнал после сверки создания")
+        log.info("Создание восстановлено: строка не дошла до листа, повтор разрешён")
+        return None
 
     def cancel(self, record: dict, telegram_id: int) -> None:
         with self.lock:
@@ -1861,6 +1916,41 @@ class AdaptiveSheets:
                 except Exception:
                     log.warning("Журнал операций не обновлён после сверки отмены")
             return released
+
+    def settle_create(self, booking_id: str, telegram_id: int) -> None:
+        """Сверка незакрытого создания по постоянному ID: строка уже на листе.
+
+        Потерянный ответ оставлял журнал pending; клиент повторил запрос, и дубль-проверка
+        нашла его запись. Подтверждаем личность по строке закрываем журнал, чтобы не
+        оставлять вечный маркер блокировки.
+        """
+        with self.lock:
+            try:
+                path, journal = self._journal()
+            except MappingError:
+                return
+            targets = {key: entry for key, entry in journal.items()
+                       if entry.get("state") == "pending" and str(entry.get("id", "")) == str(booking_id).strip()}
+            if not targets:
+                return
+            settled = []
+            for key, entry in targets.items():
+                try:
+                    rule = self._target(sheet_id=entry["sheet_id"])
+                except MappingError:
+                    continue  # область недоступна: журнал остаётся до ручной сверки
+                if self._booking_row_state(rule, entry.get("row"),
+                                           {"ID": str(booking_id).strip(), "Telegram ID": str(telegram_id)}) is True:
+                    settled.append(key)
+            if not settled:
+                return  # строка не подтверждает личность: сверку делает администратор
+            for key in settled:
+                journal[key]["state"] = "done"
+            log.info("Создание восстановлено по повтору клиента: запись %s подтверждена листом, журнал закрыт", booking_id)
+            try:
+                atomic_json(path, journal)
+            except Exception:
+                log.warning("Журнал операций не обновлён после сверки создания по ID")
 
     def validate_reschedule(self, record: dict, new_date: str) -> dict:
         rule = self._target(sheet_id=record["__sheet_id__"])

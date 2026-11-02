@@ -288,7 +288,7 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Записала', answer)
         self.assertEqual(len(self.spreadsheet.worksheet('Записи').writes), 1)
 
-    async def test_restart_preserves_uncertain_write_journal_without_saving_profile(self):
+    async def test_restart_preserves_uncertain_write_journal_and_reconciles_on_retry(self):
         from sheets import Store
         from adaptive import MappingError
         from tests.fakes import booking
@@ -298,9 +298,9 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
         restarted=Store(self.store.config)
         restarted._spreadsheet=self.spreadsheet
         self.spreadsheet.worksheet('Записи').fail_write=False
-        with self.assertRaises(MappingError):
-            restarted.create_booking(**booking())
-        self.assertFalse(self.spreadsheet.worksheet('Записи').writes)
+        result=restarted.create_booking(**booking())
+        self.assertTrue(result['ok'],result)  # сверка по постоянному ID сняла незакрытый журнал
+        self.assertEqual(len(self.spreadsheet.worksheet('Записи').values)-1,1)  # без дублей
 
     async def test_ordinary_reply_after_booking_is_not_replaced_in_history(self):
         await self.offer()
