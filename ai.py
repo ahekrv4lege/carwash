@@ -474,8 +474,9 @@ class Agent:
 
     @staticmethod
     def _build_static_prompt(config: Config, contacts: str) -> str:
-        plate_text = ("Записи нужен и госномер (plate): если клиент его ещё не назвал, спроси до оформления;"
-                      " известный госномер повторно не спрашивай, клиент меняет его обычным текстом."
+        plate_text = ("Записи нужен и госномер (plate): спроси его вместе с остальными недостающими данными,"
+                      " не отдельным сообщением; известный госномер повторно не спрашивай, клиент меняет"
+                      " его обычным текстом. У повторных клиентов Python подставит номер из памяти сам."
                       if config.car_plate_required else "")
         return plain_text(f"""РОЛЬ И КОНТЕКСТ
 Ты — Светлана, администратор автомойки «{config.carwash_name}». Говори о себе в женском роде.
@@ -742,6 +743,8 @@ car — слова клиента с исходной цитатой; car_model 
                         last_order["tariff"] = last.last_tariff
                     if last.last_services:
                         last_order["services"] = list(last.last_services)
+                    if last.last_plate:
+                        last_order["plate"] = last.last_plate
                     state["repeat_last"] = last_order
             customer, projected = self._model_context(user.id)
             if customer:
@@ -1259,7 +1262,7 @@ car — слова клиента с исходной цитатой; car_model 
         repeat = state.get("repeat_last") or {}
         repeat_fields = set()
         if repeat:
-            for field in ("car", "size_class", "tariff", "services"):
+            for field in ("car", "size_class", "tariff", "services", "plate"):
                 if not repeat.get(field) or result.get(field) or (field in facts and facts.get(field)):
                     continue
                 result[field] = repeat[field]
@@ -1363,13 +1366,13 @@ car — слова клиента с исходной цитатой; car_model 
         return [{"car": car.name, "class": car.size_class} for car in cars[:3]]
 
     async def _remember_vehicle(self, user, car_name: str, size_class: str,
-                                tariff: str | None = None, services=None) -> None:
+                                tariff: str | None = None, services=None, plate: str | None = None) -> None:
         """Подтверждённый клиентом автомобиль и состав заказа («как в прошлый раз»)."""
         if not car_name:
             return
         try:
             await asyncio.to_thread(self.cars.remember, user.id, car_name, size_class,
-                                    tariff=tariff, services=services)
+                                    tariff=tariff, services=services, plate=plate)
         except Exception as error:
             log.warning("Автомобиль не сохранён в памяти (%s)", type(error).__name__)
 
@@ -1790,6 +1793,9 @@ car — слова клиента с исходной цитатой; car_model 
             result = tool_cache[key]
             if result.get("table_unavailable"):
                 return result["error"]
+            if result.get("direct_reply"):
+                # Вопрос про госномер задаёт Python без лишнего поколения модели.
+                return result["direct_reply"]
             if result.get("confirmation_required") and user.id in self._pending:
                 return self._offer(user.id, self._pending[user.id])
             payload = ({"ok": True, "cached": True, "reuse": "Результат с этими аргументами уже указан выше."}
@@ -1951,6 +1957,9 @@ car — слова клиента с исходной цитатой; car_model 
                             apply_patch(self._state[user.id], {field: [chosen] if field == "services" else chosen}, {})
                     if all(self._state[user.id].get("facts", {}).get(field) for field in BOOKING_REQUIRED):
                         result = await self._call_tool("create_booking", "{}", user)
+                        if result.get("direct_reply"):
+                            # Вопрос про госномер без второго поколения модели.
+                            return result["direct_reply"]
                         if result.get("confirmation_required"):
                             return self._offer(user.id, self._pending[user.id])
                         if result.get("table_unavailable"):
@@ -1995,16 +2004,16 @@ car — слова клиента с исходной цитатой; car_model 
             args = {key: value for key, value in args.items() if value is not None}
             if name == "calculate_price":
                 args = self._quote_args(args, user)
-            # «Как в прошлый раз»: car/size_class/tariff/services Python подставит из
-            # памяти прошлого заказа (state.repeat_last), поэтому их отсутствие в args
-            # допустимо — реальная проверка полноты происходит в _booking_args.
-            repeat_fillable = set()
+            # «Как в прошлый раз»: состав заказа продставит память прошлого заказа, поэтому их
+            # отсутствие в args допустимо; госномер по флагу обязателен, но вопрос задаёт
+            # Python сам — без второго поколения модели.
             if name == "create_booking":
-                repeat = self._state.get(user.id, {}).get("repeat_last") or {}
-                repeat_fillable = {field for field in ("car", "size_class", "tariff", "services")
-                                   if repeat.get(field) and not self._state.get(user.id, {}).get("facts", {}).get(field)}
-            if any(field_name not in args or not args[field_name] for field_name in schema["required"]
-                   if field_name not in repeat_fillable):
+                state_now = self._state.get(user.id, {})
+                repeat = state_now.get("repeat_last") or {}
+                plate_known = (args.get("plate") or state_now.get("facts", {}).get("plate") or repeat.get("plate"))
+                if self.config.car_plate_required and not plate_known:
+                    return {"ok": False, "field": "plate", "direct_reply": _CLARIFICATION_QUESTIONS["plate"]}
+            if any(field_name not in args or not args[field_name] for field_name in schema["required"]):
                 raise ValueError
             for key, value in args.items():
                 if schema["properties"][key]["type"] == "array":
@@ -2192,7 +2201,8 @@ car — слова клиента с исходной цитатой; car_model 
                     # «Повторная запись как в прошлый раз»: последняя подтверждённая машина и состав.
                     await self._remember_vehicle(user, result["car"], arguments.get("size_class", ""),
                                                  tariff=arguments.get("tariff") or "",
-                                                 services=arguments.get("services") or [])
+                                                 services=arguments.get("services") or [],
+                                                 plate=arguments.get("plate") or "")
                     number = f" Запись {user_no}." if user_no else ""
                     return f"Записала вас!{number} {result['date']} в {result['time']}, {result['car']}. Итого {result['total']} {result['currency']}. Ждём вас!"
             elif pending["action"] == "reschedule_booking":
