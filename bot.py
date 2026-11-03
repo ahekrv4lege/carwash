@@ -13,6 +13,7 @@ from urllib.request import getproxies, proxy_bypass
 from aiogram import Bot, Dispatcher, F as Filter, Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import PRODUCTION, TelegramAPIServer
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.chat_action import ChatActionSender
@@ -70,8 +71,22 @@ def telegram_proxy() -> str | None:
     return value
 
 
+def telegram_api():
+    """Базовый адрес Bot API: PRODUCTION или TELEGRAM_API_BASE (прокси/зеркало)."""
+    raw = os.getenv("TELEGRAM_API_BASE", "").strip().rstrip("/")
+    if not raw:
+        return PRODUCTION
+    parsed = urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.query or parsed.fragment:
+        raise RuntimeError("TELEGRAM_API_BASE: нужен абсолютный http(s)-адрес")
+    return TelegramAPIServer(
+        base=f"{raw}/bot{{token}}/{{method}}",
+        file=f"{raw}/file/bot{{token}}/{{path}}",
+    )
+
+
 def telegram_session() -> AiohttpSession:
-    session = AiohttpSession(proxy=telegram_proxy(), timeout=35)
+    session = AiohttpSession(api=telegram_api(), proxy=telegram_proxy(), timeout=35)
     session.middleware(retry_telegram)
     return session
 
