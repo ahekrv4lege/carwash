@@ -23,6 +23,7 @@ from providers import api_error_label, client_options, completion_options, inval
 from sheets import (WEEKDAYS_RU, Store, parse_date, parse_time, digits, valid_phone,
                     to_work_time, within_work_hours, WORK_HOURS_HINT)
 from vehicles import VehicleMemory, car_key
+from recovery import RecoveryMemory, SNAPSHOT_TTL_SEC
 from conversation import (CATALOG_FIELDS, FIELDS, PHONE, any_word_mentioned, apply_patch, folded, leak_reason,
                           literal_car_patch, model_state, plain_text, redact_phone, safe_claim, same, stem_variants,
                           strict_json, unpack, validate_patch, salvage_patch, source_date, source_time, word_stems)
@@ -32,6 +33,15 @@ PROVIDER_COOLDOWN_SEC = 60
 
 # Учитываем разрешение часов: на Windows ожидание может закончиться раньше дедлайна.
 MONOTONIC_RESOLUTION = time.get_clock_info("monotonic").resolution
+
+# Какие поля STATE переживают штатную остановку. Каталог, цены, слоты и
+# незавершённые предложения остаются временными: их проверяет Python заново.
+_RECOVERY_STATE_KEYS = {
+    "stage", "confirmed", "review_required", "outstanding", "vehicle_ambiguous",
+    "vehicle_family", "ambiguous_time", "unavailable_time", "booking", "cancelled",
+    "consumed_offers", "context", "greeted", "selection", "invalidated",
+    "vehicle_question", "slot_pick",
+}
 
 
 @dataclass
@@ -387,6 +397,7 @@ class Agent:
         self.config, self.store, self.reporter = config, store, reporter
         self.cars = VehicleMemory(config.vehicle_memory_file, cache_mb=config.vehicle_cache_mb,
                                   ttl_min=config.vehicle_cache_ttl_min, adaptive=config.vehicle_cache_adaptive)
+        self.recovery = RecoveryMemory(config.conversation_memory_file)
         contacts = ", ".join(contact for contact in (config.carwash_address, config.carwash_phone) if contact) or "не указаны"
         self._prompt_contacts = contacts
         self._prompt_static = self._build_static_prompt(config, contacts)
@@ -410,6 +421,12 @@ class Agent:
         self._turn_sources: dict[int, dict] = {}
         self._turn_tools: dict[int, dict] = {}
         self._tools_cache: dict[tuple, list] = {}
+        # Последний ход клиента: нужен только снимку при штатной остановке.
+        # Обычные сообщения ничего не пишут на диск.
+        self._turns: dict[int, dict] = {}
+        self._last_activity: dict[int, float] = {}
+        self._recovery_resume: dict[int, dict] = {}
+        self._profile_hidden: set[int] = set()
         # Сколько времени проверенные результаты инструментов можно показывать модели
         # без повторной проверки: прайс/расчёт — от кэша каталога, слоты — от кэша слотов.
         self._catalog_ttl_sec = max(self.config.catalog_cache_sec * 5, 300)
@@ -479,8 +496,10 @@ class Agent:
         try:
             async with self._locks[user_id]:
                 entered = True
+                self._mark_activity(user_id)
                 self._take_proposal(user_id)
                 await self._restore_saved_vehicle(user_id)
+                await self._restore_profile(user_id)
                 try:
                     yield
                 finally:
@@ -489,6 +508,7 @@ class Agent:
             self._active[user_id] -= 1
             self._last_seen[user_id] = time.monotonic()
             self._last_seen.move_to_end(user_id)
+            self._mark_activity(user_id)
             if entered:
                 self._turn_text.pop(user_id, None)
                 self._turn_sources.pop(user_id, None)
@@ -508,6 +528,10 @@ class Agent:
         self._turn_text.pop(user_id, None)
         self._turn_sources.pop(user_id, None)
         self._turn_tools.pop(user_id, None)
+        self._turns.pop(user_id, None)
+        self._last_activity.pop(user_id, None)
+        self._recovery_resume.pop(user_id, None)
+        self._profile_hidden.add(user_id)
 
     def delivery_token(self, user_id: int, reply: str | None = None):
         pending = self._pending.get(user_id, {})
@@ -521,6 +545,81 @@ class Agent:
             pending["delivered"] = True
             self._state[user_id]["pending"] = {"action": pending["action"], "delivered": True}
             self._save_proposal(user_id)
+
+    # ---------- короткая память хода и постоянный профиль ----------
+
+    def _mark_activity(self, user_id: int) -> None:
+        """Активность по стенным часам: monotonic нельзя сравнивать после рестарта."""
+        self._last_activity[user_id] = time.time()
+
+    def _turn_start(self, user_id: int, text: str, kind: str = "reply", user=None) -> None:
+        self._turns[user_id] = {
+            "text": text, "kind": kind, "processed": False, "delivered": False,
+            "started_at": time.time(), "user": {
+                "id": user_id,
+                "username": getattr(user, "username", None),
+                "full_name": getattr(user, "full_name", "") or "",
+            },
+        }
+        self._mark_activity(user_id)
+
+    def _turn_processed(self, user_id: int, text: str, answer: str) -> None:
+        turn = self._turns.get(user_id)
+        if turn is not None and turn.get("text") == text and not turn.get("processed"):
+            turn.update(answer=answer, processed=True, processed_at=time.time())
+
+    def mark_turn_delivered(self, user_id: int, answer: str) -> None:
+        """Telegram подтвердил отправку последнего ответа (независимо от сводки)."""
+        turn = self._turns.get(user_id)
+        if turn is not None and turn.get("processed") and turn.get("answer") == answer:
+            turn.update(delivered=True, delivered_at=time.time())
+
+    async def _save_profile(self, user_id: int) -> None:
+        facts = self._state.get(user_id, {}).get("facts", {})
+        name = facts.get("client_name") if isinstance(facts.get("client_name"), str) else ""
+        phone = facts.get("phone") if isinstance(facts.get("phone"), str) else ""
+        if not name and not phone:
+            return
+        self._profile_hidden.discard(user_id)
+        try:
+            await asyncio.to_thread(self.recovery.save_profile, user_id, name, phone)
+        except Exception as error:
+            log.warning("Профиль клиента не сохранён (%s)", type(error).__name__)
+
+    async def _restore_profile(self, user_id: int) -> None:
+        """Имя и телефон — постоянная память, не зависящая от окна восстановления."""
+        state = self._state[user_id]
+        if state.get("profile_restored"):
+            return
+        state["profile_restored"] = True
+        if user_id in self._profile_hidden:
+            return
+        try:
+            profile = await asyncio.to_thread(self.recovery.profile, user_id)
+        except Exception as error:
+            log.warning("Профиль клиента недоступен (%s)", type(error).__name__)
+            return
+        if not profile:
+            return
+        facts = state.setdefault("facts", {})
+        if profile.get("name") and not facts.get("client_name"):
+            facts["client_name"] = profile["name"]
+        if profile.get("phone") and not facts.get("phone"):
+            facts["phone"] = profile["phone"]
+
+    def pending_recoveries(self) -> list[tuple]:
+        """Незавершённые ходы из снимка: доставить ответ или безопасно повторить."""
+        result = []
+        for user_id, turn in self._recovery_resume.items():
+            data = turn.get("user") if isinstance(turn, dict) else None
+            if not isinstance(data, dict) or data.get("id") != user_id:
+                continue
+            result.append((ChatUser(user_id, data.get("username"), data.get("full_name") or ""),
+                           dict(turn)))
+        return result
+
+    def clear_recovery(self, user_id: int) -> None:
+        self._recovery_resume.pop(user_id, None)
 
     def _offer(self, user_id, pending, prefix=""):
         answer = prefix + self._proposal_text(pending)
@@ -659,9 +758,14 @@ car — слова клиента с исходной цитатой; car_model 
         if leak_reason(answer):
             log.warning("Служебный текст заменён вопросом клиенту")
             answer = self._clarification(user_id)
+        self._turn_processed(user_id, text, answer)
+        pending = self._pending.get(user_id)
+        if pending and pending.get("action") in {"create_booking", "cancel_booking", "reschedule_booking"}:
+            turn = self._turns.get(user_id)
+            if turn is not None:
+                turn["kind"] = "proposal"
         self._turn_text.pop(user_id, None)
         history = self._history[user_id]
-        pending = self._pending.get(user_id)
         state = self._state[user_id]
         # Контекст следующего шага: бот спросил об автомобиле, и марка семейства
         # из слов клиента или ответа делает короткий ответ («пятая») проверяемым.
@@ -733,6 +837,7 @@ car — слова клиента с исходной цитатой; car_model 
                 return "Сообщение слишком длинное. Напишите, пожалуйста, короче: автомобиль, услуга и желаемое время."
             self._turn_text[user.id] = text
             self._turn_sources[user.id] = {}
+            self._turn_start(user.id, text, user=user)
             # Телефон сохраняем только из одиночного числа без отрицаний, сомнений
             # и ярлыков «заказ/запись/квитанция…»: это другой номер, а не телефон клиента.
             phone_match = next(PHONE.finditer(text), None)
@@ -741,6 +846,7 @@ car — слова клиента с исходной цитатой; car_model 
                     and not re.search(r"(?:заказ[а-яё]*|запис[а-яё]*|квитанци[а-яё]*|сч[её]т[а-яё]*|карт[аи]\w*|vin|ордер[а-яё]*|полис[а-яё]*|договор[а-яё]*)[\s№#:,-]*$",
                                       text[:phone_match.start()], re.I)):
                 apply_patch(self._state[user.id], {"phone": phone_match[0]}, {})
+                await self._save_profile(user.id)
             pending = self._pending.get(user.id)
             if pending and self._affirmative(text, pending["action"]):
                 if not pending.get("delivered"):
@@ -999,6 +1105,8 @@ car — слова клиента с исходной цитатой; car_model 
                 state.update(stage="collecting", confirmed=False)
                 self._offer_slot_menu(user.id, "date")
                 return "Предложение устарело. Уточните желаемую дату и время, я проверю их заново."
+            label = "Подтвердить" if action == "confirm" else "Изменить"
+            self._turn_start(user.id, f"Нажата кнопка «{label}».", kind="proposal", user=user)
             consumed = [*state.get("consumed_offers", [])[-7:], offer_id]
             state["consumed_offers"] = consumed
             self._pending.pop(user.id, None)
@@ -1307,6 +1415,8 @@ car — слова клиента с исходной цитатой; car_model 
             self._state[user.id].pop("selection", None)
         apply_patch(self._state[user.id], changes, tentative)
         self._turn_sources.setdefault(user.id, {}).update(positions)
+        if {"client_name", "phone"} & changes.keys():
+            await self._save_profile(user.id)
         car_quote = ""
         for field in ("car_model", "car"):
             entry = sources[0].get(field)
@@ -1583,15 +1693,21 @@ car — слова клиента с исходной цитатой; car_model 
         return [{"car": car.name, "class": car.size_class} for car in cars[:3]]
 
     async def _remember_vehicle(self, user, car_name: str, size_class: str,
-                                tariff: str | None = None, services=None, plate: str | None = None) -> None:
+                                tariff: str | None = None, services=None, plate: str | None = None):
         """Подтверждённый клиентом автомобиль и состав заказа («как в прошлый раз»)."""
         if not car_name:
-            return
+            return None
         try:
-            await asyncio.to_thread(self.cars.remember, user.id, car_name, size_class,
-                                    tariff=tariff, services=services, plate=plate)
+            saved = await asyncio.to_thread(self.cars.remember, user.id, car_name, size_class,
+                                            tariff=tariff, services=services, plate=plate)
         except Exception as error:
             log.warning("Автомобиль не сохранён в памяти (%s)", type(error).__name__)
+            return None
+        state = self._state.get(user.id)
+        if saved is not None and state is not None:
+            # Ссылка на индивидуальную запись: снимок диалога не хранит model_id.
+            state["restored_vehicle"] = {"id": saved.id, "car": saved.name}
+        return saved
 
     def forget_vehicle_facts(self, user_id: int, car) -> None:
         """Удалённый из памяти автомобиль больше не участвует в текущем диалоге."""
@@ -1611,6 +1727,289 @@ car — слова клиента с исходной цитатой; car_model 
         if same_record:
             state.pop("restored_vehicle", None)
         state["vehicle_restored"] = True
+
+    # ---------- снимок диалогов на штатной остановке ----------
+
+    @classmethod
+    def _plain(cls, value, depth=0):
+        """Только JSON-данные; вложенность и размеры ограничены."""
+        if isinstance(value, str):
+            return value[:2000]
+        if isinstance(value, (int, float, bool)) or value is None:
+            return value
+        if depth >= 4:
+            return None
+        if isinstance(value, (list, tuple)):
+            return [cls._plain(item, depth + 1) for item in value[:30]]
+        if isinstance(value, dict):
+            return {str(key)[:80]: cls._plain(item, depth + 1)
+                    for key, item in list(value.items())[:50]}
+        return None
+
+    @classmethod
+    def _clean_facts(cls, facts) -> dict:
+        if not isinstance(facts, dict):
+            return {}
+        result = {}
+        for field_name in FIELDS:
+            value = facts.get(field_name)
+            if isinstance(value, str) and value.strip():
+                result[field_name] = value[:500]
+            elif field_name == "services" and isinstance(value, list):
+                services = [str(item)[:200] for item in value[:30] if str(item).strip()]
+                if services:
+                    result[field_name] = services
+        return result
+
+    @staticmethod
+    def _plate_key(value) -> str:
+        return re.sub(r"[^0-9a-zа-я]+", "", str(value or "").casefold().replace("ё", "е"))
+
+    def _snapshot_vehicle(self, user_id: int, facts: dict) -> dict:
+        state = self._state.get(user_id, {})
+        marker = state.get("restored_vehicle") or {}
+        name = facts.get("car_model") or facts.get("car") or ""
+        vehicle = {"id": None, "name": str(name)[:120], "plate": str(facts.get("plate") or "")[:40]}
+        if (isinstance(marker, dict) and marker.get("id") and name
+                and car_key(marker.get("car") or "") == car_key(name)):
+            vehicle["id"] = int(marker["id"])
+            vehicle["name"] = str(marker.get("car") or name)[:120]
+        return vehicle
+
+    def _snapshot_payload(self, user_id: int, now: float) -> dict:
+        state = self._state.get(user_id, {})
+        facts = self._clean_facts(state.get("facts", {}))
+        history = []
+        for message in self._history.get(user_id, []):
+            if not isinstance(message, dict):
+                continue
+            role, content = message.get("role"), message.get("content")
+            if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
+                history.append({"role": role, "content": content[:6000]})
+        history = history[-8:]
+        while history and history[0]["role"] != "user":
+            history.pop(0)
+        if len(history) % 2:
+            history.pop(0)
+        saved_state = {}
+        for key in _RECOVERY_STATE_KEYS:
+            if key not in state:
+                continue
+            value = self._plain(state[key])
+            if value not in (None, {}, []):
+                saved_state[key] = value
+        turn = self._turns.get(user_id)
+        saved_turn = None
+        if isinstance(turn, dict):
+            data = turn.get("user") if isinstance(turn.get("user"), dict) else {}
+            saved_turn = {
+                "text": str(turn.get("text") or "")[:6000],
+                "answer": str(turn.get("answer") or "")[:6000],
+                "kind": turn.get("kind") or "reply",
+                "processed": bool(turn.get("processed")),
+                "delivered": bool(turn.get("delivered")),
+                "started_at": turn.get("started_at"),
+                "user": {"id": user_id, "username": data.get("username"),
+                         "full_name": str(data.get("full_name") or "")[:200]},
+            }
+        return {
+            "history": history,
+            "facts": facts,
+            "state": saved_state,
+            "vehicle": self._snapshot_vehicle(user_id, facts),
+            "turn": saved_turn,
+            "last_activity": float(self._last_activity.get(user_id, now)),
+        }
+
+    async def save_conversations(self, now: float | None = None,
+                                 ttl: int = SNAPSHOT_TTL_SEC) -> int:
+        """Один компактный снимок активных за последние ttl секунд.
+
+        Вызывается только при штатной остановке, не на каждом сообщении.
+        Сбой записи логируется: приложение не делает вид, что снимок сохранён.
+        """
+        now = time.time() if now is None else float(now)
+        entries = []
+        for user_id in set(self._state) | set(self._history) | set(self._turns):
+            active_at = self._last_activity.get(user_id, now)
+            if now - active_at > ttl:
+                continue
+            payload = self._snapshot_payload(user_id, now)
+            if not (payload["history"] or payload["facts"] or payload["state"] or payload["turn"]):
+                continue
+            entries.append((user_id, payload))
+        try:
+            count = await asyncio.to_thread(self.recovery.save_snapshot, entries, now, ttl)
+        except Exception as error:
+            log.error("Не удалось сохранить снимок диалогов (%s)", type(error).__name__)
+            return 0
+        log.info("Снимок диалогов сохранён: %d", count)
+        return count
+
+    async def restore_conversations(self, now: float | None = None,
+                                    ttl: int = SNAPSHOT_TTL_SEC) -> int:
+        """Поднять недавние диалоги до приёма новых обновлений Telegram."""
+        now = time.time() if now is None else float(now)
+        try:
+            rows = await asyncio.to_thread(self.recovery.load_snapshot, now, ttl)
+        except Exception as error:
+            log.error("Не удалось прочитать снимок диалогов (%s)", type(error).__name__)
+            return 0
+        restored = []
+        for row in rows:
+            try:
+                if await self._restore_payload(row["telegram_id"], row["saved_at"], row["payload"], now):
+                    restored.append(row["telegram_id"])
+            except Exception as error:
+                log.warning("Снимок диалога не восстановлен (%s)", type(error).__name__)
+        if restored:
+            try:
+                await asyncio.to_thread(self.recovery.clear_snapshot, restored)
+            except Exception as error:
+                log.warning("Не удалось очистить снимок диалогов (%s)", type(error).__name__)
+        log.info("Восстановлено диалогов: %d", len(restored))
+        return len(restored)
+
+    async def _restore_payload(self, user_id: int, saved_at: float, payload: dict,
+                               now: float) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        facts = self._clean_facts(payload.get("facts"))
+        state = {}
+        raw_state = payload.get("state")
+        if isinstance(raw_state, dict):
+            for key in _RECOVERY_STATE_KEYS:
+                if key in raw_state:
+                    value = self._plain(raw_state[key])
+                    if value not in (None, {}, []):
+                        state[key] = value
+        profile = None
+        try:
+            profile = await asyncio.to_thread(self.recovery.profile, user_id)
+        except Exception as error:
+            log.warning("Профиль клиента недоступен (%s)", type(error).__name__)
+        if profile:
+            if profile.get("updated_at", 0) > saved_at:
+                if profile.get("name"):
+                    facts["client_name"] = profile["name"]
+                if profile.get("phone"):
+                    facts["phone"] = profile["phone"]
+            else:
+                if profile.get("name") and not facts.get("client_name"):
+                    facts["client_name"] = profile["name"]
+                if profile.get("phone") and not facts.get("phone"):
+                    facts["phone"] = profile["phone"]
+            state["profile_restored"] = True
+
+        vehicle = payload.get("vehicle") if isinstance(payload.get("vehicle"), dict) else {}
+        vehicle_id = vehicle.get("id")
+        try:
+            vehicle_id = int(vehicle_id) if vehicle_id is not None else None
+        except (TypeError, ValueError):
+            vehicle_id = None
+        expected = facts.get("car_model") or facts.get("car") or vehicle.get("name") or ""
+        if expected:
+            try:
+                cars = await asyncio.to_thread(self.cars.for_user, user_id)
+            except Exception as error:
+                cars = None
+                log.warning("Память об автомобилях недоступна (%s)", type(error).__name__)
+            if cars is not None:
+                car, deleted = None, False
+                if vehicle_id is not None:
+                    car = next((item for item in cars if item.id == vehicle_id), None)
+                    if car is None:
+                        deleted = True
+                    elif expected and car_key(car.name) != car_key(expected):
+                        car = None  # устаревшая ссылка, ищем по названию и номеру
+                if car is None and not deleted:
+                    candidates = [item for item in cars if car_key(item.name) == car_key(expected)]
+                    if len(candidates) > 1:
+                        plate = facts.get("plate") or vehicle.get("plate") or ""
+                        if plate:
+                            key = self._plate_key(plate)
+                            candidates = [item for item in candidates
+                                          if self._plate_key(item.last_plate) == key]
+                    if len(candidates) == 1:
+                        car = candidates[0]
+                if deleted:
+                    # Запись удалена после снимка: старую машину не возвращаем.
+                    for field_name in ("car", "car_model", "size_class", "plate"):
+                        facts.pop(field_name, None)
+                    state["vehicle_restored"] = True
+                elif car is not None:
+                    facts["car"] = car.name
+                    facts["car_model"] = car.name
+                    if car.size_class and not facts.get("size_class"):
+                        facts["size_class"] = car.size_class
+                    if not facts.get("plate") and car.last_plate:
+                        facts["plate"] = car.last_plate
+                    state["restored_vehicle"] = {"id": car.id, "car": car.name}
+                    state["vehicle_restored"] = True
+
+        state["facts"] = facts
+        if state.get("stage") == "writing":
+            # Остановка во время подтверждения: результат мог уже примениться.
+            state.update(stage="uncertain", confirmed=False, outstanding=[])
+        history = []
+        for message in payload.get("history") or []:
+            if not isinstance(message, dict):
+                continue
+            role, content = message.get("role"), message.get("content")
+            if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
+                history.append({"role": role, "content": content[:6000]})
+        history = history[-8:]
+        while history and history[0]["role"] != "user":
+            history.pop(0)
+        if len(history) % 2:
+            history.pop(0)
+        self._state[user_id] = state
+        self._history[user_id] = history
+        self._last_seen[user_id] = time.monotonic()
+        self._last_seen.move_to_end(user_id)
+        self._last_activity[user_id] = float(payload.get("last_activity") or saved_at)
+
+        if state.get("stage") == "awaiting_confirmation":
+            self._take_proposal(user_id)
+            if user_id in self._pending:
+                loaded = self._state[user_id]
+                merged = dict(loaded)
+                for key, value in state.items():
+                    if key not in {"facts", "selection"}:
+                        merged[key] = value
+                merged["facts"] = {**loaded.get("facts", {}), **facts}
+                self._state[user_id] = state = merged
+            else:
+                state.update(stage="collecting", confirmed=False)
+                state.pop("outstanding", None)
+        else:
+            self._proposal_file(user_id).unlink(missing_ok=True)
+
+        turn = payload.get("turn")
+        if isinstance(turn, dict):
+            data = turn.get("user") if isinstance(turn.get("user"), dict) else {}
+            saved_turn = {
+                "text": str(turn.get("text") or "")[:6000],
+                "answer": str(turn.get("answer") or "")[:6000],
+                "kind": turn.get("kind") or "reply",
+                "processed": bool(turn.get("processed")),
+                "delivered": bool(turn.get("delivered")),
+                "started_at": turn.get("started_at"),
+                "user": {"id": user_id, "username": data.get("username"),
+                         "full_name": str(data.get("full_name") or "")[:200]},
+            }
+            self._turns[user_id] = saved_turn
+            if saved_turn["kind"] == "reply" and not saved_turn["processed"]:
+                self._recovery_resume[user_id] = saved_turn
+            elif saved_turn["processed"] and not saved_turn["delivered"]:
+                # Сводку без действующей кнопки не пересылаем: она введёт в заблуждение.
+                if saved_turn["kind"] != "proposal" or user_id in self._pending:
+                    self._recovery_resume[user_id] = saved_turn
+            elif saved_turn["kind"] != "reply" and not saved_turn["processed"]:
+                # Нажатие кнопки вслепую не повторяем: результат мог уже примениться.
+                if state.get("stage") in {"writing", "awaiting_confirmation"}:
+                    state.update(stage="uncertain", confirmed=False, outstanding=[])
+        return True
 
     def _customer_car(self, user) -> str:
         """Только подтверждённый автомобиль клиента: предположительные значения не влияют на класс."""
@@ -1844,6 +2243,10 @@ car — слова клиента с исходной цитатой; car_model 
 
     async def close(self) -> None:
         self._closed = True
+        try:
+            self.recovery.close()
+        except Exception as error:
+            log.error("Ошибка закрытия памяти диалогов (%s)", type(error).__name__)
         clients, self._provider_clients = self._provider_clients, [None] * len(self._provider_configs)
         for client in clients:
             if client is not None:
@@ -2506,6 +2909,7 @@ car — слова клиента с исходной цитатой; car_model 
                                                  tariff=arguments.get("tariff") or "",
                                                  services=arguments.get("services") or [],
                                                  plate=arguments.get("plate") or "")
+                    await self._save_profile(user.id)
                     number = f" Запись {user_no}." if user_no else ""
                     return f"Записала вас!{number} {result['date']} в {result['time']}, {result['car']}. Итого {result['total']} {result['currency']}. Ждём вас!"
             elif pending["action"] == "reschedule_booking":

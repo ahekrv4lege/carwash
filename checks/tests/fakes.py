@@ -165,7 +165,8 @@ def config(path, **kwargs):
                  sheet_classes="Классы",
                  car_plate_required=False,
                  sheets_adaptive_enabled=True, sheets_mapping_file=str(Path(path) / "mapping.json"),
-                 vehicle_memory_file=str(_MEMORY_DIR / f"vehicles-{next(_TOKENS)}.sqlite3"))
+                 vehicle_memory_file=str(_MEMORY_DIR / f"vehicles-{next(_TOKENS)}.sqlite3"),
+                 conversation_memory_file=str(_MEMORY_DIR / f"recovery-{next(_TOKENS)}.sqlite3"))
     return replace(cfg, **kwargs)
 
 

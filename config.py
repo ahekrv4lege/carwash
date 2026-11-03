@@ -141,6 +141,8 @@ class Config:
     llm_fallbacks: tuple[ProviderConfig, ...] = ()
     # Память об автомобилях клиентов: SQLite на диске и RAM-кэш по пользователю.
     vehicle_memory_file: str = ".runtime/customer_vehicles.sqlite3"
+    # Постоянный профиль клиента и снимок активных диалогов на штатной остановке.
+    conversation_memory_file: str = ".runtime/conversation_recovery.sqlite3"
     vehicle_cache_mb: float = 4.0
     vehicle_cache_ttl_min: float = 30.0
     vehicle_cache_adaptive: bool = True
@@ -287,6 +289,7 @@ def load_config(sheets_only: bool = False) -> Config:
         reply_concurrency=_integer("REPLY_CONCURRENCY", "8", 1),
         car_plate_required=_bool("CAR_PLATE_REQUIRED", True),
         vehicle_memory_file=_path("VEHICLE_MEMORY_FILE", ".runtime/customer_vehicles.sqlite3"),
+        conversation_memory_file=_path("CONVERSATION_MEMORY_FILE", ".runtime/conversation_recovery.sqlite3"),
         vehicle_cache_mb=_number("VEHICLE_CACHE_MB", "4", 0.5),
         vehicle_cache_ttl_min=_number("VEHICLE_CACHE_TTL_MIN", "30", 1),
         vehicle_cache_adaptive=_bool("VEHICLE_CACHE_ADAPTIVE", True),

@@ -30,6 +30,7 @@ router = Router()
 router.message.filter(Filter.chat.type == "private")  # работаем только в личных чатах
 
 TG_LIMIT = 4000  # лимит Telegram — 4096 символов
+SHUTDOWN_GRACE_SEC = 8  # ждём уже принятые обновления, не новых; systemd даёт 30 с
 
 
 QueuedMessage = namedtuple("QueuedMessage", "handler message data batchable future ack")
@@ -191,8 +192,9 @@ def markup_from_rows(rows) -> InlineKeyboardMarkup | None:
 async def send_answer(message: Message, agent: Agent, reporter: AdminReporter,
                       user: ChatUser, text: str, answer: str,
                       keyboard: InlineKeyboardMarkup | None = None) -> None:
-    delivery_token = agent.delivery_token(user.id, answer)
-    answer = plain_text(answer)
+    raw_answer = answer
+    delivery_token = agent.delivery_token(user.id, raw_answer)
+    answer = plain_text(raw_answer)
     pending = agent._pending.get(user.id, {})
     offer_id = pending.get("offer_id") if delivery_token is not None else None
     if keyboard is None and isinstance(offer_id, str):
@@ -209,6 +211,7 @@ async def send_answer(message: Message, agent: Agent, reporter: AdminReporter,
         else:
             await message.answer(chunk)
     agent.mark_delivered(user.id, delivery_token)
+    agent.mark_turn_delivered(user.id, raw_answer)
     await reporter.dialog(user.id, user.full_name, user.username, text, answer)
 
 
@@ -377,6 +380,58 @@ async def on_other(message: Message) -> None:
     await message.answer("Напишите ваш вопрос текстом.")
 
 
+class RecoveryMessage:
+    """Минимальный получатель для send_answer при возобновлении после рестарта."""
+
+    def __init__(self, bot: Bot, chat_id: int):
+        self.bot, self.chat_id = bot, chat_id
+
+    async def answer(self, text: str, reply_markup=None):
+        return await self.bot.send_message(self.chat_id, text, reply_markup=reply_markup)
+
+
+async def resume_recovered(agent: Agent, bot: Bot, reporter: AdminReporter) -> None:
+    """Доставить готовый ответ или один раз безопасно повторить прерванный ход.
+
+    Кнопочные действия вслепую не повторяются: подтверждение записи могло уже
+    примениться. Обычный текст сообщения не содержит операции записи, поэтому
+    его повтор допустим; предложение всё равно требует кнопки.
+    """
+    for user, turn in agent.pending_recoveries():
+        channel = RecoveryMessage(bot, user.id)
+        try:
+            if turn.get("processed") and not turn.get("delivered"):
+                log.info("Повторная доставка ответа после перезапуска: id=%s", user.id)
+                await send_answer(channel, agent, reporter, user, turn.get("text", ""),
+                                  turn.get("answer", ""))
+            elif not turn.get("processed") and turn.get("kind") == "reply":
+                log.info("Возобновление прерванного ответа после перезапуска: id=%s", user.id)
+                answer = await agent.reply(user, turn.get("text", ""))
+                await send_answer(channel, agent, reporter, user, turn.get("text", ""), answer)
+        except Exception as error:
+            log.warning("Не удалось возобновить диалог (%s)", type(error).__name__)
+        finally:
+            agent.clear_recovery(user.id)
+
+
+async def finish_updates(dispatcher: Dispatcher) -> None:
+    """Дождаться уже принятых обработчиков; новые обновления polling не принимает."""
+    active = getattr(dispatcher, "_handle_update_tasks", ())
+    if not isinstance(active, (set, list, tuple)):
+        return
+    tasks = [task for task in list(active) if not task.done()]
+    if not tasks:
+        return
+    log.info("Ожидание активных обработчиков: %d", len(tasks))
+    _, pending = await asyncio.wait(tasks, timeout=SHUTDOWN_GRACE_SEC)
+    if not pending:
+        return
+    log.warning("Обработчики не завершились за %s с: %d; отменяю", SHUTDOWN_GRACE_SEC, len(pending))
+    for task in pending:
+        task.cancel()
+    await asyncio.wait(pending, timeout=2)
+
+
 async def maintain_sessions(agent: Agent) -> None:
     while True:
         await asyncio.sleep(60)
@@ -435,6 +490,7 @@ async def main() -> None:
     config = load_config()
     bot = Bot(config.bot_token, session=telegram_session())
     agent = None
+    dispatcher = None
     maintenance = None
     archiver = None
     vehicle_cache = None
@@ -449,6 +505,12 @@ async def main() -> None:
         router.message.outer_middleware(batcher)
         router.callback_query.outer_middleware(batcher)
         dispatcher.include_router(router)
+        # Сначала поднимаем недавние диалоги и завершаем прерванные ответы,
+        # только потом начинаем принимать новые обновления Telegram.
+        restore_conversations = getattr(agent, "restore_conversations", None)
+        if restore_conversations is not None and asyncio.iscoroutinefunction(restore_conversations):
+            await restore_conversations()
+            await resume_recovered(agent, bot, reporter)
         maintenance = asyncio.create_task(maintain_sessions(agent))
         archiver = asyncio.create_task(archive_old_bookings(store))
         vehicle_cache = asyncio.create_task(maintain_vehicle_cache(agent))
@@ -459,6 +521,10 @@ async def main() -> None:
         log.info("Бот запущен. Модель: %s", config.ai_model if config.ai_enabled else "AI отключён")
         await dispatcher.start_polling(bot, close_bot_session=False)
     finally:
+        # start_polling уже перестал принимать новые обновления. Даём активным
+        # обработчикам завершиться и только затем пишем один снимок диалогов.
+        if dispatcher is not None:
+            await finish_updates(dispatcher)
         for task in (maintenance, archiver, vehicle_cache, grid_auditor):
             if task is not None:
                 task.cancel()
@@ -466,8 +532,15 @@ async def main() -> None:
                     await task
         try:
             if agent is not None:
-                await agent.close()
-                agent.cars.close()
+                try:
+                    save_conversations = getattr(agent, "save_conversations", None)
+                    if save_conversations is not None and asyncio.iscoroutinefunction(save_conversations):
+                        await save_conversations()
+                finally:
+                    try:
+                        await agent.close()
+                    finally:
+                        agent.cars.close()
         finally:
             await bot.session.close()
 
