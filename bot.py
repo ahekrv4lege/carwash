@@ -379,13 +379,16 @@ async def maintain_grid_consistency(store: Store) -> None:
 
 
 async def archive_old_bookings(store: Store) -> None:
-    """Раз в 6 часов: прошедшие заявки получают статус «Архив» и переносятся
-    в отдельный архивный лист (без дублей по ID), затем очистка слотов."""
+    """Раз в 6 часов: прошедшие заявки получают статус «Архив», записи со
+    статусами «Архив» и «Отмена» переносятся в отдельный архивный лист
+    (без дублей), нумерация ID в «Записях» выставляется заново, затем
+    очистка слотов."""
     while True:
         try:
             archived = await asyncio.to_thread(store.archive_old_bookings)
-            # Периодическое обслуживание: безопасная хронологическая сортировка.
-            # Колонка «ID» постоянна, формулы и данные вне шапки блокируют перезапись.
+            # Периодическое обслуживание: безопасная хронологическая сортировка
+            # и перенумерация ID по порядку строк. Формулы и данные вне шапки
+            # блокируют перезапись.
             await asyncio.to_thread(store.refresh_bookings_sheet, sort=True)
             moved = await asyncio.to_thread(store.move_archived_bookings)
             if archived or moved:

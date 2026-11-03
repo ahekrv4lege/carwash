@@ -39,6 +39,7 @@ class Worksheet:
         self.writes = []
         self.updates = []       # полные перезаписи диапазонов (worksheet.update)
         self.format_calls = 0
+        self.format_log = []    # (ranges, cell_format) — для проверок раскраски
         self.formatting = {"A1": {"bold": True}, "A2:Z100": {"numberFormat": "TEXT"}}
         self.literal_cells = set()
         self.before_get = None
@@ -95,6 +96,8 @@ class Worksheet:
 
     def format(self, ranges, cell_format):
         self.format_calls += 1
+        self.format_log.append((list(ranges) if isinstance(ranges, list) else [ranges],
+                                deepcopy(cell_format)))
 
     def update_cell(self, row, column, value):
         from adaptive import cell_name
