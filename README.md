@@ -359,6 +359,8 @@ TLS-проверка сертификатов остаётся включённ�
 | `CATALOG_CACHE_SEC` / `SLOTS_CACHE_SEC` | `60` / `15` | кэш (с) прайса/слотов и записей |
 | `MAX_HISTORY` | `24` | сообщений диалога в памяти |
 | `REPLY_MIN_DELAY_SEC` / `REPLY_BATCH_SEC` | `1.5` / `0.4` | темп ответа и батчинг быстрых сообщений |
+| `REPLY_CONCURRENCY` | `8` | одновременных диалогов (ограничитель reply_gate); на продакшене — `25` |
+| `TELEGRAM_API_BASE` | пусто | свой адрес Bot API (прокси/зеркало); пусто — официальный `api.telegram.org` |
 | `SHEET_SERVICES`/`SHEET_TARIFFS`/`SHEET_SLOTS`/`SHEET_BOOKINGS`/`SHEET_CLASSES` | `Услуги`/`Тарифы`/`Слоты`/`Записи`/`Классы` | названия листов (должны быть разными) |
 | `SHEET_ARCHIVE` | `Архив` | архивный лист для записей со статусом «Архив» |
 | `SHEETS_ADAPTIVE_ENABLED` | false | адаптивный слой (карта областей, переоткрытие) |
@@ -390,7 +392,7 @@ TLS-проверка сертификатов остаётся включённ�
 ./.venv/bin/python checks/run.py              # Linux
 ```
 
-- **Офлайн-набор: 481 тест** (сейчас; см. `CHANGES.md`). Ни сети, ни ключей, ни квот —
+- **Офлайн-набор: 852 теста** (сейчас; см. `CHANGES.md`). Ни сети, ни ключей, ни квот —
   таблица и модель синтетические (`checks/tests/fakes.py`).
 - `checks/tests/test_conversation.py` + `test_phase2.py` — диалог, память, подтверждения.
 - `checks/tests/test_slot_buttons.py` — кнопки выбора даты/времени: свободные часы,
