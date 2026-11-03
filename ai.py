@@ -2252,7 +2252,7 @@ car — слова клиента с исходной цитатой; car_model 
             args = {key: value for key, value in args.items() if value is not None}
             if name == "calculate_price":
                 args = self._quote_args(args, user)
-            # «Как в прошлый раз»: состав заказа продставит память прошлого заказа, поэтому их
+            # «Как в прошлый раз»: состав заказа подставит память прошлого заказа, поэтому их
             # отсутствие в args допустимо; госномер по флагу обязателен, но вопрос задаёт
             # Python сам — без второго поколения модели.
             if name == "create_booking":
