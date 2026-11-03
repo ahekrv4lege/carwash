@@ -870,6 +870,21 @@ car — слова клиента с исходной цитатой; car_model 
                     self._state[user.id]["review_required"] = True
                 self._state[user.id].pop("outstanding", None)
             state = self._state[user.id]
+            if pending and pending["action"] in {"create_booking", "reschedule_booking"}:
+                clocks = re.findall(r"(?<!\d)\d{1,2}:\d{2}(?!\d)", text)
+                remainder = re.sub(r"(?<!\d)\d{1,2}:\d{2}(?!\d)", " ", text).casefold()
+                words = set(re.findall(r"[а-яёa-z]+", remainder))
+                if (len(clocks) == 1 and words <= {"нет", "лучше", "давайте", "тогда", "время", "на", "в",
+                        "поменяйте", "измените", "перенесите", "остальное", "всё", "все", "верно", "пожалуйста"}
+                        and not re.search(r"\d", remainder)):
+                    chosen = await asyncio.to_thread(self.store.booking_time, clocks[0])
+                    if chosen:
+                        apply_patch(state, {"time": chosen}, {})
+                        arguments = dict(pending["args"], time=chosen)
+                        result = await asyncio.wait_for(self._call_tool(pending["action"], _compact_json(arguments), user), timeout=remaining())
+                        if result.get("confirmation_required"):
+                            return self._remember(user.id, text, self._offer(user.id, self._pending[user.id]))
+                        return self._remember(user.id, text, result.get("error") or self._clarification(user.id, result.get("field")))
             # Контекст уточнения модели: марка из слов клиента и недавний вопрос
             # бота об автомобиле делают короткий ответ («пятая») проверяемым.
             vehicle_question = bool(state.pop("vehicle_question", None))

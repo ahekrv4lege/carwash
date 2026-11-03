@@ -64,6 +64,20 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
     def other_writes(self):
         return sum(len(s.writes) for s in self.spreadsheet.sheets if s.title != "Записи")
 
+    async def test_short_time_correction_rebuilds_real_offer_without_model_claim(self):
+        self.spreadsheet.worksheet("Слоты").values.extend([["01.01.2099","11:00","1"],["01.01.2099","12:00","1"]])
+        await self.offer(dict(ARGS,time="11:00"))
+        old=self.agent._pending[111]["offer_id"]
+        self.transport.reset_mock()
+        answer=await self.say("Нет, лучше 12:00. Всё остальное верно.")
+        self.assertIn("12:00",answer)
+        self.assertEqual(self.agent._pending[111]["args"]["time"],"12:00")
+        self.assertNotEqual(self.agent._pending[111]["offer_id"],old)
+        self.transport.assert_not_called()
+        result=await self.confirm()
+        self.assertIn("12:00",result)
+        self.assertEqual(self.store.my_bookings(111)["bookings"][0]["time"],"12:00")
+
     async def test_display_text_is_metadata_for_reads_and_memory_not_customer_consent(self):
         answer = await self.say("Мой автомобиль раф 4", response(calls=[
             ("get_price_list", {"display_text": "Смотрю прайс"}),
