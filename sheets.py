@@ -1736,19 +1736,20 @@ class Store:
         return deleted
 
     def clean_expired_slots(self) -> int:
-        """Физическая очистка устаревших дат в листе «Слоты».
+        """Обслуживание листа «Слоты»: очистка прошедших дат, сдвиг строк вверх,
+        дописывание недостающих будущих дат по прошлой неделе.
 
         Локальный день бота — часовой пояс задан в .env. Линейную раскладку
-        («Дата, Время, Постов») чистим адресно: прошлые строки пустеют, лист не
-        сдвигается. Сеточные раскладки (дата в названии листа), график
-        «Начало/Конец» без колонки «Дата», строки с формулами и данные вне
-        раскладки остаются без изменений. Возвращает число очищенных строк.
+        («Дата, Время, Постов») обслуживаем адресно; сдвиг пропускается при
+        формулах или непонятных непустых строках; сеточные раскладки (дата
+        в названии листа) и график «Начало/Конец» без колонки «Дата» не
+        трогаются. Возвращает число очищенных строк.
         """
         today = self.now().date()
         with self._lock:
             if self._adaptive:
-                cleared = self._adaptive.clean_expired_slots(today)
-                if cleared:
+                cleared, added = self._adaptive.clean_expired_slots(today)
+                if cleared or added:
                     self._invalidate("slots")
                 return cleared
             try:
@@ -1756,7 +1757,7 @@ class Store:
                 values = worksheet.get_all_values(value_render_option="FORMULA",
                                                   date_time_render_option="FORMATTED_STRING")
             except Exception as error:
-                log.warning("Слоты не прочитаны; очистка пропущена (%s)", type(error).__name__)
+                log.warning("Слоты не прочитаны; обслуживание пропущено (%s)", type(error).__name__)
                 return 0
             if not values:
                 return 0
@@ -1766,36 +1767,145 @@ class Store:
             date_column = headers.index("Дата") + 1
             columns = {index + 1 for index, header in enumerate(headers)
                        if header in {"Дата", "Время", "Постов", "Мест", "Боксов"}}
-            updates, cleared_rows = [], 0
+            width = max(columns)
+            known, has_formulas = {}, False
             for row, row_values in enumerate(values[1:], 2):
                 if not any(str(field_value).strip() for field_value in row_values):
                     continue
-                slot_date = parse_date(str(row_values[date_column - 1]).strip()) if len(row_values) >= date_column else None
-                if not slot_date or slot_date >= today:
-                    continue  # будущий или сегодняшний день не трогаем
                 if any(str(field_value).startswith("=") for field_value in row_values):
-                    log.warning("Слоты, строка %d: формула в прошедшей строке — не очищается", row)
-                    continue
-                for column in columns:
-                    updates.append({"range": cell_name(row, column), "values": [[""]]})
-                cleared_rows += 1
-            if not updates:
-                return 0
-            try:
-                worksheet.batch_update(updates, value_input_option="RAW")
-            except AttributeError:
-                # Синтетические листы в тестах умеют только поячеечную запись.
-                for update in updates:
-                    match = re.fullmatch(r"([A-Z]+)(\d+)", update["range"])
-                    if not match:
+                    has_formulas = True
+                slot_date = parse_date(str(row_values[date_column - 1]).strip()) if len(row_values) >= date_column else None
+                if slot_date:
+                    known.setdefault(slot_date, []).append((row, row_values))
+            # Шаг 1: автопроизводство недостающих будущих дат до чистки — шаблоном
+            # служат ещё живые строки прошлых недель.
+            added, appended_entries = self._slots_fill_future(worksheet, values, today)
+
+            past_updates, cleared_rows = [], 0
+            for slot_date, entries in list(known.items()):
+                if slot_date >= today:
+                    continue  # будущий или сегодняшний день не трогаем
+                for row, row_values in entries:
+                    if any(str(field_value).startswith("=") for field_value in row_values):
+                        log.warning("Слоты, строка %d: формула в прошедшей строке — не очищается", row)
                         continue
-                    column_number = 0
-                    for letter in match.group(1):
-                        column_number = column_number * 26 + ord(letter) - 64
-                    worksheet.update_cell(int(match.group(2)), column_number, update["values"][0][0])
-            self._invalidate("slots")
-            log.info("Слоты: очищено устаревших строк: %d", cleared_rows)
+                    for column in columns:
+                        past_updates.append({"range": cell_name(row, column), "values": [[""]]})
+                    cleared_rows += 1
+                known.pop(slot_date)
+            if past_updates:
+                self._batch_sheet_cells(worksheet, past_updates)
+            if cleared_rows:
+                log.info("Слоты: очищено устаревших строк: %d", cleared_rows)
+
+            if not has_formulas:
+                future_entries = sorted(
+                    tuple((row, raw) for entries in known.values() for (row, raw) in entries)
+                    + tuple(appended_entries),
+                    key=lambda item: item[0])
+                self._slots_shift_up(worksheet, future_entries, width)
+            else:
+                log.info("Слоты: формулы в области — сдвиг пропущен")
+            if cleared_rows or added:
+                self._invalidate("slots")
+            if added:
+                log.info("Слоты: добавлено строк будущего расписания: %d", added)
             return cleared_rows
+
+    def _batch_sheet_cells(self, worksheet, updates: list[dict]) -> None:
+        try:
+            worksheet.batch_update(updates, value_input_option="RAW")
+        except AttributeError:
+            # Синтетические листы в тестах умеют только поячеечную запись.
+            for update in updates:
+                match = re.fullmatch(r"([A-Z]+)(\d+)", update["range"])
+                if not match:
+                    continue
+                column_number = 0
+                for letter in match.group(1):
+                    column_number = column_number * 26 + ord(letter) - 64
+                worksheet.update_cell(int(match.group(2)), column_number, update["values"][0][0])
+        except Exception as error:
+            log.warning("Слоты: запись ячеек не удалась (%s)", type(error).__name__)
+
+    def _slots_shift_up(self, worksheet, entries: list, width: int) -> None:
+        """Переписать будущие строки плотно со второй строки листа и очистить хвост."""
+        updates: list[dict] = []
+        for offset, (source_row, raw) in enumerate(entries):
+            target_row = 2 + offset
+            if target_row == source_row:
+                continue
+            full = (list(raw) + [""] * width)[:width]
+            for column, value in enumerate(full, 1):
+                updates.append({"range": cell_name(target_row, column), "values": [[value]]})
+        if updates:
+            self._batch_sheet_cells(worksheet, updates)
+            tail = [{"range": cell_name(row, column), "values": [[""]]}
+                    for row in range(2 + len(entries), len(worksheet.get_all_values()) + 1)
+                    for column in range(1, width + 1)]
+            self._batch_sheet_cells(worksheet, tail)
+
+    def _slots_fill_future(self, worksheet, values: list, today) -> tuple[int, list]:
+        """Дописать недостающие будущие даты по прошлым неделям (тот же день недели).
+
+        Шаблон берётся из исходного снимка; новые строки дописываются за
+        последним слотом. Возвращает (добавлено строк, [(строка, содержимое)]) —
+        сдвиг потом поднимает их вместе с остальными будущими строками.
+        """
+        width = 0
+        for row_values in values[1:]:
+            if row_values:
+                width = max(width, len(row_values))
+        existing_dates: set = set()
+        grouped: dict = {}
+        for row_values in values[1:]:
+            if not any(str(field_value).strip() for field_value in row_values):
+                continue
+            if any(str(field_value).startswith("=") for field_value in row_values):
+                continue  # формулы не используются как шаблон и не считаются содержимым дня
+            slot_date = parse_date(str(row_values[0]).strip())
+            if slot_date:
+                existing_dates.add(slot_date)
+                grouped.setdefault(slot_date, []).append(list(row_values))
+        missing = []
+        for offset in range(1, 8):
+            day = today + timedelta(days=offset)
+            if day not in existing_dates:
+                missing.append(day)
+        if not missing:
+            return 0, []
+        start_row = len(values) + 1
+        for row in range(len(values), 0, -1):
+            row_values = values[row - 1] if row <= len(values) else []
+            if any(str(field_value).strip() for field_value in row_values):
+                start_row = row + 1
+                break
+            if row == 1:
+                start_row = 2
+                break
+        updates: list[dict] = []
+        added_rows = 0
+        appended: list = []
+        for day in missing:
+            template = None
+            for weeks_back in range(1, 5):
+                candidate = day - timedelta(days=7 * weeks_back)
+                if candidate in grouped:
+                    template = grouped[candidate]
+                    break
+            if not template:
+                continue
+            new_raw = (list(template) + [""] * max(width, len(template)))[:max(width, len(template))]
+            new_raw[0] = day.strftime("%d.%m.%Y")
+            for column, value in enumerate(new_raw, 1):
+                updates.append({"range": cell_name(start_row, column), "values": [[value]]})
+            appended.append((start_row, new_raw))
+            start_row += 1
+            added_rows += 1
+        if not updates:
+            return 0, []
+        self._batch_sheet_cells(worksheet, updates)
+        return added_rows, appended
 
     def my_bookings(self, telegram_id: int) -> dict:
         with self._lock:

@@ -446,14 +446,14 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
             return next(tool["function"]["parameters"] for tool in self.agent._tools(self.user)
                         if tool["function"]["name"] == "create_booking")
         self.agent._state[111] = {"facts": {key: value for key, value in ARGS.items() if key != "phone"}}
-        # Госномер обязателен по умолчанию (CAR_PLATE_REQUIRED=true).
-        self.assertEqual(schema()["required"], ["phone", "plate"])
+        # Флаг обязательности госномера в этих тестах отключён (car_plate_required=False).
+        self.assertEqual(schema()["required"], ["phone"])
         self.assertIn("phone", schema()["properties"])
         self.assertNotIn("car", schema()["properties"])
         self.agent._state[111]["facts"]["phone"] = ARGS["phone"]
-        self.assertEqual(schema()["required"], ["plate"])
+        self.assertEqual(schema()["required"], [])
         self.agent._state[111]["facts"].clear()
-        self.assertEqual(set(schema()["required"]), {"date", "time", "client_name", "phone", "car", "size_class", "plate"})
+        self.assertEqual(set(schema()["required"]), {"date", "time", "client_name", "phone", "car", "size_class"})
         self.assertEqual(SCHEMAS["create_booking"]["required"], [])
 
     async def test_memory_repair_sends_only_the_forced_tool_schema(self):

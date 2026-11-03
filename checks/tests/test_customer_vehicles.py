@@ -74,18 +74,40 @@ class DatabaseTests(unittest.TestCase):
         old.commit()
         old.close()
         db = self.open_db()
-        cars = db.list_active(111)  # миграция v1 -> v2 не теряет данные
-        self.assertEqual([(c.name, c.last_tariff, c.last_services) for c in cars],
-                         [("Toyota Camry 3.5", "", ())])
+        cars = db.list_active(111)  # миграция v1 -> v3 не теряет данные
+        self.assertEqual([(c.name, c.last_tariff, c.last_services, c.last_plate) for c in cars],
+                         [("Toyota Camry 3.5", "", (), "")])
         saved = db.upsert(111, "Toyota Camry 3.5", "Легковой", "2026-01-02 10:00:00",
-                          tariff="Базовый", services=["Мойка"])
+                          tariff="Базовый", services=["Мойка"], plate="а 123 ав 77")
         self.assertEqual(db.list_active(111)[0].last_tariff, "Базовый")
         self.assertEqual(db.list_active(111)[0].last_services, ("Мойка",))
+        self.assertEqual(db.list_active(111)[0].last_plate, "а 123 ав 77")
         # Прошлый заказ не затирается пустым повтором без подтверждённого состава.
         db.upsert(111, "Toyota Camry 3.5", "Легковой", "2026-01-03 10:00:00")
         car = db.list_active(111)[0]
-        self.assertEqual((car.last_tariff, car.last_services), ("Базовый", ("Мойка",)))
+        self.assertEqual((car.last_tariff, car.last_services, car.last_plate),
+                         ("Базовый", ("Мойка",), "а 123 ав 77"))
         self.assertEqual(saved.size_class, "Легковой")
+
+    def test_v2_schema_gets_plate_column(self):
+        middle = sqlite3.connect(self.path)
+        middle.execute("CREATE TABLE vehicles ("
+                       " id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER NOT NULL, car_key TEXT NOT NULL,"
+                       " car_name TEXT NOT NULL, size_class TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active',"
+                       " created_at TEXT NOT NULL, updated_at TEXT NOT NULL,"
+                       " last_tariff TEXT NOT NULL DEFAULT '', last_services TEXT NOT NULL DEFAULT '')")
+        middle.execute("PRAGMA user_version = 2")
+        middle.execute("INSERT INTO vehicles (telegram_id, car_key, car_name, size_class, status, created_at, updated_at,"
+                       " last_tariff, last_services) VALUES (111, 'bmw x5', 'BMW X5', 'Кроссовер', 'active', 'x', 'x',"
+                       " 'Базовый', '[\"Мойка\"]')")
+        middle.commit()
+        middle.close()
+        db = self.open_db()
+        car = db.list_active(111)[0]  # миграция v2 -> v3: колонка госномера появляется автоматически
+        self.assertEqual((car.name, car.last_tariff, car.last_services, car.last_plate),
+                         ("BMW X5", "Базовый", ("Мойка",), ""))
+        db.upsert(111, "BMW X5", "Кроссовер", "2026-01-02 10:00:00", plate="о 999 оо 99")
+        self.assertEqual(db.list_active(111)[0].last_plate, "о 999 оо 99")
 
     def test_upsert_deduplicates_and_updates_class(self):
         db = self.open_db()
@@ -442,12 +464,13 @@ class AgentIntegrationTests(unittest.IsolatedAsyncioTestCase):
                      facts={"client_name": "Synthetic", "phone": "00000000000",
                             "date": "2099-01-01", "time": "11:00"},
                      repeat_last={"car": "Toyota Camry 3.5", "size_class": "Легковой",
-                                  "tariff": "Базовый", "services": []})
+                                  "tariff": "Базовый", "services": [], "plate": "а 123 ав 77"})
         result = await self.agent._call_tool("create_booking", "{}", self.user)
         self.assertTrue(result.get("confirmation_required"), result)
         args = self.agent._pending[self.user.id]["args"]
         self.assertEqual(args["car"], "Toyota Camry 3.5")  # автомобиль из памяти прошлого заказа
         self.assertEqual(args["tariff"], "Базовый")  # та же услуга
+        self.assertEqual(args["plate"], "а 123 ав 77")  # госномер тоже из памяти прошлой записи
         # «Повторная» цена и слоты — свежий расчёт и проверка таблицы, а не значения прошлой записи.
         self.assertEqual(args["date"], "2099-01-01")
         self.assertEqual(args["time"], "11:00")

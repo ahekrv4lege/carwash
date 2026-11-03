@@ -11,6 +11,10 @@ from unittest.mock import patch
 from ai import Agent, ChatUser
 from conversation import model_state
 from tests.fakes import booking, fixture
+from tests.test_conversation import ARGS, response
+
+import asyncio
+from unittest.mock import AsyncMock, patch
 
 
 class OfflinePlateTests(unittest.TestCase):
@@ -131,6 +135,30 @@ class ModelStateTests(unittest.TestCase):
         self.assertIn("plate", model_state(state, True)["missing"])
         known = {"facts": {"plate": "а 123 ав 77"}}
         self.assertNotIn("plate", model_state(known, True)["missing"])
+
+
+class DirectPlateAskTests(unittest.IsolatedAsyncioTestCase):
+    """Оптимизация: вопрос про госномер задаёт Python без второго поколения модели."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store, self.spreadsheet = fixture(self.temp.name)
+        with patch("ai.AsyncOpenAI"):
+            self.agent = Agent(replace(self.store.config, car_plate_required=True), self.store)
+        self.transport = AsyncMock()
+        self.agent.client.chat.completions.create = self.transport
+        self.user = ChatUser(111, None, "Synthetic")
+        self.addCleanup(self.agent.cars.close)
+
+    async def test_missing_plate_is_answered_without_extra_model_generation(self):
+        self.agent._state[111].clear()
+        self.agent._state[111].update(stage="collecting", facts=dict(ARGS))
+        self.transport.side_effect = [response(calls=[("create_booking", {})])]
+        answer = await self.agent.reply(self.user, "Запишите меня завтра")
+        self.assertIn("госномер", answer.lower())
+        self.assertEqual(self.transport.call_count, 1)  # один вызов модели: вопрос задал Python
+        self.assertFalse(self.spreadsheet.worksheet("Записи").writes)  # запись не начиналась
 
 
 if __name__ == "__main__":
