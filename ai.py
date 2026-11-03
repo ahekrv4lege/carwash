@@ -1012,6 +1012,23 @@ car — слова клиента с исходной цитатой; car_model 
                 await self._remember_service_choice(user)
                 answer = _clean_text(await asyncio.wait_for(
                     self._run(messages, user, review_before, deadline=deadline), timeout=remaining()))
+                explicit_quote = await asyncio.wait_for(self._explicit_order(user), timeout=remaining())
+                if explicit_quote and user.id in self._pending:
+                    current = self._pending[user.id]
+                    if current["action"] == "create_booking" and any(current.get("quote", {}).get(k) != explicit_quote.get(k)
+                            for k in ("total", "tariff", "extras")):
+                        self._pending.pop(user.id, None)
+                        state.pop("pending", None)
+                if explicit_quote and user.id not in self._pending:
+                    if all(state.get("facts", {}).get(field) for field in BOOKING_REQUIRED):
+                        result = await asyncio.wait_for(self._call_tool("create_booking", "{}", user), timeout=remaining())
+                        if result.get("confirmation_required"):
+                            return self._remember(user.id, text, self._offer(user.id, self._pending[user.id]))
+                    elif re.search(r"сколько|стоит|долго|длительн", text, re.I):
+                        parts = [explicit_quote.get("tariff"), *(explicit_quote.get("extras") or [])]
+                        answer = " + ".join(p for p in parts if p) + f" — {explicit_quote['total']} {self.config.currency}."
+                        if explicit_quote.get("duration_minutes"):
+                            answer += f" Длительность: {explicit_quote['duration_minutes']} мин."
                 if user.id not in self._pending and re.search(r"\b(?:подтвердите\s+(?:запись|заказ)|записать\s+вас|оформить\s+запись|записыва\w*|запиш\w*|оформл\w*|подготовлен\w*|подготов\w*\s+запис\w*)\b", answer, re.I):
                     facts_net = state.setdefault("facts", {})
                     parsed_net_time = source_time(text, True) or source_time(text)
@@ -1471,6 +1488,25 @@ car — слова клиента с исходной цитатой; car_model 
 
     _ORDINAL_CHOICE = re.compile(r"\b(?:перв\w*|1|втор\w*|2|трет\w*|3|четв[её]рт\w*|4)\b", re.I)
     _ALL_CHOICE = re.compile(r"\b(?:оба|обе|вс[её])\b", re.I)
+
+    async def _explicit_order(self, user):
+        state = self._state[user.id]
+        source = self._turn_text.get(user.id, "")
+        if (not re.search(r"\b(?:плюс|отдельно|добав\w*|с)\b|\+", source, re.I)
+                or re.search(r"\b(?:не|нет|без|если|или|либо|возможно|может)\b", source, re.I)):
+            return None
+        catalog, facts = state.get("catalog") or {}, state.get("facts") or {}
+        def named(name, endings=""):
+            return bool(name and re.search(r"(?<!\w)" + re.escape(name) + endings + r"(?!\w)", source, re.I))
+        tariffs = [name for name in catalog.get("tariffs", []) if named(name)]
+        services = [name for name in catalog.get("services", []) if named(name, r"(?:ом|а|у|е)?")]
+        if len(tariffs) != 1 or not services or not facts.get("size_class"):return None
+        quote = await asyncio.to_thread(self.store.calculate_price, facts["size_class"], tariffs[0], services)
+        if not quote.get("ok"):return None
+        apply_patch(state, {"tariff": tariffs[0], "services": quote["extras"]}, {})
+        state.update(selection={"size_class": quote["size_class"], "tariff": tariffs[0], "services": quote["extras"]},
+                     quote=self._quote_state(quote))
+        return quote
 
     async def _remember_service_choice(self, user):
         """Ответ клиента на предложенные варианты услуги: «фары», «вторую», «оба».

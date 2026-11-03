@@ -76,6 +76,23 @@ class SchedulingRegressions(unittest.TestCase):
             ["A","09:00","19:00","ремонт"]]))
         with self.assertRaises(MappingError):store._get_slots()
 
+    def test_explicit_tariff_extra_uses_catalog_price_and_duration(self):
+        self.sheet.worksheet("Услуги").values.append(["Воск","Защита","200","300","да","15"])
+        with patch("ai.AsyncOpenAI"):agent=Agent(self.store.config,self.store)
+        user=ChatUser(111,None,"Тест")
+        agent._state[111]={"facts":{"car":"Lada Vesta","size_class":"Легковой"},
+            "catalog":{"tariffs":["Базовый","Комплекс"],"services":["Мойка","Воск"]}}
+        agent._turn_text[111]="Хочу Базовый плюс воск для Lada Vesta, легковой. Сколько и как долго?"
+        result=asyncio.run(agent._explicit_order(user))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["total"],830)
+        self.assertEqual(result["duration_minutes"],75)
+        self.assertEqual(agent._state[111]["facts"]["services"],["Воск"])
+        for text in ["Базовый без воска", "Базовый с воском или Комплекс с воском"]:
+            agent._turn_text[111]=text
+            self.assertIsNone(asyncio.run(agent._explicit_order(user)))
+        agent.cars.close()
+
     def test_peak_concurrency_not_total_intersections(self):
         schedule = self.store._get_slots()
         rows = [{"Дата":"01.01.2099","Время":t,"Длительность":"60","Статус":"Новая"} for t in ["10:00","11:00"]]
