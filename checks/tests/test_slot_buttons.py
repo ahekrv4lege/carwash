@@ -68,6 +68,7 @@ class SlotButtonDialogTests(unittest.IsolatedAsyncioTestCase):
                     "message": message.model_dump(), "data": data})
                 await queue(handler, callback, {"agent": agent})
             with patch.object(Message, "answer", new_callable=AsyncMock) as answer, \
+                 patch.object(Message, "delete", new_callable=AsyncMock) as delete_message, \
                  patch.object(CallbackQuery, "answer", new_callable=AsyncMock), \
                  patch("bot.ChatActionSender.typing", return_value=sender):
                 await queue(text_handler, message, {"agent": agent})
@@ -78,6 +79,8 @@ class SlotButtonDialogTests(unittest.IsolatedAsyncioTestCase):
                 date_data = date_keyboard.inline_keyboard[0][0].callback_data
                 self.assertEqual(date_data, f"slots:date:{day.isoformat()}")
                 await click(date_data, lambda event, values: bot.on_slot_pick(event, agent, reporter))
+                # Старое меню дней удалено: следующий шаг приходит новым сообщением.
+                self.assertEqual(delete_message.await_count, 1)
                 # 2. После выбора даты - свободные часы этого дня и кнопка возврата к дням.
                 time_keyboard = answer.await_args.kwargs["reply_markup"]
                 self.assertEqual([button.text for row in time_keyboard.inline_keyboard for button in row],
@@ -86,6 +89,7 @@ class SlotButtonDialogTests(unittest.IsolatedAsyncioTestCase):
                 time_data = time_keyboard.inline_keyboard[0][0].callback_data
                 self.assertEqual(time_data, f"slots:time:{day.isoformat()}:10:00")
                 await click(time_data, lambda event, values: bot.on_slot_pick(event, agent, reporter))
+                self.assertEqual(delete_message.await_count, 2)
                 # 3. Данных хватает: прежнее подтверждение - сводка и одна кнопка «Подтвердить».
                 confirm_keyboard = answer.await_args.kwargs["reply_markup"]
                 confirm_data = confirm_keyboard.inline_keyboard[0][0].callback_data
@@ -93,6 +97,8 @@ class SlotButtonDialogTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("slots:", confirm_data)
                 self.assertIn("Предлагаю запись:", answer.await_args.args[0])
                 await click(confirm_data, lambda event, values: bot.on_proposal(event, agent, reporter))
+                # Сводку с подтверждением клик не удаляет.
+                self.assertEqual(delete_message.await_count, 2)
             # Выбор слота кнопками не обращается к модели: один запрос на весь диалог.
             self.assertEqual(transport.chat.completions.create.await_count, 1)
             self.assertEqual(len(spreadsheet.worksheet("Записи").writes), 1)
@@ -131,6 +137,43 @@ class SlotButtonDialogTests(unittest.IsolatedAsyncioTestCase):
             # Слот уже указан клиентом: кнопки выбора даты не показываются.
             self.assertIsNone(agent._state[111].get("slot_menu"))
             self.assertIsNone(await agent.slot_keyboard(ChatUser(111, None, "Synthetic")))
+
+    async def test_free_slots_request_answers_with_button_menu_not_text_list(self):
+        # «Что свободно?» — меню дней кнопками; дни и часы текстом не перечисляем,
+        # модель для этого не вызывается.
+        import bot
+        from aiogram.types import Message
+        with tempfile.TemporaryDirectory() as folder:
+            store, spreadsheet = fixture(folder)
+            day = upcoming_day(store)
+            add_slot(spreadsheet, day, "10:00")
+            agent, transport = make_agent(store, [])  # пустая очередь: вызов модели уронил бы тест
+            self.addAsyncCleanup(agent.close)
+            self.addAsyncCleanup(agent.reset, 111)
+            agent.reset(111)
+            queue = bot.MessageBatcher(0.01)
+            reporter = Mock(dialog=AsyncMock())
+            sender = Mock(__aenter__=AsyncMock(), __aexit__=AsyncMock())
+            def user_message(message_id, text_value):
+                return Message.model_validate({"message_id": message_id, "date": 0,
+                    "chat": {"id": 111, "type": "private"}, "from": USER, "text": text_value})
+            async def text_handler(event, data):
+                await bot.ask_agent(event, agent, reporter, event.text)
+            with patch.object(Message, "answer", new_callable=AsyncMock) as answer, \
+                 patch("bot.ChatActionSender.typing", return_value=sender):
+                await queue(text_handler, user_message(1, "Что свободно на этой неделе?"), {"agent": agent})
+                text = answer.await_args.args[0]
+                self.assertIn("Выберите день записи:", text)
+                self.assertNotIn("10:00", text)  # часы остались в кнопках
+                keyboard = answer.await_args.kwargs["reply_markup"]
+                self.assertEqual(keyboard.inline_keyboard[0][0].callback_data, f"slots:date:{day.isoformat()}")
+                # Конкретный день назван: меню часов этого дня.
+                await queue(text_handler, user_message(2, f"А что свободно на {day:%d.%m.%Y}?"), {"agent": agent})
+                text = answer.await_args.args[0]
+                self.assertIn("Выберите время записи на", text)
+                keyboard = answer.await_args.kwargs["reply_markup"]
+                self.assertEqual(keyboard.inline_keyboard[0][0].callback_data, f"slots:time:{day.isoformat()}:10:00")
+            self.assertEqual(transport.chat.completions.create.await_count, 0)
 
 
 class SlotButtonUnitTests(unittest.IsolatedAsyncioTestCase):
@@ -249,7 +292,8 @@ class SlotButtonUnitTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(agent.close)
         user = ChatUser(111, None, "Synthetic")
         text, rows = await agent.pick_date(user, "2099-01-01")
-        self.assertIn("Свободное время на 01.01.2099", text)
+        self.assertIn("Выберите время записи на 01.01.2099", text)
+        self.assertNotIn("— 10:00", text)  # часы не перечисляем текстом: они в кнопках
         self.assertEqual(rows, [[("10:00", "slots:time:2099-01-01:10:00"), ("12:00", "slots:time:2099-01-01:12:00")],
                                 [SLOT_BACK_BUTTON]])
         self.assertEqual(agent._state[111]["slot_pick"], {"date": "2099-01-01"})
@@ -299,12 +343,14 @@ class SlotButtonUnitTests(unittest.IsolatedAsyncioTestCase):
                 "chat": {"id": 111, "type": "private"}, "from": {"id": 999, "is_bot": True, "first_name": "Carwash"},
                 "text": "Свободное время"}).model_dump(), "data": SLOT_BACK_BUTTON[1]})
         with patch.object(Message, "answer", new_callable=AsyncMock) as answer, \
-             patch.object(CallbackQuery, "answer", new_callable=AsyncMock), \
-             patch.object(Message, "edit_reply_markup", new_callable=AsyncMock):
+             patch.object(Message, "delete", new_callable=AsyncMock) as delete_message, \
+             patch.object(CallbackQuery, "answer", new_callable=AsyncMock):
             queue = bot.MessageBatcher(0.01)
             async def handler(event, values):
                 await bot.on_slot_pick(event, agent, Mock(dialog=AsyncMock()))
             await queue(handler, callback, {"agent": agent})
+        # Меню часов удалено, кнопки дней показаны заново.
+        self.assertEqual(delete_message.await_count, 1)
         self.assertIsNone(agent._state[111].get("slot_pick"))
         text = answer.await_args.args[0]
         self.assertIn("Выберите день", text)
@@ -315,7 +361,7 @@ class SlotButtonUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent._state[111]["slot_pick"], {"date": day.isoformat()})
         self.assertEqual(agent._state[111]["facts"]["date"], day.isoformat())
         self.assertNotIn("date", agent._state[111].get("invalidated", []))
-        self.assertIn("Свободное время на", text)
+        self.assertIn("Выберите время записи на", text)
 
     async def test_stale_past_slot_does_not_block_date_buttons(self):
         # В фактах осталась дата прошлой записи: она не «подходящий слот», кнопки нужны.

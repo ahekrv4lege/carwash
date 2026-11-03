@@ -251,11 +251,18 @@ async def on_slot_pick(callback: CallbackQuery, agent: Agent, reporter: AdminRep
         answer, rows = await agent.slot_back(user)
     else:
         return
-    if callback.message.reply_markup:
+    if answer or rows:
+        # Меню выбора уезжает целиком: следующий шаг приходит новым сообщением,
+        # а при возврате к дням меню дней показывается заново.
         try:
-            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.delete()
         except Exception as error:
-            log.warning("Не удалось убрать старые кнопки (%s)", type(error).__name__)
+            log.warning("Не удалось убрать меню выбора (%s)", type(error).__name__)
+            if callback.message.reply_markup:
+                try:
+                    await callback.message.edit_reply_markup(reply_markup=None)
+                except Exception as removal_error:
+                    log.warning("Не удалось убрать старые кнопки (%s)", type(removal_error).__name__)
     if answer:
         await send_answer(callback.message, agent, reporter, user, label, answer,
                           keyboard=markup_from_rows(rows))

@@ -86,10 +86,16 @@ SCHEMAS = {tool["function"]["name"]: tool["function"]["parameters"] for tool in 
 SLOT_DATE_QUESTION = re.compile(
     r"на\s+какой\s+день|какая\s+дата|какой\s+день|какое\s+число|"
     r"когда\s+(?:вас\s+)?записать|когда\s+вам\s+удобно|"
-    r"(?:на\s+)?(?:какой\s+)?(?:день|дату|число)\s+и\s+время", re.I)
+    r"(?:на\s+)?(?:какой\s+)?(?:день|дату|число)\s+и\s+время|"
+    r"(?:выбер\w*|укаж\w*)\s+(?:день|дату|число)", re.I)
 SLOT_TIME_QUESTION = re.compile(
     r"на\s+какое\s+время|какое\s+(?:другое\s+)?время|"
-    r"(?:день|время|дата)\s+(?:вам\s+)?(?:подход\w*|удобн\w*)|как\s+время", re.I)
+    r"(?:день|время|дата)\s+(?:вам\s+)?(?:подход\w*|удобн\w*)|как\s+время|"
+    r"выбер\w*\s+время", re.I)
+
+# Подсказка модели в результате get_free_slots: слоты показываются кнопками.
+SLOTS_MENU_NOTE = ("Свободные дни и часы клиенту показываются кнопками выбора; "
+                   "не перечисляй их текстом. Коротко спроси, какой день и время удобны.")
 
 # Раскладка кнопок под ширину Telegram: два дня и четыре часа в ряду.
 SLOT_DATES_PER_ROW = 2
@@ -497,7 +503,7 @@ CUSTOMER хранит подтверждённые словами клиента
 При изменении выбора или класса вызови calculate_price. Состав тарифа не дублируй в services: без отдельно заказанных допуслуг services=[]. Не добавляй сушку, коврики, воск или скидку, которых нет в результате инструмента. Итоговую сумму и скидку называй только из проверенного расчёта; сама цены не складывай и проценты не придумывай. Сообщай о недоступном компоненте и изменении суммы до подтверждения. Допуслугу можно уместно предложить один раз; после отказа её не повторяй.
 
 ДАТА И ВРЕМЯ
-Относительные даты считай от указанного выше времени и часового пояса. Число без года должно обозначать предстоящую дату, но не переноси прошедшую дату на следующий год молча: уточни её. Если фраза допускает несколько дат или время «в два» неоднозначно, уточни только эту часть. Не предлагай прошедшее время. Свободные слоты, рабочие дни и часы бери только из get_free_slots или результата create_booking. Не объявляй весь день занятым, если недоступен один час. При занятом времени покажи ближайшие доступные варианты из инструмента отдельными строками. Слот не считается удержанным до успешной записи.
+Относительные даты считай от указанного выше времени и часового пояса. Число без года должно обозначать предстоящую дату, но не переноси прошедшую дату на следующий год молча: уточни её. Если фраза допускает несколько дат или время «в два» неоднозначно, уточни только эту часть. Не предлагай прошедшее время. Свободные слоты, рабочие дни и часы бери только из get_free_slots или результата create_booking. Не объявляй весь день занятым, если недоступен один час. Свободные дни и часы клиент выбирает кнопками, которые показывает Python: не перечисляй дни и часы списком в тексте, коротко спроси, какой день и время удобны. При занятом времени предложи выбрать другое время из кнопок. Слот не считается удержанным до успешной записи.
 
 ЗАПИСЬ
 Для записи нужны имя, телефон, авто, класс, тариф/услуги, дата и время. {plate_text}
@@ -689,14 +695,22 @@ car — слова клиента с исходной цитатой; car_model 
                     if not slots.get("ok"):
                         return self._remember(user.id, text, "Не удалось посмотреть расписание. Попробуйте ещё раз позже.")
                     self._remember_slots(user, slots)
-                    days = [day for day in slots.get("days", []) if day.get("free_times")][:3]
+                    days = [day for day in slots.get("days", []) if day.get("free_times")]
                     if not days:
                         return self._remember(user.id, text, slots.get("note", "Свободного времени не нашла."))
-                    blocks = [day["date"] + " (" + day["weekday"] + "):\n" + "\n".join("— " + hour for hour in day["free_times"]) for day in days]
-                    question = "Во сколько вы заканчиваете работу?" if re.search(r"после\s+работы", text, re.I) else "Какое время вам подходит?"
-                    facts_now = state.get("facts", {})
-                    self._offer_slot_menu(user.id, "time" if (facts_now.get("date") or state.get("slot_pick")) else "date")
-                    return self._remember(user.id, text, "Свободное время:\n\n" + "\n\n".join(blocks) + "\n\n" + question)
+                    if re.search(r"после\s+работы", text, re.I):
+                        # Для расчёта длительности нужно время окончания работ клиента.
+                        blocks = [day["date"] + " (" + day["weekday"] + "):\n" + "\n".join("— " + hour for hour in day["free_times"]) for day in days[:3]]
+                        return self._remember(user.id, text, "Свободное время:\n\n" + "\n\n".join(blocks) + "\n\nВо сколько вы заканчиваете работу?")
+                    # Дни и часы клиент выбирает кнопками, текстом не перечисляем.
+                    chosen = str(selected_date) if selected_date else None
+                    if chosen and any(day["date"] == chosen for day in days):
+                        state["slot_pick"] = {"date": chosen}
+                        self._offer_slot_menu(user.id, "time")
+                        return self._remember(user.id, text,
+                                              "Выберите время записи на " + self._day_label(parse_date(chosen)) + ":")
+                    self._offer_slot_menu(user.id, "date")
+                    return self._remember(user.id, text, "Выберите день записи:")
             except Exception as error:
                 log.warning("Не удалось прочитать расписание (%s)", api_error_label(error))
             review_before = dict(state.get("facts", {})) if state.get("review_required") else None
@@ -972,9 +986,8 @@ car — слова клиента с исходной цитатой; car_model 
                 return (f"На {self._day_label(day)} свободного времени не осталось. Выберите другой день.",
                         await self._date_rows(user))
             state.pop("unavailable_time", None)
-            text = (f"Свободное время на {self._day_label(day)}:\n\n"
-                    + "\n".join("— " + time_value for time_value in times)
-                    + "\n\nКакое вам подходит?")
+            # Часы не перечисляем текстом: клиент выбирает кнопками.
+            text = f"Выберите время записи на {self._day_label(day)}:"
             return self._remember(user.id, f"Выбрал дату кнопкой: {self._day_label(day)}.", text), \
                 self._time_buttons(day, times)
 
@@ -2252,7 +2265,10 @@ car — слова клиента с исходной цитатой; car_model 
             )
 
         if name == "get_free_slots":
-            return await asyncio.to_thread(store.free_slots, arguments.get("date") or None, 7, self._duration_hint(user))
+            result = await asyncio.to_thread(store.free_slots, arguments.get("date") or None, 7, self._duration_hint(user))
+            if isinstance(result, dict) and result.get("ok"):
+                result = {**result, "note": SLOTS_MENU_NOTE}
+            return result
 
         if name == "create_booking":
             result = await asyncio.to_thread(
