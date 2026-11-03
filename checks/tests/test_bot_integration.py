@@ -33,7 +33,7 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
             message = Message.model_validate({"message_id": 1, "date": 0,
                 "chat": {"id": 111, "type": "private"}, "from": user, "text": json.dumps(ARGS, ensure_ascii=False)})
             async def text_handler(event, data):
-                await bot.ask_agent(event, agent, reporter, event.text)
+                await bot.ask_agent(event, agent, reporter, event.text, inbox_keys=data.get("inbox_keys"))
             async def click(data):
                 callback = CallbackQuery.model_validate({"id": data, "chat_instance": "synthetic", "from": user,
                     "message": message.model_dump(), "data": data})
@@ -45,7 +45,7 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
                  patch("bot.ChatActionSender.typing", return_value=sender):
                 await queue(text_handler, message, {"agent": agent})
                 old = answer.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
-                await queue(text_handler, message.model_copy(update={"text": "Хочу в 12:00"}), {"agent": agent})
+                await queue(text_handler, message.model_copy(update={"text": "Хочу в 12:00", "message_id": 2}), {"agent": agent})
                 new = answer.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
                 self.assertNotEqual(old, new)
                 self.assertIn(ARGS["phone"], answer.await_args.args[0])
@@ -117,10 +117,11 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
             reporter = Mock(dialog=AsyncMock())
             sender = Mock(__aenter__=AsyncMock(), __aexit__=AsyncMock())
             async def handler(message, data):
-                await bot.ask_agent(message, agent, reporter, message.text)
+                await bot.ask_agent(message, agent, reporter, message.text, inbox_keys=data.get("inbox_keys"))
+            message_ids = iter(range(1, 1000))
             async def send(*texts):
                 messages = [Message.model_validate({
-                    "message_id": index + 1, "date": 0,
+                    "message_id": next(message_ids), "date": 0,
                     "chat": {"id": 111, "type": "private"},
                     "from": {"id": 111, "is_bot": False, "first_name": "Synthetic"},
                     "text": text,

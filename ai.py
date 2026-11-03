@@ -16,11 +16,11 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Any
 
-from openai import AsyncOpenAI, APIConnectionError, APIStatusError, RateLimitError
+from openai import AsyncOpenAI, APIError as OpenAIError, APIConnectionError, APIStatusError, RateLimitError
 
 from config import ROOT, Config
 from providers import api_error_label, client_options, completion_options, invalid_tool_output, request_arguments, retry_after
-from sheets import (WEEKDAYS_RU, Store, parse_date, parse_time, digits, valid_phone,
+from sheets import (WEEKDAYS_RU, Store, DurationSchedule, parse_date, parse_time, digits, valid_phone,
                     to_work_time, within_work_hours, WORK_HOURS_HINT)
 from vehicles import VehicleMemory, car_key, plate_key, plate_mentioned
 from recovery import RecoveryMemory, SNAPSHOT_TTL_SEC
@@ -398,6 +398,10 @@ class Agent:
         self.cars = VehicleMemory(config.vehicle_memory_file, cache_mb=config.vehicle_cache_mb,
                                   ttl_min=config.vehicle_cache_ttl_min, adaptive=config.vehicle_cache_adaptive)
         self.recovery = RecoveryMemory(config.conversation_memory_file)
+        from inbox import Inbox
+        from pathlib import Path
+        self.inbox = Inbox(Path(config.conversation_memory_file).with_suffix(".inbox.sqlite3"))
+        self._inbox_active: set[str] = set()
         contacts = ", ".join(contact for contact in (config.carwash_address, config.carwash_phone) if contact) or "не указаны"
         self._prompt_contacts = contacts
         self._prompt_static = self._build_static_prompt(config, contacts)
@@ -408,6 +412,7 @@ class Agent:
         ))
         self._provider_clients = [self.client] + [None] * len(config.llm_fallbacks)
         self._provider_retry_at = [0.0] * len(self._provider_configs)
+        self._provider_gates = [asyncio.Semaphore(config.ai_request_concurrency) for _ in self._provider_configs]
         self._provider_probes: set[int] = set()
         self._closed = False
         self._history: dict[int, list[dict]] = defaultdict(list)
@@ -921,7 +926,7 @@ car — слова клиента с исходной цитатой; car_model 
                         and not re.search(r"\b(?:не|если|или|либо)\b", text, re.I)):
                     selected_date = source_date(text, self.store.now(), True)
                     slots = await asyncio.wait_for(asyncio.to_thread(
-                        self.store.free_slots, str(selected_date) if selected_date else None), timeout=remaining())
+                        self.store.free_slots, str(selected_date) if selected_date else None, **self._slot_options(user)), timeout=remaining())
                     if not slots.get("ok"):
                         return self._remember(user.id, text, "Не удалось посмотреть расписание. Попробуйте ещё раз позже.")
                     self._remember_slots(user, slots)
@@ -1156,7 +1161,7 @@ car — слова клиента с исходной цитатой; car_model 
     async def _date_rows(self, user) -> list | None:
         """Строки кнопок ближайших дней со свободными часами; None, если таблица недоступна."""
         try:
-            result = await asyncio.to_thread(self.store.free_slots)
+            result = await asyncio.to_thread(self.store.free_slots, **self._slot_options(user))
         except Exception as error:
             log.warning("Не удалось прочитать расписание (%s)", api_error_label(error))
             return None
@@ -1177,7 +1182,7 @@ car — слова клиента с исходной цитатой; car_model 
         if not day:
             return None
         try:
-            result = await asyncio.to_thread(self.store.free_slots, day.isoformat())
+            result = await asyncio.to_thread(self.store.free_slots, day.isoformat(), **self._slot_options(user))
         except Exception as error:
             log.warning("Не удалось прочитать расписание (%s)", api_error_label(error))
             return None
@@ -1219,7 +1224,7 @@ car — слова клиента с исходной цитатой; car_model 
             if not day:
                 return "Не удалось определить дату. Напишите её сообщением, пожалуйста.", None
             try:
-                result = await asyncio.to_thread(self.store.free_slots, day.isoformat())
+                result = await asyncio.to_thread(self.store.free_slots, day.isoformat(), **self._slot_options(user))
             except Exception as error:
                 log.warning("Расписание недоступно при выборе дня (%s)", type(error).__name__)
                 return "Не удалось посмотреть расписание. Попробуйте ещё раз позже.", None
@@ -1253,7 +1258,7 @@ car — слова клиента с исходной цитатой; car_model 
             if not day or not chosen:
                 return "Не удалось определить время. Напишите его сообщением, пожалуйста.", None
             try:
-                result = await asyncio.to_thread(self.store.free_slots, day.isoformat())
+                result = await asyncio.to_thread(self.store.free_slots, day.isoformat(), **self._slot_options(user))
             except Exception as error:
                 log.warning("Расписание недоступно при выборе времени (%s)", type(error).__name__)
                 return "Не удалось проверить расписание. Попробуйте ещё раз позже.", None
@@ -2049,6 +2054,7 @@ car — слова клиента с исходной цитатой; car_model 
             catalog = self.store.get_catalog()
         except Exception:
             return None
+
         facts = self._state.get(user.id, {}).get("facts", {})
         selection = self._state.get(user.id, {}).get("selection") or {}
         tariff = selection.get("tariff") or facts.get("tariff")
@@ -2057,6 +2063,18 @@ car — слова клиента с исходной цитатой; car_model 
             return catalog.duration_for(tariff, services or [])
         except Exception:
             return None
+
+    def _slot_options(self, user):
+        state = self._state.get(user.id, {})
+        facts, selection = state.get("facts", {}), state.get("selection", {}) or {}
+        tariff = selection.get("tariff") or facts.get("tariff")
+        services = selection.get("services", facts.get("services", []))
+        options = {}
+        if tariff or services:
+            options.update(size_class=selection.get("size_class") or facts.get("size_class"),
+                           tariff=tariff, services=services, duration_minutes=self._duration_hint(user))
+        if parse_time(str(facts.get("time", ""))):options["requested_time"] = facts["time"]
+        return options
 
     def _state_fresh(self, entry, ttl_sec) -> bool:
         """Проверенная запись STATE ещё актуальна по своей метке времени.
@@ -2367,14 +2385,19 @@ car — слова клиента с исходной цитатой; car_model 
 
     @staticmethod
     def _retryable_api_error(error) -> bool:
-        status = getattr(error, "status_code", 0)
+        status = getattr(error, "status_code", 0) or 0
         return (
             isinstance(error, (APIConnectionError, RateLimitError, asyncio.TimeoutError))
+            or (isinstance(error, OpenAIError) and not status)
             or status in {408, 429}
             or status >= 500
         )
 
     async def _request_provider(self, index, retries, arguments):
+        async with self._provider_gates[index]:
+            return await self._request_provider_serial(index, retries, arguments)
+
+    async def _request_provider_serial(self, index, retries, arguments):
         config = self._provider_configs[index]
         arguments = request_arguments(config, arguments)
         if self._provider_clients[index] is None:
@@ -2383,7 +2406,7 @@ car — слова клиента с исходной цитатой; car_model 
         for attempt in range(max(1, retries) + 1):
             try:
                 return await client.chat.completions.create(**completion_options(config), **arguments)
-            except (APIConnectionError, APIStatusError) as error:
+            except OpenAIError as error:
                 if invalid_tool_output(error) and any(
                     tool["function"]["name"] == "respond" for tool in arguments.get("tools", [])
                 ):
@@ -2392,12 +2415,13 @@ car — слова клиента с исходной цитатой; car_model 
                         arguments, tools=[tool for tool in arguments["tools"] if tool["function"]["name"] == "respond"],
                         tool_choice={"type": "function", "function": {"name": "respond"}}))
                 connection_retry = isinstance(error, APIConnectionError) and attempt == 0
-                if not self._retryable_api_error(error) or (attempt >= retries and not connection_retry) or retry_after(error) is not None:
+                delay = retry_after(error)
+                if not self._retryable_api_error(error) or (attempt >= retries and not connection_retry) or (delay is not None and delay > 5):
                     raise
                 log.warning("Повтор AI-запроса после %s", type(error).__name__)
                 # Провайдер «мигает» окнами по несколько секунд: пауза 1с/2с даёт
                 # соединению время восстановиться, 0.25с уходили в тот же провал.
-                await asyncio.sleep(1.0 * (attempt + 1))
+                await asyncio.sleep(delay if delay is not None else 1.0 * (attempt + 1))
 
     async def _request(self, **kwargs):
         if self._closed:
@@ -2409,7 +2433,14 @@ car — слова клиента с исходной цитатой; car_model 
             if retry_at <= now and index not in self._provider_probes
         ]
         if not available:
-            raise RuntimeError("Настроенные AI API временно недоступны; повторите позже")
+            delay = min(self._provider_retry_at) - now
+            if 0 < delay <= min(5, self.config.ai_request_budget_sec / 2):
+                await asyncio.sleep(delay)
+                now = time.monotonic()
+                available = [i for i, retry_at in enumerate(self._provider_retry_at)
+                             if retry_at <= now and i not in self._provider_probes]
+            if not available:
+                raise RuntimeError("Настроенные AI API временно недоступны; повторите позже")
         # Бюджет общий для одной генерации и всей цепочки API.
         deadline = now + self.config.ai_request_budget_sec
         for position, index in enumerate(available):
@@ -2429,7 +2460,7 @@ car — слова клиента с исходной цитатой; car_model 
                 result = await asyncio.wait_for(
                     self._request_provider(index, retries, kwargs), timeout=budget
                 )
-            except (APIConnectionError, APIStatusError, asyncio.TimeoutError) as error:
+            except (OpenAIError, asyncio.TimeoutError) as error:
                 failover = self._retryable_api_error(error) or getattr(error, "status_code", 0) in {
                     401,
                     402,
@@ -2921,18 +2952,23 @@ car — слова клиента с исходной цитатой; car_model 
             booking_date, booking_time = parse_date(args["date"]), parse_time(to_work_time(args["time"]))
             if not booking_date or not booking_time or not re.fullmatch(r"\d{1,2}[:.]\d{2}(?::00)?", to_work_time(args["time"]).strip()) or not valid_phone(args["phone"]) or not args["car"].strip() or not args["client_name"].strip():
                 return {"ok": False, "error": "Проверьте дату, время, имя, автомобиль и телефон"}
-            if not within_work_hours(booking_time):
-                return {"ok": False, "field": "available_time", "error": WORK_HOURS_HINT}
-            if not self.store._is_future(booking_date, booking_time):
-                return {"ok": False, "error": "Это время уже прошло или слишком близко. Выберите предстоящую дату и время."}
             args = dict(args, date=booking_date.isoformat(), time=booking_time)
             def preview():
                 with self.store.fresh_tables():
+                    chosen_time = self.store.booking_time(supplied["time"])
+                    outside_fixed = not isinstance(self.store._get_slots(), DurationSchedule) and not within_work_hours(chosen_time or "")
                     quote = self.store.calculate_price(args["size_class"], args.get("tariff"), args.get("services", []),
                                                        fresh=True, car=args.get("car") or None)
-                    slots = self.store.free_slots(args["date"]) if quote.get("ok") else {}
-                    return quote, slots
-            quote, slots = await asyncio.to_thread(preview)
+                    slots = self.store.free_slots(args["date"], duration_minutes=quote.get("duration_minutes"),
+                        requested_time=chosen_time, size_class=quote.get("size_class"),
+                        tariff=quote.get("tariff"), services=quote.get("extras", [])) if quote.get("ok") else {}
+                    return quote, slots, chosen_time, outside_fixed
+            quote, slots, booking_time, outside_fixed = await asyncio.to_thread(preview)
+            if outside_fixed:
+                return {"ok": False, "field": "available_time", "error": WORK_HOURS_HINT}
+            if not booking_time or not self.store._is_future(booking_date, booking_time):
+                return {"ok": False, "error": "Это время уже прошло или слишком близко. Выберите предстоящую дату и время."}
+            args["time"] = booking_time
             if not quote.get("ok"):
                 self._failed_read("calculate_price", user)
                 return quote
@@ -2943,7 +2979,7 @@ car — слова клиента с исходной цитатой; car_model 
             names = {service_name.lower(): service_name for service_name in quote["extras"] + [service_name for line in quote["lines"] for service_name in line.get("includes", [])]}
             supplied.update(date=booking_date.isoformat(), time=booking_time, size_class=quote["size_class"], tariff=quote["tariff"] or "",
                             services=list(dict.fromkeys(names[service_name.strip().lower()] for service_name in supplied.get("services", []))))
-            if not any(booking_time in day["free_times"] for day in slots.get("days", [])):
+            if not slots.get("ok") or not any(booking_time in day["free_times"] for day in slots.get("days", [])):
                 self._state[user.id].update(stage="choosing_time", confirmed=False)
                 return {"ok": False, "error": "Выбранное время недоступно", "availability": slots}
             pending = {"action": name, "args": args, "quote": quote}
@@ -3094,7 +3130,7 @@ car — слова клиента с исходной цитатой; car_model 
             )
 
         if name == "get_free_slots":
-            result = await asyncio.to_thread(store.free_slots, arguments.get("date") or None, 7, self._duration_hint(user))
+            result = await asyncio.to_thread(store.free_slots, arguments.get("date") or None, 7, **self._slot_options(user))
             if isinstance(result, dict) and result.get("ok"):
                 result = {**result, "note": SLOTS_MENU_NOTE}
             return result

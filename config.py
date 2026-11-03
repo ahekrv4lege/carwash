@@ -124,6 +124,7 @@ class Config:
     ai_max_tool_iterations: int = 6
     ai_max_tool_calls: int = 12
     ai_request_retries: int = 1
+    ai_request_concurrency: int = 4
     ai_history_chars: int = 6000
     ai_recent_turns: int = 4
     ai_proofread_enabled: bool = False
@@ -138,6 +139,7 @@ class Config:
     # Лист с длительностями услуг («Услуга», «Длительность»); лист может отсутствовать.
     sheet_durations: str = "Длительности"
     sheet_archive: str = "Архив"   # отдельный архивный лист: записи старше недели
+    sheet_resources: str = "Ограничения боксов"
     llm_fallbacks: tuple[ProviderConfig, ...] = ()
     # Память об автомобилях клиентов: SQLite на диске и RAM-кэш по пользователю.
     vehicle_memory_file: str = ".runtime/customer_vehicles.sqlite3"
@@ -146,6 +148,7 @@ class Config:
     vehicle_cache_mb: float = 4.0
     vehicle_cache_ttl_min: float = 30.0
     vehicle_cache_adaptive: bool = True
+    booking_coordination_file: str = str(ROOT / ".runtime/booking-coordination.sqlite3")
 
 def _fallbacks(primary_url: str, primary_model: str) -> tuple[ProviderConfig, ...]:
     providers = []
@@ -194,6 +197,7 @@ def _generation_settings() -> dict:
         ai_max_tool_iterations=_integer("AI_MAX_TOOL_ITERATIONS", "6", 1),
         ai_max_tool_calls=_integer("AI_MAX_TOOL_CALLS", "12", 1),
         ai_request_retries=retries,
+        ai_request_concurrency=_integer("AI_REQUEST_CONCURRENCY", "4", 1),
         ai_history_chars=_integer("AI_HISTORY_CHARS", "6000", 1000),
         ai_recent_turns=_integer("AI_RECENT_TURNS", "4", 1),
         ai_proofread_enabled=_bool("AI_PROOFREAD_ENABLED"),
@@ -293,6 +297,8 @@ def load_config(sheets_only: bool = False) -> Config:
         vehicle_cache_mb=_number("VEHICLE_CACHE_MB", "4", 0.5),
         vehicle_cache_ttl_min=_number("VEHICLE_CACHE_TTL_MIN", "30", 1),
         vehicle_cache_adaptive=_bool("VEHICLE_CACHE_ADAPTIVE", True),
+        booking_coordination_file=_path("BOOKING_COORDINATION_FILE", ".runtime/booking-coordination.sqlite3"),
+        sheet_resources=os.getenv("SHEET_RESOURCES", "Ограничения боксов").strip(),
         **_sheet_settings(),
         **_ai_settings(sheets_only),
     )

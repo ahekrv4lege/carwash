@@ -187,12 +187,18 @@ class DurationSchedule:
     daily_posts: int = 1
     by_date: dict[date, tuple[tuple[int, int], ...]] = field(default_factory=dict)
     posts_by_date: dict[date, int] = field(default_factory=dict)
+    capacity_windows: dict[date | None, tuple[tuple[int, int, int | None], ...]] = field(default_factory=dict)
 
     def intervals(self, day: date) -> tuple[tuple[int, int], ...]:
         return self.by_date.get(day, self.daily)
 
     def posts(self, day: date) -> int:
         return self.posts_by_date.get(day, self.daily_posts)
+
+    def windows(self, day: date):
+        if self.capacity_windows:
+            return self.capacity_windows.get(day, self.capacity_windows.get(None, ()))
+        return tuple((a, b, self.posts(day)) for a, b in self.intervals(day))
 
 
 # ───────────────────────────── модель данных ─────────────────────────────
@@ -505,6 +511,8 @@ class Store:
         self.config = config
         self.timezone = ZoneInfo(config.timezone)
         self._lock = threading.RLock()
+        from coordination import BookingLock
+        self._write_lock = BookingLock(config.booking_coordination_file)
         self._cache: dict[str, tuple[float, Any]] = {}
         self._spreadsheet = None  # gspread.Spreadsheet, подключаемся лениво
         self._adaptive = None
@@ -519,7 +527,7 @@ class Store:
         with self._lock:
             self._class_rules_absent = False
             document = self._adaptive.refresh(force=force, validate=validate)
-            self._invalidate("catalog", "slots", "bookings")
+            self._invalidate("catalog", "slots", "bookings", "bays")
             return document
 
     # ---------- низкий уровень ----------
@@ -558,7 +566,7 @@ class Store:
     @contextmanager
     def fresh_tables(self):
         """Один свежий пакет для расчёта; финальный write-preflight остаётся независимым."""
-        with self._lock:
+        with self._write_lock, self._lock:
             previous = self._observed
             self._invalidate("catalog", "slots", "bookings")
             try:
@@ -823,13 +831,17 @@ class Store:
             if any("Время" in record for record in rows):
                 raise MappingError("Смешаны часовая вместимость и график работы; нужна одна раскладка")
             return self._load_duration_schedule(rows)
+        if self._get_bays() is not None:
+            raise MappingError("Именованные ограничения боксов требуют интервального графика с длительностями")
         slots: dict[tuple[date, str], int] = {}
         for record in rows:
             booking_date, booking_time = parse_date(pick(record, "Дата")), parse_time(pick(record, "Время"))
             if not booking_date or not booking_time:
                 continue
             capacity_value = to_number(pick(record, "Постов", "Мест", "Боксов"))
-            capacity = 1 if capacity_value is None else max(int(capacity_value), 0)
+            if capacity_value is None or capacity_value < 0 or not float(capacity_value).is_integer():
+                raise MappingError("Не указано корректное количество постов для слота")
+            capacity = int(capacity_value)
             key = (booking_date, booking_time)
             free = bool(record.get("__free_capacity__"))
             if key in slots and isinstance(slots[key], FreeCapacity) != free:
@@ -845,6 +857,7 @@ class Store:
         daily_posts: int | None = None
         by_date: dict[date, list[tuple[int, int]]] = {}
         posts_by_date: dict[date, int] = {}
+        windows = {}
         for record in rows:
             start, end = time_to_minutes(str(record.get("Начало", "")).strip()), time_to_minutes(str(record.get("Конец", "")).strip())
             if start is None and end is None:
@@ -852,7 +865,7 @@ class Store:
             if start is None or end is None or start >= end:
                 raise MappingError("Некорректный интервал графика работы")
             raw = str(record.get("Постов", "")).strip()
-            posts = 1
+            posts = None
             if raw:
                 value = to_number(raw)
                 if value is None or value < 0 or not float(value).is_integer():
@@ -861,19 +874,21 @@ class Store:
             day_text = str(record.get("Дата", "")).strip()
             day = parse_date(day_text) if day_text else None
             if day:
-                if posts_by_date.get(day, posts) != posts:
-                    raise MappingError("Противоречивое число постов для одной даты")
                 by_date.setdefault(day, []).append((start, end))
-                posts_by_date[day] = posts
+                posts_by_date[day] = max(posts_by_date.get(day, 0), posts or 0)
             else:
-                if daily_posts not in (None, posts):
-                    raise MappingError("Противоречивое число постов в графике работы")
-                daily_posts = posts
+                daily_posts = max(daily_posts or 0, posts or 0)
                 daily.append((start, end))
+            windows.setdefault(day, []).append((start, end, posts))
         if not daily and not by_date:
             raise MappingError("В графике работы нет ни одного интервала")
-        return DurationSchedule(tuple(daily), daily_posts if daily_posts is not None else 1,
-                                {day: tuple(spans) for day, spans in by_date.items()}, posts_by_date)
+        for spans in windows.values():
+            for i, (a, b, capacity) in enumerate(spans):
+                if any(a < d and c < b and capacity != other for c, d, other in spans[i + 1:]):
+                    raise MappingError("Противоречивая вместимость пересекающихся интервалов")
+        return DurationSchedule(tuple(daily), daily_posts or 0,
+                                {day: tuple(spans) for day, spans in by_date.items()}, posts_by_date,
+                                {day: tuple(spans) for day, spans in windows.items()})
 
     # ---------- запись по длительности услуги ----------
     def _booking_intervals(self, rows: list[dict[str, Any]], exclude: dict[str, Any] | None = None) -> tuple[list[tuple[date, int, int]], set[date]]:
@@ -904,16 +919,16 @@ class Store:
         candidates: set[int] = set()
         for begin, end in schedule.intervals(day):
             cursor = begin
-            while cursor + duration <= end:
+            while cursor < end:
                 candidates.add(cursor)
                 cursor += FREE_START_STEP_MIN
             for booked_start, booked_end in same_day:
-                if begin < booked_start and booked_end <= end and booked_start + duration <= end:
-                    candidates.add(booked_start)  # старт сразу после освобождения ресурса
+                if begin <= booked_end < end:
+                    candidates.add(booked_end)
         free = []
         for start in sorted(candidates):
-            busy = sum(1 for booked_start, booked_end in same_day if booked_start < start + duration and start < booked_end)
-            if busy < schedule.posts(day):
+            from availability import interval_problem
+            if interval_problem(schedule.windows(day), same_day, start, start + duration) is None:
                 free.append(start)
         return free
 
@@ -927,23 +942,61 @@ class Store:
     def _quote_duration(self, quote: dict) -> tuple[int | None, list[str]]:
         return quote.get("duration_minutes"), list(quote.get("duration_missing", []))
 
+    @staticmethod
+    def _quote_services(quote):
+        return list(dict.fromkeys(name for line in quote.get("lines", [])
+                                  for name in line.get("includes", [line["item"]])))
+
+    def _get_bays(self):
+        def load():
+            try:
+                values = self._get_spreadsheet().worksheet(self.config.sheet_resources).get_all_values()
+            except (WorksheetNotFound, StopIteration):
+                return None
+            from resources import parse_bays
+            catalog = self.get_catalog()
+            return parse_bays(values, catalog.size_classes, catalog.services)
+        return self._cached("bays", self.config.slots_cache_sec, load)
+
+    def _bay_choice(self, rows, day, time_text, duration, size_class=None, services=None, exclude=None):
+        bays = self._get_bays()
+        if bays is None:
+            return None, None
+        if not size_class or not services:
+            return None, "Для проверки бокса выберите класс автомобиля и услуги"
+        from resources import eligible_bays
+        start = time_to_minutes(time_text)
+        eligible = eligible_bays(bays, day, start, start + duration, size_class, services)
+        occupied = set()
+        for row in rows:
+            if row is exclude or not self._is_active(row) or parse_date(pick(row, "Дата")) != day:
+                continue
+            begin = time_to_minutes(pick(row, "Время"))
+            length = parse_duration_minutes(pick(row, "Длительность"))
+            if begin is None or length is None:
+                return None, "В записях нет времени или длительности; нужна проверка администратора"
+            if begin < start + duration and start < begin + length:
+                bay = pick(row, "Бокс")
+                if not bay or bay.casefold() not in {b["name"].casefold() for b in bays}:
+                    return None, "В пересекающейся записи не указан бокс; нужна проверка администратора"
+                occupied.add(bay.casefold())
+        selected = next((bay for bay in eligible if bay.casefold() not in occupied), None)
+        return selected, None if selected else "Нет доступного бокса с нужными допусками на всю длительность услуги"
+
     def _check_duration_start(self, schedule: DurationSchedule, rows: list[dict[str, Any]], day: date,
-                              time_text: str, duration: int, exclude: dict | None = None) -> str | None:
+                              time_text: str, duration: int, exclude: dict | None = None,
+                              size_class: str | None = None, services: list[str] | None = None) -> str | None:
         """None — старт подходит; иначе причина отказа (без выдуманных правил)."""
         start = time_to_minutes(time_text)
         if start is None:
             return "Неверное время записи"
-        intervals, missing = self._booking_intervals(rows)
+        intervals, missing = self._booking_intervals(rows, exclude=exclude)
         if day in missing:
             return "В записях за этот день нет длительности; обратитесь к администратору"
         same_day = [(booked_start, booked_end) for booked_day, booked_start, booked_end in intervals if booked_day == day]
-        for begin, end in schedule.intervals(day):
-            if begin <= start and start + duration <= end:
-                busy = sum(1 for booked_start, booked_end in same_day if booked_start < start + duration and start < booked_end)
-                if busy < schedule.posts(day):
-                    return None
-                return "Интервал занят: нет свободного поста на всю длительность услуги"
-        return "Это время вне графика работы"
+        from availability import interval_problem
+        problem = interval_problem(schedule.windows(day), same_day, start, start + duration)
+        return problem or self._bay_choice(rows, day, time_text, duration, size_class, services, exclude)[1]
 
     def grid_maintenance(self) -> dict:
         """Сверка сеток постов с записями: устаревшие свои маркеры снимаются,
@@ -951,7 +1004,7 @@ class Store:
         собственные маркеры с проверенным ID; записи только читаются."""
         if not self._adaptive:
             return {"checked": 0, "cleared": [], "ambiguous": [], "missing": []}
-        with self._lock:
+        with self._write_lock, self._lock:
             self._invalidate("bookings")
             _, rows = self._get_bookings()
             by_id: dict[str, list[dict[str, Any]]] = {}
@@ -1006,6 +1059,10 @@ class Store:
     def _get_slots(self) -> dict[tuple[date, str], int]:
         return self._cached("slots", self.config.slots_cache_sec, self._load_slots)
 
+    def booking_time(self, value, slots=None):
+        slots = self._get_slots() if slots is None else slots
+        return parse_time(str(value)) if isinstance(slots, DurationSchedule) else parse_time(to_work_time(value))
+
     def _get_bookings(self) -> tuple[list[str], list[dict[str, Any]]]:
         return self._cached("bookings", self.config.slots_cache_sec, self._load_bookings)
 
@@ -1054,7 +1111,9 @@ class Store:
             if slot_date == requested_date and self._capacity_left(slots, busy, (slot_date, slot_time)) > 0 and self._is_future(slot_date, slot_time)
         )
 
-    def free_slots(self, date_str: str | None = None, days: int = 7, duration_minutes: int | None = None) -> dict:
+    def free_slots(self, date_str: str | None = None, days: int = 7, duration_minutes: int | None = None,
+                   *, requested_time: str | None = None, size_class: str | None = None,
+                   tariff: str | None = None, services: list[str] | None = None) -> dict:
         if date_str:
             booking_date = parse_date(date_str)
             if not booking_date:
@@ -1072,7 +1131,28 @@ class Store:
             finally:
                 self._observed = previous
         if isinstance(slots, DurationSchedule):
-            return self._free_slots_duration(slots, booking_rows, dates[0] if date_str else None, days, duration_minutes)
+            if size_class:
+                quote = self.calculate_price(size_class, tariff, services or [])
+                if not quote.get("ok"):return quote
+                duration_minutes = quote.get("duration_minutes") or duration_minutes
+                services = self._quote_services(quote)
+            if self._get_bays() is not None and (not size_class or not services):
+                return _failure("Для проверки бокса выберите класс автомобиля и услуги")
+            output = self._free_slots_duration(slots, booking_rows, dates[0] if date_str else None, days, duration_minutes)
+            if output.get("ok"):
+                for entry in output.get("days", []):
+                    day = parse_date(entry["date"])
+                    if self._get_bays() is not None:
+                        entry["free_times"] = [t for t in entry["free_times"] if self._bay_choice(
+                            booking_rows, day, t, duration_minutes or self.get_catalog().shortest_duration(), size_class, services)[1] is None]
+                    if requested_time and date_str:
+                        problem = self._check_duration_start(slots, booking_rows, day, requested_time,
+                            duration_minutes or self.get_catalog().shortest_duration(), size_class=size_class, services=services)
+                        output["requested_available"] = problem is None and self._is_future(day, requested_time)
+                        if output["requested_available"]:
+                            entry["free_times"] = sorted(set(entry["free_times"] + [requested_time]))
+                        elif problem:output["requested_error"] = problem
+            return output
         busy = self._booked_capacity(booking_rows)
         if not date_str:
             today = self.now().date()
@@ -1102,6 +1182,8 @@ class Store:
         Без выбранной услуги длительность не выдумывается: используется минимальная
         известная длительность, а финальная проверка при записи считает точно.
         """
+        if requested and any(cap is None for _, _, cap in schedule.windows(requested)):
+            return _failure("Не указана вместимость графика; уточните число постов у администратора")
         duration = duration_minutes
         if not duration:
             duration = self.get_catalog().shortest_duration()
@@ -1173,6 +1255,9 @@ class Store:
             self._invalidate("slots", "bookings")  # слоты и записи — только свежие данные
             slots = self._get_slots()
             headers, booking_rows = self._get_bookings()
+            booking_time = self.booking_time(time_str, slots)
+            if not booking_time or not self._is_future(booking_date, booking_time):
+                return _failure("Это время уже прошло или слишком близко к текущему моменту")
             # Госномер обязателен только если настройка включена и в таблице есть колонка:
             # старые таблицы без поля продолжают работать.
             plate = (plate or "").strip()[:40]
@@ -1198,11 +1283,16 @@ class Store:
                     return _failure(f"Нет данных о длительности: {detail}. Уточните у администратора.")
                 if "Длительность" not in headers:
                     return _failure("В таблице записей нет колонки «Длительность»; обратитесь к администратору")
-                problem = self._check_duration_start(slots, booking_rows, booking_date, booking_time, duration_minutes)
+                selected_services = self._quote_services(quote)
+                problem = self._check_duration_start(slots, booking_rows, booking_date, booking_time, duration_minutes,
+                                                     size_class=matched_class, services=selected_services)
                 if problem:
                     intervals, missing = self._booking_intervals(booking_rows)
                     return _failure(problem, free_times_that_day=self._duration_free_times(
                         slots, intervals, missing, booking_date, duration_minutes))
+                bay, _ = self._bay_choice(booking_rows, booking_date, booking_time, duration_minutes, matched_class, selected_services)
+                if bay and "Бокс" not in headers:
+                    return _failure("Для именованных боксов добавьте колонку «Бокс» в таблицу записей")
             else:
                 if not within_work_hours(booking_time):
                     return _failure(WORK_HOURS_HINT)
@@ -1258,6 +1348,7 @@ class Store:
                 "статус": "Новая",
                 "госномер": plate,
                 **({} if duration_minutes is None else {"длительность": str(duration_minutes)}),
+                **({"бокс": bay} if isinstance(slots, DurationSchedule) and bay else {}),
             }
             if self._adaptive:
                 try:
@@ -1323,7 +1414,7 @@ class Store:
         Адаптивные раскладки этот код не переписывает: адресные операции adaptive.py
         не нуждаются в перестановке строк, а их структуру знает только mappings.
         """
-        with self._lock:
+        with self._write_lock, self._lock:
             if self._adaptive:
                 return
             worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
@@ -1512,7 +1603,7 @@ class Store:
         from adaptive import cell_name
 
         today = self.now().date()
-        with self._lock:
+        with self._write_lock, self._lock:
             headers, rows = self._table(self.config.sheet_bookings)
             if not rows or "Статус" not in headers:
                 return 0
@@ -1571,7 +1662,7 @@ class Store:
         отмены — красным, остальной архив — серым; лист служебный, вне карт
         адаптива. Возвращает число скопированных записей.
         """
-        with self._lock:
+        with self._write_lock, self._lock:
             headers, rows = self._table(self.config.sheet_bookings)
             candidates = []
             for record in rows:
@@ -1746,7 +1837,7 @@ class Store:
         трогаются. Возвращает число очищенных строк.
         """
         today = self.now().date()
-        with self._lock:
+        with self._write_lock, self._lock:
             if self._adaptive:
                 cleared, added = self._adaptive.clean_expired_slots(today)
                 if cleared or added:
@@ -1934,7 +2025,7 @@ class Store:
         return {"ok": True, "bookings": output}
 
     def cancel_booking(self, booking_id: Any, telegram_id: int, *, expected_booking: dict | None = None) -> dict:
-        with self._lock:
+        with self._write_lock, self._lock:
             self._invalidate("bookings")
             headers, rows = self._get_bookings()
             matches = [record for record in rows if pick(record, "ID") == str(booking_id).strip()]
@@ -1993,14 +2084,15 @@ class Store:
     def reschedule_booking(self, booking_id: Any, telegram_id: int, date_str: str, time_str: str,
                            *, expected_booking: dict | None = None, dry_run: bool = False) -> dict:
         new_date, new_time = parse_date(date_str), parse_time(to_work_time(time_str))
-        if not new_date or not new_time or not self._is_future(new_date, new_time):
+        if not new_date or not new_time:
             return _failure("Укажите предстоящую дату и время с учётом минимального интервала до записи")
-        if not within_work_hours(new_time):
-            return _failure(WORK_HOURS_HINT)
         with self.fresh_tables():
             self._invalidate("slots", "bookings")
             slots = self._get_slots()
             headers, rows = self._get_bookings()
+            new_time = self.booking_time(time_str, slots)
+            if not new_time or not self._is_future(new_date, new_time):
+                return _failure("Укажите предстоящую дату и время с учётом минимального интервала до записи")
             matches = [row for row in rows if pick(row, "ID") == str(booking_id).strip()]
             if len(matches) != 1 or pick(matches[0], "Telegram ID") != str(telegram_id):
                 return _failure("Запись не найдена среди ваших записей")
@@ -2031,13 +2123,22 @@ class Store:
                 moved_duration = parse_duration_minutes(raw) if raw else None
                 if not moved_duration:
                     return _failure("В записи нет длительности; перенести нельзя. Обратитесь к администратору")
-                problem = self._check_duration_start(slots, rows, new_date, new_time, moved_duration, exclude=record)
+                catalog = self.get_catalog()
+                quote = catalog.quote(pick(record, "Класс"), pick(record, "Тариф") or None,
+                                      [v.strip() for v in pick(record, "Доп. услуги").split(",") if v.strip()])
+                if not quote.get("ok"):return _failure("Не удалось проверить услуги переносимой записи")
+                selected_services = self._quote_services(quote)
+                problem = self._check_duration_start(slots, rows, new_date, new_time, moved_duration, exclude=record,
+                                                     size_class=pick(record, "Класс"), services=selected_services)
                 if problem:
                     intervals, missing = self._booking_intervals(rows)
                     return _failure(f"{problem}. Исходная запись сохранена",
                                     free_times_that_day=self._duration_free_times(
                                         slots, intervals, missing, new_date, moved_duration))
+                bay, _ = self._bay_choice(rows, new_date, new_time, moved_duration, pick(record, "Класс"), selected_services, record)
             else:
+                bay = None
+                if not within_work_hours(new_time):return _failure(WORK_HOURS_HINT)
                 busy = self._booked_capacity([row for row in rows if row is not record])
                 if self._capacity_left(slots, busy, (new_date, new_time)) <= 0:
                     return _failure("Новое время занято. Исходная запись сохранена",
@@ -2051,7 +2152,7 @@ class Store:
             result["user_no"] = user_no
             if self._adaptive:
                 try:
-                    result["grid_released"] = self._adaptive.reschedule(record, telegram_id, new_date.isoformat(), new_time)
+                    result["grid_released"] = self._adaptive.reschedule(record, telegram_id, new_date.isoformat(), new_time, bay=bay)
                 except SlotUnavailable as error:
                     return _failure(f"{error}. Исходная запись сохранена", free_times_that_day=self._free_times(new_date, slots, busy))
             else:
@@ -2063,10 +2164,14 @@ class Store:
                 self._invalidate("slots", "bookings")
                 if self._get_slots() != slots or self._get_bookings() != (headers, rows):
                     return _failure("Расписание или записи изменились. Проверьте перенос заново")
-                worksheet.batch_update([
+                updates = [
                     {"range": cell_name(record["__row__"], columns["дата"]), "values": [[new_date.strftime("%d.%m.%Y")]]},
                     {"range": cell_name(record["__row__"], columns["время"]), "values": [[new_time]]},
-                ], value_input_option="RAW")
+                ]
+                if bay:
+                    if "бокс" not in columns:return _failure("Для переносов нужен столбец «Бокс»")
+                    updates.append({"range": cell_name(record["__row__"], columns["бокс"]), "values": [[bay]]})
+                worksheet.batch_update(updates, value_input_option="RAW")
             self._invalidate("bookings")
             self.refresh_bookings_sheet()
             return result

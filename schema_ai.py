@@ -178,15 +178,16 @@ def request_mapping(config, compact: dict) -> dict:
 
 def _request_mapping(config, compact: dict, hint: str | None) -> dict:
     from openai import OpenAI
-    from providers import client_options
+    from providers import client_options, completion_options, retry_after
+    from dataclasses import replace
 
-    client = OpenAI(**client_options(config))
     payload = json.dumps(compact, ensure_ascii=False)
     if len(payload) > MAX_COMPACT_CHARS:  # страховка от разрастания книги
         trimmed = {"sheets": [{"title": sheet["title"], "sample_rows": sheet["sample_rows"][:6]}
                               for sheet in compact["sheets"]]}
         payload = json.dumps(trimmed, ensure_ascii=False)
     model = getattr(config, "sheets_ai_model", "") or config.ai_model
+    current = replace(config, ai_model=model, ai_temperature=0)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": "Структура книги:\n" + payload},
@@ -195,22 +196,22 @@ def _request_mapping(config, compact: dict, hint: str | None) -> dict:
         messages.append({"role": "user", "content": hint})
     timeout = getattr(config, "sheets_ai_timeout_sec", 90)
     last_error: Exception | None = None
-    for attempt in range(2):  # одна повторная попытка на сетевой сбой, как у диалогового пути
-        try:
-            response = client.chat.completions.create(
-                model=model, temperature=0, response_format={"type": "json_object"},
-                timeout=timeout, messages=messages)
-            break
-        except Exception as error:
-            last_error = error
-            degenerate = isinstance(error, ValueError)  # модель выдала бессмысленный текст
-            transient = getattr(error, "status_code", None) in {408, 429, 500, 502, 503} \
-                or type(error).__name__ in {"APIConnectionError", "APITimeoutError"}
-            if not (transient or degenerate) or attempt == 1:
-                raise
-            time.sleep(0.5)
-    else:
-        raise last_error  # pragma: no cover - цикл всегда завершается raise или break
+    with OpenAI(**client_options(current)) as client:
+        for attempt in range(2):
+            try:
+                response = client.chat.completions.create(
+                    **completion_options(current), response_format={"type": "json_object"},
+                    timeout=timeout, messages=messages)
+                break
+            except Exception as error:
+                last_error = error
+                transient = getattr(error, "status_code", None) in {408, 429, 500, 502, 503} \
+                    or type(error).__name__ in {"APIConnectionError", "APITimeoutError"}
+                delay = retry_after(error)
+                if not transient or attempt == 1 or (delay is not None and delay > 5):raise
+                time.sleep(delay if delay is not None else 0.5)
+        else:
+            raise last_error
     usage = getattr(response, "usage", None)
     log.info("AI-интерпретация структуры: токенов %s", getattr(usage, "total_tokens", "?"))
     content = response.choices[0].message.content or ""

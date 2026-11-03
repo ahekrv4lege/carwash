@@ -6,7 +6,7 @@ import logging
 import os
 import time
 from collections import namedtuple
-from contextlib import nullcontext, suppress
+from contextlib import nullcontext, suppress, asynccontextmanager
 from urllib.parse import urlsplit
 from urllib.request import getproxies, proxy_bypass
 
@@ -22,6 +22,7 @@ import analytics
 from admin import AdminReporter
 from ai import Agent, ChatUser
 from config import Config, load_config
+from recovery import SNAPSHOT_TTL_SEC
 from conversation import plain_text
 from sheets import Store
 
@@ -111,8 +112,17 @@ class MessageBatcher:
         affirmative = any(Agent._affirmative(text, action) for action in ("create_booking", "cancel_booking"))
         batchable = bool(text) and not text.startswith("/") and not affirmative and self.delay > 0
         future = asyncio.get_running_loop().create_future()
-        queue_owner = user_id not in self.pending
         agent = data.get("agent")
+        if not callback and text and not text.startswith("/") and isinstance(agent, Agent):
+            identity = {"id": user_id, "username": message.from_user.username, "full_name": message.from_user.full_name}
+            try:
+                key = await asyncio.to_thread(agent.inbox.accept, user_id, message.message_id, identity, text)
+                if await asyncio.to_thread(agent.inbox.delivered, [key]):return None
+            except Exception as error:
+                log.error("Сообщение не сохранено в очереди (%s)", type(error).__name__)
+                return await message.answer("Не удалось надёжно сохранить сообщение. Повторите его чуть позже.")
+            data = dict(data, inbox_keys=[key])
+        queue_owner = user_id not in self.pending
         if affirmative and not queue_owner and agent and agent.delivery_token(user_id) is None:
             data = dict(data, queued_before_proposal=True)
         queue = self.pending.setdefault(user_id, [])
@@ -154,7 +164,8 @@ class MessageBatcher:
             if latest.data.get("queued_before_proposal") and agent.delivery_token(event.from_user.id) is not None:
                 result = None
             else:
-                result = await latest.handler(event, latest.data)
+                keys = [key for item in batch for key in item.data.get("inbox_keys", [])]
+                result = await latest.handler(event, dict(latest.data, inbox_keys=keys))
         except Exception as error:
             for item in batch:
                 item.future.set_exception(error)
@@ -203,7 +214,10 @@ async def send_answer(message: Message, agent: Agent, reporter: AdminReporter,
         ]])
     if keyboard is None:
         # Кнопки выбора даты/времени строятся по актуальным слотам таблицы.
-        keyboard = markup_from_rows(await agent.slot_keyboard(user))
+        try:
+            keyboard = markup_from_rows(await agent.slot_keyboard(user))
+        except Exception as error:
+            log.warning("Клавиатура недоступна; отправляем текст (%s)", type(error).__name__)
     chunks = split_text(answer)
     for index, chunk in enumerate(chunks):
         if keyboard is not None and index == len(chunks) - 1:
@@ -212,21 +226,59 @@ async def send_answer(message: Message, agent: Agent, reporter: AdminReporter,
             await message.answer(chunk)
     agent.mark_delivered(user.id, delivery_token)
     agent.mark_turn_delivered(user.id, raw_answer)
-    await reporter.dialog(user.id, user.full_name, user.username, text, answer)
+    try:
+        await reporter.dialog(user.id, user.full_name, user.username, text, answer)
+    except Exception as error:
+        log.warning("Журнал диалога недоступен после доставки (%s)", type(error).__name__)
+
+
+@asynccontextmanager
+async def optional_typing(message):
+    sender, entered = ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id), False
+    try:
+        try:
+            await sender.__aenter__()
+            entered = True
+        except Exception as error:
+            log.warning("Индикатор набора недоступен (%s)", type(error).__name__)
+        yield
+    finally:
+        if entered:
+            try:
+                await sender.__aexit__(None, None, None)
+            except Exception as error:
+                log.warning("Индикатор набора не завершён (%s)", type(error).__name__)
 
 
 async def ask_agent(message: Message, agent: Agent, reporter: AdminReporter, text: str,
-                    reply_gate: asyncio.Semaphore | None = None) -> None:
+                    reply_gate: asyncio.Semaphore | None = None, inbox_keys=None) -> None:
     telegram_user = message.from_user
     user = ChatUser(id=telegram_user.id, username=telegram_user.username, full_name=telegram_user.full_name)
+    keys = inbox_keys or []
+    if isinstance(agent, Agent) and isinstance(getattr(message, "message_id", None), int):
+        if not keys:
+            keys = [await asyncio.to_thread(agent.inbox.accept, user.id, message.message_id,
+                {"id": user.id, "username": user.username, "full_name": user.full_name}, text)]
+        if await asyncio.to_thread(agent.inbox.delivered, keys):return
     started = time.monotonic()
     gate = reply_gate if reply_gate is not None else nullcontext()
     # Ограничитель параллельных диалогов (reply_gate из main): всплеск обновлений
     # после простоя не должен порождать сотни одновременных AI-запросов и чтений таблиц.
-    async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id), gate:
-        answer = await agent.reply(user, text)
+    async with optional_typing(message), gate:
+        try:
+            answer = await agent.reply(user, text)
+        except Exception as error:
+            log.error("Обработка сообщения прервана (%s)", type(error).__name__)
+            answer = "Не удалось завершить обработку. Если вы подтверждали запись, проверьте «Мои записи» перед повтором. Иначе повторите сообщение чуть позже."
         await asyncio.sleep(max(0, agent.config.reply_min_delay_sec - (time.monotonic() - started)))
-    await send_answer(message, agent, reporter, user, text, answer)
+    if keys:agent._inbox_active.update(keys)
+    try:
+        if keys:
+            await asyncio.to_thread(agent.inbox.prepare, keys, answer, agent._snapshot_payload(user.id, time.time()))
+        await send_answer(message, agent, reporter, user, text, answer)
+        if keys:await asyncio.to_thread(agent.inbox.acknowledge, keys)
+    finally:
+        if keys:agent._inbox_active.difference_update(keys)
 
 
 @router.callback_query(Filter.data.startswith("booking:"))
@@ -371,8 +423,8 @@ async def cmd_forgetcar(message: Message, command: CommandObject, agent: Agent) 
 
 
 @router.message(Filter.text)
-async def on_text(message: Message, agent: Agent, reporter: AdminReporter, reply_gate: asyncio.Semaphore) -> None:
-    await ask_agent(message, agent, reporter, message.text, reply_gate)
+async def on_text(message: Message, agent: Agent, reporter: AdminReporter, reply_gate: asyncio.Semaphore, inbox_keys=None) -> None:
+    await ask_agent(message, agent, reporter, message.text, reply_gate, inbox_keys)
 
 
 @router.message()
@@ -410,8 +462,51 @@ async def resume_recovered(agent: Agent, bot: Bot, reporter: AdminReporter) -> N
                 await send_answer(channel, agent, reporter, user, turn.get("text", ""), answer)
         except Exception as error:
             log.warning("Не удалось возобновить диалог (%s)", type(error).__name__)
-        finally:
+        else:
             agent.clear_recovery(user.id)
+
+
+async def resume_inbox(agent, bot, reporter, *, processed_only=False):
+    for entry in await asyncio.to_thread(agent.inbox.pending, processed_only):
+        if set(entry["keys"]) & agent._inbox_active:continue
+        user = ChatUser(**entry["user"])
+        if processed_only and agent._active.get(user.id):continue
+        try:
+            answer, payload = entry["answer"], entry["payload"]
+            expired = time.time()-entry["received"] > SNAPSHOT_TTL_SEC
+            if expired:
+                payload = None
+                answer = "Сообщение не удалось обработать или доставить вовремя. Повторите запрос, чтобы проверить актуальные цены и время."
+            if not processed_only and payload and not agent._active.get(user.id):
+                await agent._restore_payload(user.id, entry["received"], payload, time.time())
+            if payload and payload.get("state", {}).get("stage") == "awaiting_confirmation" and (
+                    user.id not in agent._pending or (processed_only and agent.delivery_token(user.id, answer) is None)):
+                answer = ("Не удалось вовремя доставить сводку записи. Попросите проверить её заново: неподтверждённая запись не создавалась."
+                          if processed_only else None)
+            if answer is None:
+                if processed_only:continue
+                if time.time()-entry["received"] > SNAPSHOT_TTL_SEC:
+                    answer = "Сообщение не удалось обработать вовремя. Повторите запрос, чтобы проверить актуальные цены и время."
+                else:answer = await agent.reply(user, "\n".join(entry["texts"]))
+                await asyncio.to_thread(agent.inbox.prepare, entry["keys"], answer, agent._snapshot_payload(user.id, time.time()))
+            channel = RecoveryMessage(bot, user.id)
+            if processed_only:
+                for chunk in split_text(plain_text(answer)):await channel.answer(chunk)
+            else:
+                await send_answer(channel, agent, reporter, user, "\n".join(entry["texts"]), answer)
+            await asyncio.to_thread(agent.inbox.acknowledge, entry["keys"])
+            agent.clear_recovery(user.id)
+        except Exception as error:
+            log.warning("Очередь ответа сохранена для повтора (%s)", type(error).__name__)
+
+
+async def retry_inbox(agent, bot, reporter):
+    while True:
+        await asyncio.sleep(15)
+        try:
+            await resume_inbox(agent, bot, reporter, processed_only=True)
+        except Exception as error:
+            log.warning("Очередь ответов временно недоступна (%s)", type(error).__name__)
 
 
 async def finish_updates(dispatcher: Dispatcher) -> None:
@@ -495,6 +590,7 @@ async def main() -> None:
     archiver = None
     vehicle_cache = None
     grid_auditor = None
+    outbox = None
     try:
         store = Store(config)
         reporter = AdminReporter(bot, config.admin_chat_id)
@@ -510,7 +606,9 @@ async def main() -> None:
         restore_conversations = getattr(agent, "restore_conversations", None)
         if restore_conversations is not None and asyncio.iscoroutinefunction(restore_conversations):
             await restore_conversations()
+            await resume_inbox(agent, bot, reporter)
             await resume_recovered(agent, bot, reporter)
+        outbox = asyncio.create_task(retry_inbox(agent, bot, reporter))
         maintenance = asyncio.create_task(maintain_sessions(agent))
         archiver = asyncio.create_task(archive_old_bookings(store))
         vehicle_cache = asyncio.create_task(maintain_vehicle_cache(agent))
@@ -525,7 +623,7 @@ async def main() -> None:
         # обработчикам завершиться и только затем пишем один снимок диалогов.
         if dispatcher is not None:
             await finish_updates(dispatcher)
-        for task in (maintenance, archiver, vehicle_cache, grid_auditor):
+        for task in (maintenance, archiver, vehicle_cache, grid_auditor, outbox):
             if task is not None:
                 task.cancel()
                 with suppress(asyncio.CancelledError):

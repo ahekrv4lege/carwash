@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 
 VERSION = 1
 MAX_DISCOVERY_CELLS = 1_000_000
-ENGINE_REVISION = 2
+ENGINE_REVISION = 3
 KNOWN_PRICE_CLASSES = {"легковой", "кроссовер", "внедорожник", "минивэн", "внедорожник минивэн", "микроавтобус",
                        "седан", "хэтчбек", "универсал", "sedan", "suv", "crossover", "van", "minivan", "passenger car"}
 NON_PRICE_HEADERS = {"id", "duration", "duration minutes", "duration hours", "длительность", "длительность мин",
@@ -29,8 +29,9 @@ BOOKING_FIELDS = ["ID", "Создано", "Дата", "Время", "Имя", "�
                   "Тариф", "Доп. услуги", "Состав", "Сумма", "Комментарий", "Telegram ID", "Username", "Статус"]
 # Дополнительные поля записей: колонка может отсутствовать в старых таблицах,
 # поэтому не обязана для записи и не участвует в канонической раскладке.
-EXTRA_ROLE_FIELDS = {"bookings": ["Госномер"]}
+EXTRA_ROLE_FIELDS = {"bookings": ["Госномер", "Бокс"]}
 ALIASES = {
+    "Бокс": ["бокс", "пост", "ресурс", "bay", "resource"],
     "ID": ["id", "номер записи", "booking id", "номер брони"],
     "Создано": ["создано", "created", "created at", "дата создания"],
     "Дата": ["дата", "date", "день", "дата записи", "booking date"],
@@ -1163,7 +1164,7 @@ class AdaptiveSheets:
         self.document["missing_roles"] = sorted(set(ROLE_FIELDS) - {rule["role"] for rule in self.document["regions"]})
         ambiguous_roles = [role for role in ROLE_FIELDS
                        if len(group := [rule for rule in self.document["regions"] if rule["role"] == role]) > 1
-                       and not all(rule.get("date_source") for rule in group)]
+                       and role != "services" and not all(rule.get("date_source") for rule in group)]
         self.document["ambiguous_roles"] = ambiguous_roles
         self.document["validation_status"] = "valid" if not self.document.get("missing_roles") and not ambiguous_roles and all(
             rule["validation"]["read"] for rule in self.document["regions"] if rule["role"] in ROLE_FIELDS) else "needs_review"
@@ -1176,7 +1177,7 @@ class AdaptiveSheets:
         if not rules:
             raise MappingError(f"Нет подтверждённой области {role}; настройте mappings")
         # Несколько обычных таблиц одной роли без явных дат/границ неоднозначны.
-        if len(rules) > 1 and not all(rule.get("date_source") for rule in rules):
+        if len(rules) > 1 and role != "services" and not all(rule.get("date_source") for rule in rules):
             raise MappingError(f"Несколько областей {role}; удалите лишние правила или задайте date_source")
         if not all(rule["validation"].get("read") for rule in rules):
             raise MappingError(f"Чтение {role} заблокировано: требуется проверка mappings")
@@ -1318,8 +1319,8 @@ class AdaptiveSheets:
                 headers.extend(field for field in fields if field not in headers)
                 records.extend(self._extract_records(rule, values, worksheet.title))
             if role == "services" and any(record.get("pivot_prices") for record in rules):
-                if len(rules) != 1:
-                    raise MappingError("Для длинного прайса нужна одна область services")
+                if not all(rule.get("pivot_prices") == rules[0].get("pivot_prices") for rule in rules):
+                    raise MappingError("Распределённый прайс смешивает несовместимые представления")
                 headers, records = self._pivot_prices(rules[0], records)
             if role == "services" and any(rule.get("prices_transposed") for rule in rules):
                 # Из длинного формата собираем привычную матрицу «услуга × класс».
@@ -2188,7 +2189,7 @@ class AdaptiveSheets:
             raise MappingError("Нет доступных для изменения колонок даты и времени")
         return rule
 
-    def reschedule(self, record: dict, telegram_id: int, new_date: str, new_time: str) -> None:
+    def reschedule(self, record: dict, telegram_id: int, new_date: str, new_time: str, *, bay: str | None = None) -> None:
         with self.lock:
             versions = dict(self.read_versions)
             _, tables = self._preflight()
@@ -2213,7 +2214,10 @@ class AdaptiveSheets:
                 raise MappingError("Строка записи перемещена или изменена; перенос заблокирован")
             date = datetime.strptime(new_date, "%Y-%m-%d")
             updates = []
-            for field, value in (("Дата", date.strftime("%d.%m.%Y")), ("Время", new_time)):
+            if bay and "Бокс" not in rule["columns"]:raise MappingError("Для переносов нужен столбец «Бокс»")
+            changes = {"Дата": date.strftime("%d.%m.%Y"), "Время": new_time}
+            if bay:changes["Бокс"] = bay
+            for field, value in changes.items():
                 if field not in rule["columns"]:
                     continue
                 transform = rule.get("transforms", {}).get(field, "")
@@ -2239,8 +2243,9 @@ class AdaptiveSheets:
             # Журнал до занятия клетки: иначе сбой между ними оставлял бы маркер без следа.
             journal[key] = {"state": "pending", "sheet_id": rule["sheet_id"], "row": row, "at": time.time(),
                             "marker": f"Запись {record['ID']}",
-                            "old": {"Дата": record.get("Дата", ""), "Время": record.get("Время", "")},
-                            "new": {"Дата": new_day, "Время": new_time}}
+                            "old": {"Дата": record.get("Дата", ""), "Время": record.get("Время", ""),
+                                    **({"Бокс": record.get("Бокс", "")} if bay else {})},
+                            "new": {"Дата": new_day, "Время": new_time, **({"Бокс": bay} if bay else {})}}
             try:
                 atomic_json(path, journal)
             except Exception:
@@ -2267,7 +2272,7 @@ class AdaptiveSheets:
             try:
                 worksheet.batch_update(updates, value_input_option="RAW")
             except Exception:
-                expected = {field_name: value for field_name, value in (("Дата", new_day), ("Время", new_time))
+                expected = {field_name: value for field_name, value in {**changes, "Дата": new_day}.items()
                             if field_name in rule["columns"]}
                 if not expected or self._booking_row_state(rule, row, expected) is not True:
                     # Результат неизвестен: новая клетка и старая запись остаются до ручной сверки.
@@ -2302,8 +2307,8 @@ class AdaptiveSheets:
         Строка ещё на старом месте и клетка наша — повторяем запись строки один раз.
         Иначе состояние спорное: остаётся заблокированным до ручной сверки.
         """
-        new_state = {"Дата": new_day, "Время": new_time}
-        old_state = {"Дата": record.get("Дата", ""), "Время": record.get("Время", "")}
+        new_state = journal[key].get("new", {"Дата": new_day, "Время": new_time})
+        old_state = journal[key].get("old", {"Дата": record.get("Дата", ""), "Время": record.get("Время", "")})
         if self._booking_row_state(rule, row, new_state) is True:
             journal[key]["state"] = "done"
             released = self._release_old_move_cell(old_grid, record, new_day, new_time)

@@ -208,9 +208,9 @@ class DurationScheduleTests(unittest.TestCase):
         fits = self.store.create_booking(**booking(time_str="14:00", services=["Мойка"], tariff=None))
         self.assertTrue(fits["ok"], fits)
 
-    def test_conflicting_posts_in_schedule_are_refused(self):
+    def test_overlapping_conflicting_posts_in_schedule_are_refused(self):
         self.slots().values = [["Начало", "Конец", "Постов"],
-                               ["09:00", "13:00", "1"], ["14:00", "19:00", "2"]]
+                               ["09:00", "15:00", "1"], ["14:00", "19:00", "2"]]
         self.store._invalidate("slots", "bookings")
         with self.assertRaises(MappingError):
             self.store._get_slots()

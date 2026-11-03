@@ -125,6 +125,7 @@ class DeliveryAndTimeouts(unittest.IsolatedAsyncioTestCase):
         from bot import ask_agent
         agent = Mock()
         agent.reply = AsyncMock(return_value="synthetic-answer")
+        agent.config.reply_min_delay_sec = 0
         agent.slot_keyboard = AsyncMock(return_value=None)
         agent.delivery_token.return_value = "synthetic-token"
         message = Mock()
@@ -136,7 +137,7 @@ class DeliveryAndTimeouts(unittest.IsolatedAsyncioTestCase):
         reporter.dialog = AsyncMock()
         context = Mock()
         context.__aenter__ = AsyncMock()
-        context.__aexit__ = AsyncMock()
+        context.__aexit__ = AsyncMock(return_value=False)
         with patch("bot.ChatActionSender.typing", return_value=context):
             await ask_agent(message, agent, reporter, "synthetic-question")
         agent.delivery_token.assert_called_once_with(111, "synthetic-answer")

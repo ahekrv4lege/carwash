@@ -80,7 +80,7 @@ def _build_completion_options(config) -> dict:
         options["temperature"] = config.ai_temperature
     if config.ai_reasoning_effort:
         options["reasoning_effort"] = config.ai_reasoning_effort
-    if hostname in {"polza.ai", "api.polza.ai"}:
+    if hostname in {"polza.ai", "api.polza.ai", "openrouter.ai"}:
         polza = {}
         effort = options.pop("reasoning_effort", None)
         canonical, marker, aliases = model.partition("@")
