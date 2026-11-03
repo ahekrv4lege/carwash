@@ -463,6 +463,21 @@ def safe_claim(text):
              r"\b(?:время|слот|место)\b.{0,60}\b(?:забронирован\w*|закреплен\w*|зарезервирован\w*)\b")
     if re.search(claim, value, re.S) or re.search(r"\b(?:готово|оформлено|заброниров\w*|отменена|зарезервиров\w*|зафиксировал\w*)\b|\bждем вас\b", value):
         return "success_claim"
+    # Настоящее время тоже обещает результат («записываю вас»), но отрицание
+    # «не записываю без кнопки» — это нормальный отказ, а не ложный успех.
+    present = re.search(r"\b(?:записываю|записываем|оформляю|оформляем|бронирую|бронируем|"
+                        r"резервирую|резервируем|запишу|оформлю|забронирую|зарезервирую)\b",
+                        value, re.I)
+    if present:
+        before = value[max(0, present.start() - 40):present.start()]
+        tail = value[present.start():present.start() + 120]
+        end = re.search(r"[.!?\n]", tail)
+        sentence = tail[:end.start()] if end else tail
+        question = bool(end and end.group() == "?")
+        conditional = bool(re.search(r"\b(?:после|когда|если|потом|сначала)\b", sentence, re.I))
+        if (not question and not conditional
+                and not re.search(r"\b(?:не|без)\s+(?:\w+\s+){0,2}$", before, re.I)):
+            return "success_claim"
     return None
 
 

@@ -1022,6 +1022,11 @@ car — слова клиента с исходной цитатой; car_model 
                         answer = invented_service
                         state["service_options"] = self._ambiguous_service_options(user.id)
                 if user.id not in self._pending:
+                    scope_problem = self._scope_problem(user.id, answer)
+                    if scope_problem:
+                        log.warning("Ответ модели отклонён (%s)", scope_problem)
+                        answer = self._scope_reply(user.id, scope_problem)
+                if user.id not in self._pending:
                     problem = (leak_reason(answer) or safe_claim(answer)
                                or ("stale_offer" if "Подтвердить»" in answer and user.id not in self._pending else None)
                                or ("unverified_availability" if self._unverified_availability(user.id, answer, availability_before) else None)
@@ -2095,7 +2100,7 @@ car — слова клиента с исходной цитатой; car_model 
         r"\b(?:итого|всего|сумма|суммарно|за\s+вс[её]|общая\s+(?:стоимость|сумма))\b[^.!\n]{0,40}?"
         r"(\d[\d\s]{0,12})\s*(?:₽|руб)", re.I)
 
-    _DISCOUNT_CLAIM = re.compile(r"скидк\w*\s+(?:в\s+размере\s+|—\s*)?(\d{1,2}(?:[.,]\d+)?)\s*(?:%|проц)", re.I)
+    _DISCOUNT_CLAIM = re.compile(r"скидк\w*\s+(?:в\s+размере\s+|—\s*)?(\d{1,3}(?:[.,]\d+)?)\s*(?:%|проц)", re.I)
 
     def _unverified_availability(self, user_id, text, availability=None) -> bool:
         """«Свободно в 12:00» без свежей проверки слотов — неподтверждённое утверждение.
@@ -2212,11 +2217,102 @@ car — слова клиента с исходной цитатой; car_model 
                 continue
             value = float(match[1].replace(",", "."))
             catalog = self._state[user_id].get("catalog") or {}
-            discounts = {float(tariff.get("discount_percent") or 0) for tariff in catalog.get("tariffs", [])
-                         if isinstance(tariff, dict)}
+            discounts = {float(discount or 0)
+                         for discount in (catalog.get("tariff_discounts") or {}).values()}
+            discounts.update(float(tariff.get("discount_percent") or 0)
+                             for tariff in catalog.get("tariffs", []) if isinstance(tariff, dict))
             if value not in discounts:
                 return True
         return False
+
+    # Явные признаки чужой задачи/роли или служебных данных в готовом ответе.
+    # Это не тематический классификатор: срабатывают только однозначные формы,
+    # а обычные шутки, опечатки и смешанные сообщения проходят дальше.
+    _SCOPE_CODE = re.compile(
+        r"```|(?:^|\n)\s*(?:#include\b|def\s+[A-Za-z_]\w*\s*\(|class\s+[A-Za-z_]\w*\s*[:(]|"
+        r"function\s+[A-Za-z_]\w*\s*\(|public\s+static\s+void|console\.log\s*\(|"
+        r"System\.out\.println|<\?php|SELECT\s+.+\s+FROM\s+)", re.I | re.M)
+    _SCOPE_ROLE = re.compile(
+        r"\b(?:ня+\b|цундэр\w*|пират\w*|unrestricted|неограниченн\w*|без\s+ограничений|"
+        r"я\s+(?:теперь\s+)?(?:цундэр\w*|аниме\w*|пират\w*|горничн\w*|"
+        r"котик\w*|кошечк\w*|твоя\s+(?:девушка|жена|любовь|собственность)|"
+        r"твой\s+(?:парень|муж|слуга))|признаюсь\s+в\s+любви|я\s+тебя\s+люблю)", re.I)
+    _SCOPE_SECRET = re.compile(
+        r"\b(?:пароль|password|api[- ]?ключ|api[- ]?key|токен|token|secret|credential)\w*\b"
+        r"[^.!?\n]{0,40}[:=—-]\s*\S+", re.I)
+    _SCOPE_PROMPT = re.compile(
+        r"\b(?:мои|внутренние|системные|служебные)\s+инструкции\b[^.!?\n]{0,40}[:—-]\s*\S+|"
+        r"\bигнорируй(?:те)?\s+(?:все\s+)?правил\w*", re.I)
+    _SCOPE_FREE = re.compile(r"\bбесплатн\w*\b|\b0\s*(?:₽|руб)\b", re.I)
+    _SCOPE_OFFTOPIC_REQUEST = re.compile(
+        r"(?:напиши|сочини|переведи|реши|объясни|расскажи|придумай|сгенерируй|выполни|сделай)\b"
+        r"[^.!?\n]{0,80}(?:код|программ|стих|поэм|анекдот|шутк|перевод|домашн|задач|политик|"
+        r"реферат|эссе|сочинени|сказк|биограф|истори[юи])|"
+        r"(?:представь|вообрази|играй|сыграй|будь|веди\s+себя|ты\s+теперь|останься)\b"
+        r"[^.!?\n]{0,60}(?:роль|персонаж|аниме|цундэр|девушк|парн|пират|котик|горничн|робот|админ|"
+        r"unrestricted|помощник)|"
+        r"\b(?:политик\w*|выбор\w*|президент\w*|войн\w*|санкц\w*|погод\w*|рецепт\w*|футбол\w*|"
+        r"новост\w*|биткоин\w*|курс\s+доллара)\b", re.I)
+    _SCOPE_CARWASH = re.compile(
+        r"автомойк|мойк|машин|автомоб|тариф|цен|услуг|слот|запис|госномер|кузов|салон|Блеск|свободн",
+        re.I)
+
+    def _foreign_phone(self, user_id, text) -> bool:
+        """Телефон в ответе модели допустим только свой или контакт автомойки."""
+        allowed = {digits(self._state.get(user_id, {}).get("facts", {}).get("phone", "")),
+                   digits(self.config.carwash_phone or "")}
+        allowed.discard("")
+        for match in PHONE.finditer(text or ""):
+            number = digits(match.group())
+            if 10 <= len(number) <= 15 and number not in allowed:
+                return True
+        return False
+
+    def _unverified_free_offer(self, user_id, text) -> bool:
+        if not self._SCOPE_FREE.search(text or ""):
+            return False
+        # Явный отказ («бесплатной мойки нет», «не делаем бесплатно») не обещает услугу.
+        if re.search(
+                r"бесплатн\w*[^.!?\n]{0,30}\b(?:нет|не\s+(?:бывает|делаем|предоставляем|оказываем))\b|"
+                r"\b(?:нет|не\s+(?:бывает|делаем|предоставляем|оказываем)|невозможно|нельзя)\b"
+                r"[^.!?\n]{0,20}бесплатн\w*", text or "", re.I):
+            return False
+        quote = self._state.get(user_id, {}).get("quote")
+        return not (self._state_fresh(quote, self._catalog_ttl_sec) and quote.get("total") == 0)
+
+    def _scope_problem(self, user_id, text) -> str | None:
+        """Ответ модели явно ушёл в чужую задачу, роль, секреты или ложную скидку."""
+        if not isinstance(text, str) or not text:
+            return None
+        if self._SCOPE_CODE.search(text):
+            return "code"
+        if self._SCOPE_ROLE.search(text):
+            return "roleplay"
+        if self._SCOPE_SECRET.search(text):
+            return "credentials"
+        if self._SCOPE_PROMPT.search(text):
+            return "prompt_leak"
+        if self._unverified_free_offer(user_id, text):
+            return "unverified_business_offer"
+        if self._foreign_phone(user_id, text):
+            return "foreign_phone"
+        request = self._turn_text.get(user_id, "")
+        if self._SCOPE_OFFTOPIC_REQUEST.search(request or "") and not self._SCOPE_CARWASH.search(text):
+            return "offtopic"
+        if (len(text) >= 30 and not re.search(r"[А-Яа-яЁё]", text)
+                and re.search(r"[A-Za-z]{3,}", text)):
+            return "language"
+        return None
+
+    def _scope_reply(self, user_id, reason: str) -> str:
+        if reason in {"credentials", "foreign_phone", "prompt_leak"}:
+            return "Эти данные я показать не могу. Могу помочь с мойкой: подсказать услуги, цены или записать вас."
+        if reason == "unverified_business_offer":
+            return "Цены, скидки и запись подтверждает система по прайсу. Могу проверить стоимость и свободное время."
+        missing = model_state(self._state[user_id], self.config.car_plate_required).get("missing") or []
+        if missing:
+            return "Я помогаю только с автомойкой. " + self._clarification(user_id)
+        return "Я помогаю только с автомойкой: могу подсказать услуги, цены и свободное время. Что нужно по машине?"
 
     def _failed_read(self, name, user):
         fields = {"calculate_price": ("quote",), "get_free_slots": ("availability",),
@@ -2794,6 +2890,8 @@ car — слова клиента с исходной цитатой; car_model 
                     "size_classes": result["size_classes"],
                     "class_rules": result.get("class_rules", []),
                     "tariffs": [tariff["name"] for tariff in result["tariffs"]],
+                    "tariff_discounts": {tariff["name"]: float(tariff.get("discount_percent") or 0)
+                                         for tariff in result["tariffs"] if isinstance(tariff, dict)},
                     "services": [service["name"] for service in result["services"]],
                     "unavailable_services": result["unavailable_services"]}
                 result = dict(result, tariffs=[{field_name: field_value for field_name, field_value in tariff.items() if field_name != "note"} for tariff in result["tariffs"]])

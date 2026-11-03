@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -57,6 +58,7 @@ class ConversationRecoveryTests(unittest.IsolatedAsyncioTestCase):
         return agent, restored
 
     async def test_last_four_pairs_facts_and_stage_survive_restart(self):
+        tomorrow = (self.store.now().date() + timedelta(days=1)).isoformat()
         for index in range(4):
             await self.say(f"Сообщение {index}", response(text=f"Ответ {index}"))
         await self.say(
@@ -67,7 +69,7 @@ class ConversationRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 "car": ["Toyota Camry", "Toyota Camry"],
                 "car_model": ["Toyota Camry", "Toyota Camry"],
                 "size_class": ["Легковой", "Toyota Camry"],
-                "date": ["2026-11-04", "завтра"],
+                "date": [tomorrow, "завтра"],
                 "time": ["10:00", "10:00"],
                 "tariff": ["Базовый", "Базовый"],
             }, "tentative": {}})])
@@ -86,7 +88,7 @@ class ConversationRecoveryTests(unittest.IsolatedAsyncioTestCase):
         facts = restarted._state[111]["facts"]
         self.assertEqual((facts["client_name"], facts["phone"]), ("Иван", "79990001122"))
         self.assertEqual(facts["car_model"], "Toyota Camry")
-        self.assertEqual((facts["date"], facts["time"]), ("2026-11-04", "10:00"))
+        self.assertEqual((facts["date"], facts["time"]), (tomorrow, "10:00"))
         self.assertEqual(restarted._state[111]["stage"], "choosing_time")
         self.assertEqual(restarted._state[111]["restored_vehicle"]["car"], "Toyota Camry")
 
