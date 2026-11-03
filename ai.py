@@ -23,8 +23,9 @@ from providers import api_error_label, client_options, completion_options, inval
 from sheets import (WEEKDAYS_RU, Store, parse_date, parse_time, digits, valid_phone,
                     to_work_time, within_work_hours, WORK_HOURS_HINT)
 from vehicles import VehicleMemory
-from conversation import (CATALOG_FIELDS, FIELDS, PHONE, apply_patch, folded, leak_reason, literal_car_patch, model_state,
-                          plain_text, redact_phone, safe_claim, same, strict_json, unpack, validate_patch, salvage_patch, source_date, source_time)
+from conversation import (CATALOG_FIELDS, FIELDS, PHONE, any_word_mentioned, apply_patch, folded, leak_reason,
+                          literal_car_patch, model_state, plain_text, redact_phone, safe_claim, same, stem_variants,
+                          strict_json, unpack, validate_patch, salvage_patch, source_date, source_time, word_stems)
 
 log = logging.getLogger(__name__)
 PROVIDER_COOLDOWN_SEC = 60
@@ -134,25 +135,48 @@ _VEHICLE_NUMBERS = {
     8: r"8|восьм\w*", 40: r"40|сорок", 50: r"50|пятьдесят",
     60: r"60|шестьдесят", 70: r"70|семьдесят", 90: r"90|девяносто",
 }
+# Марки нумерованных семейств с падежами разговорных названий: «на беху», «мазду».
+_FAMILY_BRAND_WORDS = {
+    "BMW": r"bmw|бмв|бвм|бех\w*|бэх\w*|бэмв\w*|бемв\w*|бумв\w*",
+    "Audi": r"audi|ауди",
+    "Mazda": r"mazda|мазд\w*",
+    "Infiniti": r"infiniti|инфинити",
+    "Volvo": r"volvo|вольво",
+}
+_FAMILY_BRANDS = {label: re.compile(r"\b(?:" + words + r")\b", re.I)
+                  for label, words in _FAMILY_BRAND_WORDS.items()}
 _VEHICLE_BMW = {n: f"{n} Series / X{n}" for n in range(1, 8)}
 for _n in (4, 5):
     _VEHICLE_BMW[_n] += f" / i{_n} / M{_n}"
 _VEHICLE_BMW[7] += " / i7"
 _VEHICLE_FAMILIES = (
     ("BMW", _VEHICLE_BMW, re.compile(r"\s*(?:series|сери\w*)\b", re.I),
-     tuple((n, re.compile(r"\b(?:bmw|бмв|бвм|беха|бэха|бэмв|бемв|бумв)\s+(?:" + _VEHICLE_NUMBERS[n] + r")\b", re.I)) for n in _VEHICLE_BMW)),
+     tuple((n, re.compile(r"\b(?:" + _FAMILY_BRAND_WORDS["BMW"] + r")\s+(?:" + _VEHICLE_NUMBERS[n] + r")\b", re.I)) for n in _VEHICLE_BMW)),
     ("Audi", {n: f"A{n} / Q{n}" for n in (3, 4, 5, 6, 7, 8)}, None,
-     tuple((n, re.compile(r"\b(?:audi|ауди)\s+(?:" + _VEHICLE_NUMBERS[n] + r")\b", re.I)) for n in (3, 4, 5, 6, 7, 8))),
+     tuple((n, re.compile(r"\b(?:" + _FAMILY_BRAND_WORDS["Audi"] + r")\s+(?:" + _VEHICLE_NUMBERS[n] + r")\b", re.I)) for n in (3, 4, 5, 6, 7, 8))),
     ("Mazda", {3: "Mazda3 / CX-3", 5: "Mazda5 / CX-5"}, None,
-     ((3, re.compile(r"\b(?:mazda|мазда)\s+(?:" + _VEHICLE_NUMBERS[3] + r")\b", re.I)),
-      (5, re.compile(r"\b(?:mazda|мазда)\s+(?:" + _VEHICLE_NUMBERS[5] + r")\b", re.I)))),
+     ((3, re.compile(r"\b(?:" + _FAMILY_BRAND_WORDS["Mazda"] + r")\s+(?:" + _VEHICLE_NUMBERS[3] + r")\b", re.I)),
+      (5, re.compile(r"\b(?:" + _FAMILY_BRAND_WORDS["Mazda"] + r")\s+(?:" + _VEHICLE_NUMBERS[5] + r")\b", re.I)))),
     ("Infiniti", {n: f"Q{n} / QX{n}" for n in (50, 60, 70)}, None,
-     tuple((n, re.compile(r"\b(?:infiniti|инфинити)\s+(?:" + _VEHICLE_NUMBERS[n] + r")\b", re.I)) for n in (50, 60, 70))),
+     tuple((n, re.compile(r"\b(?:" + _FAMILY_BRAND_WORDS["Infiniti"] + r")\s+(?:" + _VEHICLE_NUMBERS[n] + r")\b", re.I)) for n in (50, 60, 70))),
     ("Volvo", {n: f"S{n} / V{n} / XC{n}" for n in (40, 60, 90)}, None,
-     tuple((n, re.compile(r"\b(?:volvo|вольво)\s+(?:" + _VEHICLE_NUMBERS[n] + r")\b", re.I)) for n in (40, 60, 90))),
+     tuple((n, re.compile(r"\b(?:" + _FAMILY_BRAND_WORDS["Volvo"] + r")\s+(?:" + _VEHICLE_NUMBERS[n] + r")\b", re.I)) for n in (40, 60, 90))),
 )
-_VEHICLE_SPECIFIC = {str(n): re.compile(r"\b(?:a|q|qx|xc|cx|s|v|x|i|m)[-\s]*" + str(n) + r"\b", re.I)
-                     for n in (*range(1, 9), 40, 50, 60, 70, 90)}
+# Буква перед номером («x5», «a6») называет конкретную модель семейства и снимает
+# неоднозначность. Кириллические двойники (х5, м5, а6) узнаются только слитно:
+# отдельное «а» — это союз, «с»/«в» — предлоги, и «а 5» не должно выглядеть
+# как Audi A5.
+_VEHICLE_SPECIFIC = {str(n): re.compile(
+    r"\b(?:a|q|qx|xc|cx|s|v|x|i|m)[-\s]*" + str(n) + r"\b|\b(?:а|с|х|м)" + str(n) + r"\b", re.I)
+    for n in (*range(1, 9), 40, 50, 60, 70, 90)}
+# Сочетания «марка + номер» и «номер + марка» в одном сообщении, по семействам.
+_VEHICLE_FAMILY_PATTERNS = tuple(
+    (label, choices, suffix, tuple(
+        (number, re.compile(
+            str(pattern.pattern) + r"|\b(?:" + _VEHICLE_NUMBERS[number] + r")\s+(?:" + _FAMILY_BRAND_WORDS[label] + r")\b",
+            re.I))
+        for number, pattern in numbered))
+    for label, choices, suffix, numbered in _VEHICLE_FAMILIES)
 _TOYOTA_CHOICES = {
     **{word: "Yaris / Yaris Cross" for word in ("yaris", "ярис")},
     **{word: "Corolla / Corolla Cross" for word in ("corolla", "corola", "королла", "корола", "карола")},
@@ -186,11 +210,58 @@ _VEHICLE_NAMED = (
 )
 
 
-def vehicle_clarification(text):
+# Короткий ответ номером модели («пятая») на вопрос об автомобиле: женский род
+# порядкового или разговорное имя модели, плюс точная цифра. Формы даты
+# («пятого», «пятое») сюда не входят.
+_ORDINAL_MODEL_WORDS = {
+    1: r"перв(?:ая|ую)|единичк\w*", 2: r"втор(?:ая|ую)|двойк\w*",
+    3: r"треть?я|треть?ю|тройк\w*|трешк\w*",
+    4: r"четв[её]рт(?:ая|ую)|четв[её]рк\w*",
+    5: r"пят(?:ая|ую)|пят[её]рк\w*",
+    6: r"шест(?:ая|ую)|шест[её]рк\w*",
+    7: r"седьм(?:ая|ую)|сем[её]рк\w*",
+    8: r"восьм(?:ая|ую)|восьм[её]рк\w*",
+    40: r"сорок(?:овая|овую)", 50: r"пятидесят(?:ая|ую)",
+    60: r"шестидесят(?:ая|ую)", 70: r"семидесят(?:ая|ую)",
+    90: r"девяност(?:ая|ую)",
+}
+# Короткий ответ номером модели («пятая», «5») с защитой от десятичных дробей.
+_ORDINAL_ANSWER_RE = {number: re.compile(
+    rf"(?:^|\W)(?<!\d[.,])(?:{words}|{re.escape(str(number))})(?=\W|$)(?![.,]\d)", re.I)
+    for number, words in _ORDINAL_MODEL_WORDS.items()}
+# Слова, которые сами называют конкретную модель и снимают неоднозначность
+# («икс пятый», «ай пять», «пятая серия»).
+_MODEL_SPECIFIC_WORDS = re.compile(
+    r"\b(?:икс|ай|эм|эмк\w*|ку|эс|вэ|це|си|сери\w*|series|cross|кросс|класс|кузов)\b", re.I)
+# Вопрос бота об автомобиле: после него короткий ответ («пятая») трактуется
+# как ответ о модели, а не о дате или услуге.
+_VEHICLE_QUESTION_RE = re.compile(
+    r"(?:уточни\w*|напиши\w*|скажи\w*)[^.!?\n]{0,80}\b(?:модел\w*|марк\w*|машин\w*|авто\b|автомобил\w*)\b"
+    r"|\bкак\w*\b[^.!?\n]{0,60}\b(?:модел\w*|машин\w*|авто\b|автомобил\w*|марк\w*|бмв|bmw|бех\w*|ауди|audi|мазда|mazda|инфинити|infiniti|вольво|volvo)\b"
+    r"|\b(?:бмв|bmw|бех\w*|ауди|audi|мазда|mazda|инфинити|infiniti|вольво|volvo)[^.!?\n]{0,30}\?", re.I)
+
+
+def vehicle_family(known_car: str) -> str | None:
+    """Марка нумерованного семейства в известных словах об автомобиле."""
+    for label in _FAMILY_BRAND_WORDS:
+        if _FAMILY_BRANDS[label].search(known_car or ""):
+            return label
+    return None
+
+
+def vehicle_clarification(text, known_car="", vehicle_question=False):
+    """Вопрос об автомобиле, если модель неоднозначна.
+
+    Кроме сочетания «марка + номер» в одном сообщении проверяется короткий
+    ответ номером («пятая») на недавний вопрос об автомобиле: марка семейства
+    уже известна из разговора, и номер без различающей части так же
+    неоднозначен, как «бмв 5».
+    """
     if re.search(r"\b(?:не|если|или|либо)\b", text, re.I):
         return None
-    for label, choices, suffix, numbered in _VEHICLE_FAMILIES:
+    for label, choices, suffix, numbered in _VEHICLE_FAMILY_PATTERNS:
         for number, pattern in numbered:
+            # «бмв 5» и «пятая бэха» — одно и то же сочетание марки и номера.
             match = pattern.search(text)
             if match and not (suffix and suffix.match(text[match.end():])):
                 # Полное обозначение в том же сообщении снимает неоднозначность.
@@ -205,6 +276,23 @@ def vehicle_clarification(text):
             options = choices.get(re.sub(r"\s+", "", match.group(1).lower()))
             if options:
                 return f"Уточните, пожалуйста:\n{options}?"
+    label = vehicle_family(known_car) if vehicle_question else None
+    if not label or not isinstance(text, str) or len(text.split()) > 2:
+        return None
+    family = next(entry for entry in _VEHICLE_FAMILIES if entry[0] == label)
+    choices, suffix = family[1], family[2]
+    for number, options in choices.items():
+        answer_pattern = _ORDINAL_ANSWER_RE.get(number)
+        if not answer_pattern:
+            continue
+        if not answer_pattern.search(text):
+            continue
+        if _VEHICLE_SPECIFIC[str(number)].search(text) or _MODEL_SPECIFIC_WORDS.search(text):
+            continue
+        if suffix and suffix.search(text):
+            continue
+        display = options if options.startswith(label) else f"{label} {options}"
+        return f"Уточните, пожалуйста, какую модель вы имеете в виду:\n{display}?"
     return None
 
 
@@ -464,6 +552,18 @@ class Agent:
     def _maybe_slot_menu(self, user_id, answer):
         if user_id in self._pending:
             return
+        state = self._state[user_id]
+        # Кнопки дня уместны, когда состав записи уже известен: пока не выбраны
+        # тариф или услуги, вопрос о дате преждевременен. Исключение - только
+        # что проверенные слоты: клиент сам спрашивал о свободном времени.
+        facts = state.get("facts", {})
+        if not (facts.get("tariff") or facts.get("services") or state.get("repeat_last")):
+            tools = self._turn_tools.get(user_id) or {}
+            if not any(isinstance(key, tuple) and key and key[0] == "get_free_slots"
+                       and isinstance(value, dict) and value.get("ok") for key, value in tools.items()):
+                # Диагностика: кнопки скрыты намеренно (услуга не выбрана), это не сбой Telegram.
+                log.info("Кнопки выбора дня отложены: тариф и услуги ещё не выбраны")
+                return
         if SLOT_DATE_QUESTION.search(answer or ""):
             menu = "date"
         elif SLOT_TIME_QUESTION.search(answer or ""):
@@ -499,7 +599,7 @@ CUSTOMER хранит подтверждённые словами клиента
 
 КЛАСС И ПРАЙС
 Используй уже полученные результаты инструментов. Если данных достаточно, сразу отвечай или вызывай нужный инструмент; не перечитывай тот же прайс.
-Класс выбирай по марке/модели, кузову и прайсу. Если class_rules задаёт класс модели, следуй правилу и не спрашивай категорию. Иначе седан, хэтчбек и универсал — легковые; неоднозначную категорию уточни. Название класса копируй из size_classes. Если прайса нет в STATE, сначала вызови get_price_list. Не выводи цены из примеров, общей памяти или своих догадок. Цены, состав, доступность и скидки бери только из инструментов. Тариф — пакет из каталога; отдельная услуга — не название тарифа. Если клиент уже перечислил услуги, посчитай их; не заставляй выбирать пакет. Предлагай пакет только с проверенным составом и ценой, без неподтверждённого «так выгоднее».
+Класс выбирай по марке/модели, кузову и прайсу. Если class_rules задаёт класс модели, следуй правилу и не спрашивай категорию. Иначе седан, хэтчбек и универсал — легковые; неоднозначную категорию уточни. Название класса копируй из size_classes. Если прайса нет в STATE, сначала вызови get_price_list. Не выводи цены из примеров, общей памяти или своих догадок. Цены, состав, доступность и скидки бери только из инструментов. Тариф — пакет из каталога; отдельная услуга — не название тарифа. Если слова клиента подходят сразу нескольким услугам или тарифам, не выбирай за него: перечисли подходящие варианты с ценами или спроси, что именно нужно. Если клиент уже перечислил услуги, посчитай их; не заставляй выбирать пакет. Предлагай пакет только с проверенным составом и ценой, без неподтверждённого «так выгоднее».
 При изменении выбора или класса вызови calculate_price. Состав тарифа не дублируй в services: без отдельно заказанных допуслуг services=[]. Не добавляй сушку, коврики, воск или скидку, которых нет в результате инструмента. Итоговую сумму и скидку называй только из проверенного расчёта; сама цены не складывай и проценты не придумывай. Сообщай о недоступном компоненте и изменении суммы до подтверждения. Допуслугу можно уместно предложить один раз; после отказа её не повторяй.
 
 ДАТА И ВРЕМЯ
@@ -545,6 +645,12 @@ car — слова клиента с исходной цитатой; car_model 
         state = self._state[user_id]
         missing = model_state(state, self.config.car_plate_required)["missing"]
         field = field or next(iter(missing), None)
+        if field in {"tariff_or_services", "tariff", "services", "requested_service"}:
+            # Общие слова клиента об услуге: показываем варианты каталога, а не пустой вопрос.
+            options = self._ambiguous_service_options(user_id)
+            if options:
+                self._state[user_id]["service_options"] = options
+                return self._service_options_reply(options)
         return _CLARIFICATION_QUESTIONS.get(field, "Не удалось проверить запись. Попробуйте ещё раз чуть позже.")
 
     def _remember(self, user_id, text, answer):
@@ -555,6 +661,13 @@ car — слова клиента с исходной цитатой; car_model 
         history = self._history[user_id]
         pending = self._pending.get(user_id)
         state = self._state[user_id]
+        # Контекст следующего шага: бот спросил об автомобиле, и марка семейства
+        # из слов клиента или ответа делает короткий ответ («пятая») проверяемым.
+        state["vehicle_question"] = bool(_VEHICLE_QUESTION_RE.search(answer))
+        for context_text in (text, answer):
+            context_family = vehicle_family(context_text)
+            if context_family:
+                state["vehicle_family"] = context_family
         greeting = re.match(r"^(?:здравствуйте|здравствуй|привет|доброе утро|добрый день|добрый вечер)(?:[!,.\s]+|$)", answer, re.I)
         if greeting:
             if state.get("greeted"):
@@ -644,12 +757,21 @@ car — слова клиента с исходной цитатой; car_model 
                     self._state[user.id]["review_required"] = True
                 self._state[user.id].pop("outstanding", None)
             state = self._state[user.id]
-            clarification = vehicle_clarification(text)
+            # Контекст уточнения модели: марка из слов клиента и недавний вопрос
+            # бота об автомобиле делают короткий ответ («пятая») проверяемым.
+            vehicle_question = bool(state.pop("vehicle_question", None))
+            known_car = " ".join(filter(None, (state.get("facts", {}).get("car"),
+                                               state.get("facts", {}).get("car_model"),
+                                               state.get("vehicle_family") or "")))
+            clarification = vehicle_clarification(text, known_car, vehicle_question)
             if clarification:
                 # Уточнение не отменяет сохранение остальных данных: модель запускается,
                 # Python возвращает готовый текст уточнения вместо ответа модели.
                 state["vehicle_ambiguous"] = True
                 state.pop("vehicle_clarification_turn", None)
+                family = vehicle_family(text) or vehicle_family(known_car)
+                if family:
+                    state["vehicle_family"] = family
             elif state.get("vehicle_ambiguous"):
                 if state.pop("vehicle_clarification_turn", None):
                     # Окно ответа на уточнение закрыто: дальше снова обычная проверка фактов.
@@ -662,8 +784,8 @@ car — слова клиента с исходной цитатой; car_model 
                 hour = int(ambiguous_time[:2])
                 if re.match(r"вечер|дня", period[0], re.I) and 1 <= hour <= 11:
                     hour += 12
-                elif re.match(r"ноч", period[0], re.I) and hour == 12:
-                    hour = 0
+                elif re.match(r"вечер|ноч", period[0], re.I) and hour == 12:
+                    hour = 0  # «на 12 вечером» - это полночь, а не полдень
                 apply_patch(state, {"time": f"{hour:02d}:{ambiguous_time[3:]}"}, {})
                 state.pop("ambiguous_time", None)
             elif hour_without_minutes(text) and not period:
@@ -757,6 +879,7 @@ car — слова клиента с исходной цитатой; car_model 
             messages.extend([*history, {"role": "user", "content": text}])
             try:
                 await asyncio.wait_for(self._remember_choice(user, state.get("facts", {})), timeout=remaining())
+                await self._remember_service_choice(user)
                 answer = _clean_text(await asyncio.wait_for(
                     self._run(messages, user, review_before, deadline=deadline), timeout=remaining()))
                 if user.id not in self._pending and re.search(r"\b(?:подтвердите\s+(?:запись|заказ)|записать\s+вас|оформить\s+запись|записыва\w*|запиш\w*|оформл\w*|подготовлен\w*|подготов\w*\s+запис\w*)\b", answer, re.I):
@@ -780,6 +903,14 @@ car — слова клиента с исходной цитатой; car_model 
                     answer = self._clarification(user.id, result.get("field"))
                 if self.config.ai_proofread_enabled and user.id not in self._pending:
                     answer = await self._proofread(answer)
+                if user.id not in self._pending:
+                    invented_service = self._invented_service_choice(user.id, answer)
+                    if invented_service:
+                        # Модель выбрала за клиента один из нескольких подходящих
+                        # вариантов каталога: заменяем ответ уточнением с вариантами.
+                        log.warning("Ответ модели отклонён (ambiguous_service_choice)")
+                        answer = invented_service
+                        state["service_options"] = self._ambiguous_service_options(user.id)
                 if user.id not in self._pending:
                     problem = (leak_reason(answer) or safe_claim(answer)
                                or ("stale_offer" if "Подтвердить»" in answer and user.id not in self._pending else None)
@@ -1189,6 +1320,56 @@ car — слова клиента с исходной цитатой; car_model 
             return "Уточните, пожалуйста, " + ", ".join(dict.fromkeys(labels[field] for field in sorted(conflicts))) + ". Остальные данные сохранила."
         return reply
 
+    _ORDINAL_CHOICE = re.compile(r"\b(?:перв\w*|1|втор\w*|2|трет\w*|3|четв[её]рт\w*|4)\b", re.I)
+    _ALL_CHOICE = re.compile(r"\b(?:оба|обе|вс[её])\b", re.I)
+
+    async def _remember_service_choice(self, user):
+        """Ответ клиента на предложенные варианты услуги: «фары», «вторую», «оба».
+
+        Вариант выбирает Python по различающему слову, номеру или слову «все»:
+        модель не может обосновать цитатой название, которого клиент дословно
+        не писал. Полные фразы («мойку и воск») модель называет сама.
+        """
+        state = self._state[user.id]
+        variants = state.get("service_options") or []
+        source = self._turn_text.get(user.id, "")
+        facts = state.get("facts", {})
+        if not variants or not source or facts.get("tariff") or facts.get("services"):
+            state.pop("service_options", None)
+            return
+        if re.search(r"\b(?:не|если|или|либо|вроде|кажется|наверное|возможно|может)\b", source, re.I):
+            return
+        if len(source.split()) > 3:
+            return
+        catalog = state.get("catalog") or {}
+        names = list(dict.fromkeys([*(catalog.get("tariffs") or []), *(catalog.get("services") or [])]))
+        if any(any_word_mentioned(name, source) for name in names if name not in variants):
+            return  # названа ещё одна услуга вне вариантов: пусть разбирается модель
+        tariffs = catalog.get("tariffs") or []
+        matching = [name for name in variants if any_word_mentioned(name, source)]
+        chosen = None
+        if len(matching) == 1:
+            # Различающее слово названо ровно для одного варианта.
+            chosen = matching
+        elif not matching and self._ALL_CHOICE.search(source) and all(name not in tariffs for name in variants):
+            # «все»/«оба»: клиент выбрал все предложенные услуги сразу.
+            chosen = list(variants)
+        elif not matching:
+            ordinal = self._ORDINAL_CHOICE.search(source)
+            if ordinal and len(variants) <= 4:
+                index = ("перв", "1", "втор", "2", "трет", "3", "четв").index(next(
+                    word for word in ("перв", "1", "втор", "2", "трет", "3", "четв")
+                    if ordinal[0].lower().startswith(word)))
+                if index // 2 < len(variants):
+                    chosen = [variants[index // 2]]
+        if chosen:
+            if len(chosen) == 1:
+                field = "tariff" if chosen[0] in tariffs else "services"
+                apply_patch(state, {field: [chosen[0]] if field == "services" else chosen[0]}, {})
+            else:
+                apply_patch(state, {"services": chosen}, {})
+            state.pop("service_options", None)
+
     async def _remember_choice(self, user, selection):
         source = self._turn_text.get(user.id, "")
         choice_requested = bool(re.search(
@@ -1475,6 +1656,56 @@ car — слова клиента с исходной цитатой; car_model 
             if any(value in free for value in times):
                 return False
         return True
+
+    _PRICE_IN_SENTENCE = re.compile(r"\d[\d\s]{0,6}(?:₽|руб)", re.I)
+
+    def _ambiguous_service_options(self, user_id) -> list[str]:
+        """Варианты каталога, уточняющие общие слова клиента об услуге.
+
+        «полировка» при «Полировка фар» и «Полировка кузова» в прайсе — выбор ещё
+        не сделан: Python не даёт молча подставить один из вариантов.
+        """
+        state = self._state[user_id]
+        facts = state.get("facts", {})
+        requested = facts.get("requested_service")
+        if not requested or facts.get("tariff") or facts.get("services"):
+            return []
+        catalog = state.get("catalog") or {}
+        names = list(dict.fromkeys([*(catalog.get("tariffs") or []), *(catalog.get("services") or [])]))
+        variants = stem_variants(requested, names)
+        return variants if len(variants) > 1 else []
+
+    @staticmethod
+    def _service_options_reply(variants) -> str:
+        return ("Уточните, пожалуйста, что именно выбрать:\n"
+                + "\n".join("- " + name for name in variants))
+
+    def _invented_service_choice(self, user_id, answer) -> str | None:
+        """Модель выбрала за клиента один из нескольких подходящих вариантов каталога.
+
+        Ответ, утверждающий конкретную услугу или тариф с ценой (не в вопросе),
+        хотя слова клиента подходили нескольким вариантам и ни один не выбран,
+        заменяется уточнением со списком вариантов.
+        """
+        variants = self._ambiguous_service_options(user_id)
+        if not variants or not isinstance(answer, str):
+            return None
+        asserted = set()
+        for name in variants:
+            match = re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", answer, re.I)
+            if not match:
+                continue
+            start = max(answer.rfind(boundary, 0, match.start()) for boundary in ".!?\n")
+            end = min((index for index in (answer.find(boundary, match.end()) for boundary in ".!?\n") if index != -1),
+                      default=len(answer))
+            sentence = answer[start + 1:end]
+            if "?" in sentence:
+                continue  # вариант назван в вопросе, а не в утверждении
+            if self._PRICE_IN_SENTENCE.search(sentence):
+                asserted.add(name)
+        if asserted and len(asserted) < len(variants):
+            return self._service_options_reply(variants)
+        return None
 
     _PRICE_TOOLS = frozenset({"calculate_price", "get_price_list", "create_booking",
                               "get_my_bookings", "cancel_booking", "reschedule_booking"})
@@ -1932,6 +2163,7 @@ car — слова клиента с исходной цитатой; car_model 
                             facts_now = self._state[user.id].get("facts", {})
                         except Exception as error:
                             log.warning("Дозапрос памяти не удался (%s: %s)", type(error).__name__, str(error)[:120])
+                    service_options = []
                     if not (facts_now.get("tariff") or facts_now.get("services")) and facts_now.get("requested_service"):
                         # Слова клиента («мойка кузова») -> точное название из прайса.
                         catalog = self._state[user.id].get("catalog") or {}
@@ -1941,7 +2173,16 @@ car — слова клиента с исходной цитатой; car_model 
                                       if wanted and (folded(name) == wanted or folded(name) in wanted)]
                         exact = [name for name in candidates if folded(name) == wanted]
                         chosen = exact[0] if len(exact) == 1 else (candidates[0] if len(candidates) == 1 else None)
-                        if not chosen and names:
+                        # То же название в другом падеже: «мойку» -> «Мойка».
+                        stem_equal = [name for name in names
+                                      if word_stems(name) == word_stems(facts_now["requested_service"])]
+                        if not chosen and len(stem_equal) == 1:
+                            chosen = stem_equal[0]
+                        variants = stem_variants(facts_now["requested_service"], names)
+                        if not chosen and len(variants) == 1 and not stem_equal:
+                            # Единственное уточняющее название («полировку» -> «Полировка фар»).
+                            chosen = variants[0]
+                        if not chosen and names and len(variants) <= 1 and not stem_equal:
                             scored = sorted(((SequenceMatcher(None, wanted, folded(name)).ratio(), name)
                                              for name in names), reverse=True)
                             if scored[0][0] >= 0.55 and scored[0][0] - (scored[1][0] if len(scored) > 1 else 0.0) > 0.05:
@@ -1949,6 +2190,10 @@ car — слова клиента с исходной цитатой; car_model 
                         if chosen:
                             field = "tariff" if chosen in (catalog.get("tariffs") or []) else "services"
                             apply_patch(self._state[user.id], {field: [chosen] if field == "services" else chosen}, {})
+                        elif len(variants) > 1:
+                            # Общие слова («полировка») при нескольких уточняющих вариантах
+                            # каталога: не выбираем за клиента, спрашиваем вариант.
+                            service_options = variants
                     if all(self._state[user.id].get("facts", {}).get(field) for field in BOOKING_REQUIRED):
                         result = await self._call_tool("create_booking", "{}", user)
                         if result.get("confirmation_required"):
@@ -1957,6 +2202,9 @@ car — слова клиента с исходной цитатой; car_model 
                             return result["error"]
                         if not result.get("ok") and "работаем" in str(result.get("error", "")):
                             return result["error"]
+                        if service_options:
+                            self._state[user.id]["service_options"] = service_options
+                            return self._service_options_reply(service_options)
                         if not result.get("ok") and "available_tariffs" in result:
                             return self._clarification(user.id, "tariff_or_services")
                 if first_catalog and re.search(rf"\d+\s*(?:{re.escape(self.config.currency)}|руб)", answer):

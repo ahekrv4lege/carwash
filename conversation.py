@@ -159,6 +159,19 @@ def literal_car_patch(patch, text):
     return result
 
 
+def word_matches(word, other) -> bool:
+    """Одно слово другому с точностью до падежа.
+
+    Длинные слова сравниваются по первым 4 буквам; короткие — целиком или с
+    падежным окончанием (до 2 букв), чтобы «фар» узнавалось в «фары».
+    """
+    if len(word) >= 5 or len(other) >= 5:
+        return word[:4] == other[:4]
+    return (word == other
+            or other.startswith(word) and len(other) <= len(word) + 2
+            or word.startswith(other) and len(word) <= len(other) + 2)
+
+
 def inflection_grounded(value, source) -> bool:
     """Каждое слово значения есть в цитате клиента с точностью до падежа.
 
@@ -174,6 +187,55 @@ def inflection_grounded(value, source) -> bool:
         if not any((other[:4] if len(word) >= 5 else other) == stem for other in source_words):
             return False
     return True
+
+
+def any_word_mentioned(name, source) -> bool:
+    """Хотя бы одно слово значения названо в тексте (с точностью до падежа)."""
+    words = re.findall(r"[а-яёa-z0-9]+", folded(name or ""))
+    source_words = re.findall(r"[а-яёa-z0-9]+", folded(source or ""))
+    return any(word_matches(word, other) for word in words for other in source_words)
+
+
+def distinguishing_word_grounded(name, origin, source) -> bool:
+    """Различающее слово уточняющего названия каталога названо клиентом.
+
+    «Полировка фар» уточняет общий запрос «полировка»: если клиент назвал
+    различающее слово («фары»), выбор варианта обоснован и без полного названия.
+    Все слова названия должны быть известны: общие — из запроса, различающие —
+    из текущего сообщения.
+    """
+    origin_stems = word_stems(origin or "")
+    words = re.findall(r"[а-яёa-z0-9]+", folded(name or ""))
+    if not words:
+        return False
+    source_words = re.findall(r"[а-яёa-z0-9]+", folded(source or ""))
+    for word in words:
+        stem = word[:4] if len(word) >= 5 else word
+        if stem in origin_stems:
+            continue
+        if not any(word_matches(word, other) for other in source_words):
+            return False
+    return True
+
+
+def word_stems(value) -> set[str]:
+    """Нормализованные «основы» слов значения: регистр, ё и падежные окончания не важны."""
+    return {(word[:4] if len(word) >= 5 else word)
+            for word in re.findall(r"[а-яёa-z0-9]+", folded(value or ""))}
+
+
+def stem_variants(request, names) -> list[str]:
+    """Названия каталога, уточняющие общий запрос клиента.
+
+    «полировка» уточняют «Полировка фар» и «Полировка кузова»: каждое слово
+    запроса входит в название, но название содержит ещё и различающие слова.
+    Совпадающие по составу слов названия («мойку» -> «Мойка») уточнением
+    не считаются.
+    """
+    request_stems = word_stems(request)
+    if not request_stems:
+        return []
+    return [name for name in names if request_stems < word_stems(name)]
 
 
 def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
@@ -232,8 +294,22 @@ def validate_patch(patch, text, now, catalog=None, tentative=False, known=None):
                 carried = any(folded(raw) == folded(field_value) for field_value in previous)
                 origin = grounded.get("car" if field == "size_class" else "requested_service", "")
                 inferred = origin and (folded(origin) in folded(source) or inflection_grounded(origin, source))
-                if len(matches) != 1 or not (carried or inferred) and not inflection_grounded(matches[0], source):
+                direct = bool(matches) and (inflection_grounded(matches[0], source)
+                                            or distinguishing_word_grounded(matches[0], origin, source))
+                if len(matches) != 1 or not (carried or inferred or direct):
                     raise ValueError("unverified_catalog_value")
+                if inferred and not carried and not direct and field in {"tariff", "services"}:
+                    # Общие слова клиента («полировка») не должны молча превращаться
+                    # в один из нескольких уточняющих вариантов каталога: это выбор
+                    # за клиента. Точная цитата («полировку фар») выбор обосновывает.
+                    if len(stem_variants(origin, names)) > 1:
+                        raise ValueError("ambiguous_catalog_choice")
+                    # Ровно совпадающее по словам название существует: выбор более
+                    # узкого варианта («мойку» -> «Мойка двигателя» вместо «Мойка»)
+                    # не обоснован словами клиента.
+                    if (word_stems(matches[0]) != word_stems(origin)
+                            and any(word_stems(name) == word_stems(origin) for name in names)):
+                        raise ValueError("unverified_catalog_value")
                 canonical.append(matches[0])
             value = list(dict.fromkeys(canonical)) if field == "services" else canonical[0]
         elif field == "phone":
@@ -338,7 +414,8 @@ def redact_phone(text, known=None):
 
 def model_state(state, plate_required: bool = False):
     result = {field_name: field_value for field_name, field_value in state.items() if field_name not in
-              {"details", "facts", "tentative", "outstanding", "consumed_offers", "slot_menu", "slot_pick"}}
+              {"details", "facts", "tentative", "outstanding", "consumed_offers", "slot_menu", "slot_pick",
+               "vehicle_question", "vehicle_family", "service_options"}}
     for key in ("facts", "tentative"):
         values = {field_name: field_value for field_name, field_value in state.get(key, {}).items() if field_name != "phone"}
         if state.get(key, {}).get("phone"):
