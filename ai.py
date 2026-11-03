@@ -1428,9 +1428,14 @@ car — слова клиента с исходной цитатой; car_model 
             plate = facts.get("plate")
             # Номер из прошлой машины не должен приклеиться к новой: берём его,
             # только если он действительно назван в текущем сообщении.
-            await self._remember_vehicle(
+            saved = await self._remember_vehicle(
                 user, facts.get("car_model") or facts.get("car") or "", facts.get("size_class") or "",
                 plate=plate if plate and plate_mentioned(plate, source) else None)
+            # Если у новой/исправленной машины номера нет, старый номер из фактов
+            # больше не принадлежит ей. Для той же машины saved.last_plate сохранит его.
+            if (saved is not None and not saved.last_plate and facts.get("plate")
+                    and not plate_mentioned(facts["plate"], source)):
+                facts.pop("plate", None)
         if conflicts:
             labels = {"car": "автомобиль", "car_model": "модель автомобиля", "size_class": "класс автомобиля",
                       "date": "дату", "time": "время", "phone": "телефон", "client_name": "имя",

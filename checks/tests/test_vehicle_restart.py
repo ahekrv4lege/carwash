@@ -190,14 +190,18 @@ class RestartMemoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_explicit_new_vehicle_overrides_restored_memory(self):
         await self.remember_camry()
+        self.agent.cars.remember(111, "Toyota Camry", "Легковой", plate="А 123 АА 77")
         restarted = await self.restart()
         await self.say(restarted, self.user, "У меня теперь Kia Rio",
                        self.saved("Kia Rio", model="Kia Rio", cls="Легковой"))
         facts = restarted._state[111]["facts"]
         self.assertEqual(facts["car"], "Kia Rio")
         self.assertEqual(facts["car_model"], "Kia Rio")
-        self.assertEqual(sorted(car.name for car in restarted.cars.for_user(111)),
-                         ["Kia Rio", "Toyota Camry"])
+        self.assertNotIn("plate", facts)  # номер прошлой машины не переехал на новую
+        cars = {car.name: car for car in restarted.cars.for_user(111)}
+        self.assertEqual(sorted(cars), ["Kia Rio", "Toyota Camry"])
+        self.assertEqual(cars["Kia Rio"].last_plate, "")
+        self.assertEqual(cars["Toyota Camry"].last_plate, "А 123 АА 77")
 
     async def test_repeated_confirmation_keeps_one_record_and_updates_it(self):
         await self.remember_camry()
