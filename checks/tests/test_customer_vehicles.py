@@ -493,12 +493,16 @@ class AgentIntegrationTests(unittest.IsolatedAsyncioTestCase):
         upsert.assert_not_called()
 
     async def test_saved_cars_hint_is_loaded_lazily_and_has_no_ids(self):
+        # Подсказка нужна именно при выборе из нескольких машин: одну машину
+        # Python возвращает в факты сам (см. test_vehicle_restart.py).
         self.agent.cars.remember(111, "Lada Vesta", "Легковой")
+        self.agent.cars.remember(111, "BMW X5", "Кроссовер")
         self.agent.cars.cache.drop(111)
         await self.say("Здравствуйте, хочу на мойку", response(text="Какой автомобиль?"))
         hints = [m["content"] for m in self.transport.call_args.kwargs["messages"] if m["content"].startswith("SAVED_CARS ")]
         self.assertEqual(len(hints), 1)
         self.assertIn("Lada Vesta", hints[0])
+        self.assertIn("BMW X5", hints[0])
         self.assertNotIn('"id"', hints[0])
 
     async def test_no_saved_cars_hint_when_car_is_already_known(self):

@@ -22,7 +22,7 @@ from config import ROOT, Config
 from providers import api_error_label, client_options, completion_options, invalid_tool_output, request_arguments, retry_after
 from sheets import (WEEKDAYS_RU, Store, parse_date, parse_time, digits, valid_phone,
                     to_work_time, within_work_hours, WORK_HOURS_HINT)
-from vehicles import VehicleMemory
+from vehicles import VehicleMemory, car_key
 from conversation import (CATALOG_FIELDS, FIELDS, PHONE, any_word_mentioned, apply_patch, folded, leak_reason,
                           literal_car_patch, model_state, plain_text, redact_phone, safe_claim, same, stem_variants,
                           strict_json, unpack, validate_patch, salvage_patch, source_date, source_time, word_stems)
@@ -480,6 +480,7 @@ class Agent:
             async with self._locks[user_id]:
                 entered = True
                 self._take_proposal(user_id)
+                await self._restore_saved_vehicle(user_id)
                 try:
                     yield
                 finally:
@@ -1534,6 +1535,41 @@ car — слова клиента с исходной цитатой; car_model 
         except Exception as error:
             log.warning("Память об автомобилях недоступна (%s)", type(error).__name__)
 
+    async def _restore_saved_vehicle(self, user_id: int) -> None:
+        """Вернуть подтверждённый автомобиль в факты диалога после перезапуска.
+
+        SQLite — источник истины, а STATE и RAM-кэш живут только в процессе.
+        Ровно один сохранённый автомобиль возвращается в CUSTOMER без запроса
+        к модели, чтобы постоянный клиент не называл марку и модель заново.
+        Несколько автомобилей не выбираются за клиента: их покажет SAVED_CARS.
+        Состав прошлого заказа сюда не переносится: цена и слоты проверяются
+        заново, а «как в прошлый раз» подставляет STATE.repeat_last.
+        """
+        state = self._state[user_id]
+        if state.get("vehicle_restored"):
+            return
+        facts = state.get("facts", {})
+        if facts.get("car") or facts.get("car_model"):
+            state["vehicle_restored"] = True
+            return
+        try:
+            cars = await asyncio.to_thread(self.cars.for_user, user_id)
+        except Exception as error:
+            log.warning("Память об автомобилях недоступна (%s)", type(error).__name__)
+            return
+        state["vehicle_restored"] = True
+        if len(cars) != 1:
+            return
+        saved = cars[0]
+        facts = state.setdefault("facts", {})
+        facts["car"] = saved.name
+        facts["car_model"] = saved.name
+        if saved.size_class:
+            facts["size_class"] = saved.size_class
+        if saved.last_plate:
+            facts["plate"] = saved.last_plate
+        state["restored_vehicle"] = {"id": saved.id, "car": saved.name}
+
     async def _saved_cars_hint(self, user) -> list[dict]:
         """Прошлые автомобили клиента для подсказки. Внутренние ID в модель не передаём."""
         state = self._state[user.id]
@@ -1556,6 +1592,25 @@ car — слова клиента с исходной цитатой; car_model 
                                     tariff=tariff, services=services, plate=plate)
         except Exception as error:
             log.warning("Автомобиль не сохранён в памяти (%s)", type(error).__name__)
+
+    def forget_vehicle_facts(self, user_id: int, car) -> None:
+        """Удалённый из памяти автомобиль больше не участвует в текущем диалоге."""
+        state = self._state.get(user_id)
+        if not state:
+            return
+        facts = state.get("facts", {})
+        restored = state.get("restored_vehicle") or {}
+        current = facts.get("car") or facts.get("car_model") or ""
+        same_record = (restored.get("id") == car.id
+                       and bool(current)
+                       and car_key(current) == car_key(restored.get("car") or ""))
+        if not same_record and (not current or car_key(current) != car_key(car.name)):
+            return
+        for field in ("car", "car_model", "size_class", "plate"):
+            facts.pop(field, None)
+        if same_record:
+            state.pop("restored_vehicle", None)
+        state["vehicle_restored"] = True
 
     def _customer_car(self, user) -> str:
         """Только подтверждённый автомобиль клиента: предположительные значения не влияют на класс."""

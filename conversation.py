@@ -415,7 +415,7 @@ def redact_phone(text, known=None):
 def model_state(state, plate_required: bool = False):
     result = {field_name: field_value for field_name, field_value in state.items() if field_name not in
               {"details", "facts", "tentative", "outstanding", "consumed_offers", "slot_menu", "slot_pick",
-               "vehicle_question", "vehicle_family", "service_options"}}
+               "vehicle_question", "vehicle_family", "service_options", "vehicle_restored", "restored_vehicle"}}
     for key in ("facts", "tentative"):
         values = {field_name: field_value for field_name, field_value in state.get(key, {}).items() if field_name != "phone"}
         if state.get(key, {}).get("phone"):

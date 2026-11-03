@@ -356,11 +356,14 @@ async def cmd_forgetcar(message: Message, command: CommandObject, agent: Agent) 
         if not arguments.isdigit() or not 1 <= int(arguments) <= len(cars):
             await message.answer("Укажите номер из списка: /mycars, затем /forgetcar номер")
             return
-        removed = await asyncio.to_thread(agent.cars.forget, message.from_user.id, cars[int(arguments) - 1].id)
+        car = cars[int(arguments) - 1]
+        removed = await asyncio.to_thread(agent.cars.forget, message.from_user.id, car.id)
     except Exception as error:
         log.warning("Автомобиль не удалён из памяти (%s)", type(error).__name__)
         await message.answer("Не удалось удалить автомобиль. Попробуйте позже.")
         return
+    if removed:
+        agent.forget_vehicle_facts(message.from_user.id, car)
     await message.answer("Автомобиль удалён из памяти." if removed else "Такого автомобиля уже нет в памяти.")
 
 
