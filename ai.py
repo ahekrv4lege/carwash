@@ -22,7 +22,7 @@ from config import ROOT, Config
 from providers import api_error_label, client_options, completion_options, invalid_tool_output, request_arguments, retry_after
 from sheets import (WEEKDAYS_RU, Store, parse_date, parse_time, digits, valid_phone,
                     to_work_time, within_work_hours, WORK_HOURS_HINT)
-from vehicles import VehicleMemory, car_key
+from vehicles import VehicleMemory, car_key, plate_key, plate_mentioned
 from recovery import RecoveryMemory, SNAPSHOT_TTL_SEC
 from conversation import (CATALOG_FIELDS, FIELDS, PHONE, any_word_mentioned, apply_patch, folded, leak_reason,
                           literal_car_patch, model_state, plain_text, redact_phone, safe_claim, same, stem_variants,
@@ -1423,9 +1423,14 @@ car — слова клиента с исходной цитатой; car_model 
             if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[1], str):
                 car_quote = entry[1]
                 break
-        if ({"car", "car_model"} & changes.keys()) and car_ownership(source, car_quote) and not self._state[user.id].get("vehicle_ambiguous"):
+        if ({"car", "car_model", "plate"} & changes.keys()) and car_ownership(source, car_quote) and not self._state[user.id].get("vehicle_ambiguous"):
             facts = self._state[user.id].get("facts", {})
-            await self._remember_vehicle(user, facts.get("car_model") or facts.get("car") or "", facts.get("size_class") or "")
+            plate = facts.get("plate")
+            # Номер из прошлой машины не должен приклеиться к новой: берём его,
+            # только если он действительно назван в текущем сообщении.
+            await self._remember_vehicle(
+                user, facts.get("car_model") or facts.get("car") or "", facts.get("size_class") or "",
+                plate=plate if plate and plate_mentioned(plate, source) else None)
         if conflicts:
             labels = {"car": "автомобиль", "car_model": "модель автомобиля", "size_class": "класс автомобиля",
                       "date": "дату", "time": "время", "phone": "телефон", "client_name": "имя",
@@ -1717,15 +1722,19 @@ car — слова клиента с исходной цитатой; car_model 
         facts = state.get("facts", {})
         restored = state.get("restored_vehicle") or {}
         current = facts.get("car") or facts.get("car_model") or ""
-        same_record = (restored.get("id") == car.id
-                       and bool(current)
-                       and car_key(current) == car_key(restored.get("car") or ""))
-        if not same_record and (not current or car_key(current) != car_key(car.name)):
-            return
+        if restored.get("id") is not None:
+            # ID различает две машины одной модели; название для этого не годится.
+            if (restored.get("id") != car.id or not current
+                    or car_key(current) != car_key(restored.get("car") or car.name)):
+                return
+        else:
+            current_plate = facts.get("plate") or ""
+            same_plate = bool(current_plate) and plate_key(current_plate) == plate_key(car.last_plate)
+            if not current or car_key(current) != car_key(car.name) or (current_plate and not same_plate):
+                return
         for field in ("car", "car_model", "size_class", "plate"):
             facts.pop(field, None)
-        if same_record:
-            state.pop("restored_vehicle", None)
+        state.pop("restored_vehicle", None)
         state["vehicle_restored"] = True
 
     # ---------- снимок диалогов на штатной остановке ----------
@@ -1763,7 +1772,7 @@ car — слова клиента с исходной цитатой; car_model 
 
     @staticmethod
     def _plate_key(value) -> str:
-        return re.sub(r"[^0-9a-zа-я]+", "", str(value or "").casefold().replace("ё", "е"))
+        return plate_key(value)
 
     def _snapshot_vehicle(self, user_id: int, facts: dict) -> dict:
         state = self._state.get(user_id, {})

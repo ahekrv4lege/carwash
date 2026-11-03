@@ -34,7 +34,7 @@ sys.path.insert(0, str(FOLDER))
 
 import legacy_vehicles  # noqa: E402
 import vehicles  # noqa: E402
-from vehicles import car_key  # noqa: E402
+from vehicles import car_key, plate_key  # noqa: E402
 
 CLASSES = ("Легковой", "Кроссовер", "Внедорожник", "Минивэн")
 TARIFFS = ("Базовый", "Стандарт", "Экспресс")
@@ -174,15 +174,62 @@ def build_b(path: Path, count: int) -> tuple[float, int]:
             ((key, name, "2025-01-01 00:00:00") for key, name in models.items()))
         model_ids = dict(connection.execute("SELECT model_key, model_id FROM vehicle_models"))
         connection.executemany(
-            "INSERT INTO vehicles (id, telegram_id, model_id, size_class, status, "
+            "INSERT INTO vehicles (id, telegram_id, model_id, plate_key, size_class, status, "
             "created_at, updated_at, last_tariff, last_services, last_plate) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ((row[0], row[1], model_ids[row[3]], *row[4:]) for row in iter_records(count)))
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ((row[0], row[1], model_ids[row[3]], plate_key(row[10]), *row[4:])
+             for row in iter_records(count)))
         connection.execute("COMMIT")
     finally:
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         connection.close()
     return time.perf_counter() - started, len(models)
+
+
+V4_MODELS_TABLE = (
+    "CREATE TABLE vehicle_models (model_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "model_key TEXT NOT NULL UNIQUE, canonical_name TEXT NOT NULL, created_at TEXT NOT NULL)"
+)
+V4_VEHICLES_TABLE = (
+    "CREATE TABLE vehicles ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER NOT NULL,"
+    " model_id INTEGER NOT NULL REFERENCES vehicle_models(model_id) ON DELETE RESTRICT,"
+    " size_class TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active',"
+    " created_at TEXT NOT NULL, updated_at TEXT NOT NULL,"
+    " last_tariff TEXT NOT NULL DEFAULT '', last_services TEXT NOT NULL DEFAULT '',"
+    " last_plate TEXT NOT NULL DEFAULT '')"
+)
+V4_INDEX = ("CREATE UNIQUE INDEX vehicles_active_model "
+            "ON vehicles(telegram_id, model_id) WHERE status = 'active'")
+
+
+def build_v4(path: Path, count: int) -> float:
+    """Схема v4 без plate_key: исходная база для проверки миграции v4 -> v5."""
+    models = {}
+    for _, _, name, key, *_ in iter_records(count):
+        models.setdefault(key, name)
+    connection = connect(path, foreign_keys=True)
+    started = time.perf_counter()
+    try:
+        connection.execute("BEGIN")
+        connection.execute(V4_MODELS_TABLE)
+        connection.execute(V4_VEHICLES_TABLE)
+        connection.execute(V4_INDEX)
+        connection.executemany(
+            "INSERT INTO vehicle_models (model_key, canonical_name, created_at) VALUES (?, ?, ?)",
+            ((key, name, "2025-01-01 00:00:00") for key, name in models.items()))
+        model_ids = dict(connection.execute("SELECT model_key, model_id FROM vehicle_models"))
+        connection.executemany(
+            "INSERT INTO vehicles (id, telegram_id, model_id, size_class, status, "
+            "created_at, updated_at, last_tariff, last_services, last_plate) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ((row[0], row[1], model_ids[row[3]], *row[4:]) for row in iter_records(count)))
+        connection.execute("PRAGMA user_version = 4")
+        connection.execute("COMMIT")
+    finally:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.close()
+    return time.perf_counter() - started
 
 
 def db_stats(path: Path) -> dict:
@@ -329,7 +376,7 @@ def duplicate_metrics(path: Path, arch: str) -> dict:
         started = time.perf_counter()
         database.upsert(9_999_999, "Benchmark Shared Model", "Легковой",
                         "2026-04-01 10:00:00", tariff="Базовый",
-                        services=["Мойка"], plate=f"В {index % 1000:03d} ВВ 77")
+                        services=["Мойка"], plate="В 001 ВВ 77")
         samples.append(time.perf_counter() - started)
 
     for index in range(300):
@@ -395,6 +442,8 @@ def cache_metrics(path: Path, arch: str, count: int) -> dict:
     result = {"customers": len(ids), "entries": len(memory.cache),
               "cache_bytes": memory.cache.bytes_used,
               "cache_kb": round(memory.cache.bytes_used / 1024, 1),
+              "model_cache_entries": len(getattr(memory, "model_cache", ())),
+              "model_cache_bytes": getattr(getattr(memory, "model_cache", None), "bytes_used", 0),
               "db_reads_first_pass": loaded_reads,
               "db_reads_second_pass": memory.db_reads,
               "load_ms": round(load_sec * 1000, 2), "repeat_ms": round(repeat_sec * 1000, 2),
@@ -438,10 +487,13 @@ def worker(arch: str, count: int, temp_dir: str | None = None) -> dict:
         return result
 
 
-def migration_worker(count: int, temp_dir: str | None = None) -> dict:
+def migration_worker(count: int, temp_dir: str | None = None, from_version: int = 3) -> dict:
     with tempfile.TemporaryDirectory(prefix="carwash-bench-migrate-", dir=temp_dir) as folder:
-        path = Path(folder) / "legacy.sqlite3"
-        build_a(path, count)
+        path = Path(folder) / f"legacy-v{from_version}.sqlite3"
+        if from_version == 4:
+            build_v4(path, count)
+        else:
+            build_a(path, count)
         before = db_stats(path)
         connection = sqlite3.connect(path)
         try:
@@ -473,14 +525,23 @@ def migration_worker(count: int, temp_dir: str | None = None) -> dict:
             rows_after = connection.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]
             ids_after = [row[0] for row in connection.execute("SELECT id FROM vehicles ORDER BY id")]
             model_count = connection.execute("SELECT COUNT(*) FROM vehicle_models").fetchone()[0]
+            plate_filled = connection.execute(
+                "SELECT COUNT(*) FROM vehicles WHERE plate_key <> ''").fetchone()[0]
+            plate_unknown = connection.execute(
+                "SELECT COUNT(*) FROM vehicles WHERE plate_key = ''").fetchone()[0]
+            plate_sample = connection.execute(
+                "SELECT plate_key FROM vehicles ORDER BY id LIMIT 1").fetchone()[0]
             integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
             foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
         finally:
             connection.close()
-        return {"scale": count, "migration_sec": round(migration_sec, 3),
+        return {"scale": count, "from_version": from_version,
+                "migration_sec": round(migration_sec, 3),
                 "vacuum_sec": round(vacuum_sec, 3),
                 "rows_before": rows_before, "rows_after": rows_after,
                 "ids_preserved": ids_before == ids_after, "catalog_models": model_count,
+                "plate_filled": plate_filled, "plate_unknown": plate_unknown,
+                "plate_sample": plate_sample,
                 "integrity": integrity, "foreign_key_problems": len(foreign_keys),
                 "before": before, "after_migration": after_migration, "after": after,
                 "bytes_saved": before["db_bytes"] - after["db_bytes"],
@@ -495,10 +556,13 @@ def _respond(reply, facts):
 
 
 def _count_calls(database, counts):
-    for name in ("upsert", "deactivate", "list_active"):
+    for name in ("upsert", "deactivate", "list_active", "list_compact_active"):
+        if not hasattr(database, name):
+            continue
         original = getattr(database, name)
-        def wrapper(*args, _original=original, _name=name, **kwargs):
-            counts[_name] = counts.get(_name, 0) + 1
+        key = "list_active" if name in {"list_active", "list_compact_active"} else name
+        def wrapper(*args, _original=original, _key=key, **kwargs):
+            counts[_key] = counts.get(_key, 0) + 1
             return _original(*args, **kwargs)
         setattr(database, name, wrapper)
 
@@ -638,11 +702,11 @@ def print_table(results: dict) -> None:
                    item["concurrent"]["inserts_per_second"],
                    round(item["peak_rss_kb"] / 1024, 1), item["cache"]["cache_kb"])
             print("  ".join(f"{str(value):>12}" for value in row))
-    print("\n=== Миграция v3 -> v4 ===")
+    print("\n=== Миграция v3/v4 -> v5 ===")
     for item in results["migration"]:
-        print(f"{item['scale']:>9}: migrate {item['migration_sec']:>7.3f}s + vacuum {item['vacuum_sec']:>7.3f}s  "
+        print(f"v{item['from_version']} {item['scale']:>9}: migrate {item['migration_sec']:>7.3f}s + vacuum {item['vacuum_sec']:>7.3f}s  "
               f"rows {item['rows_before']}->{item['rows_after']}  ids={item['ids_preserved']}  "
-              f"models={item['catalog_models']}  "
+              f"models={item['catalog_models']}  plate_keys={item['plate_filled']}  "
               f"db {item['before']['db_bytes']/1024/1024:.2f} -> "
               f"{item['after_migration']['db_bytes']/1024/1024:.2f} (migrated) -> "
               f"{item['after']['db_bytes']/1024/1024:.2f} (vacuum) MB  "
@@ -667,19 +731,23 @@ def main() -> int:
     parser.add_argument("--scales", default="1000,10000,100000,1000000")
     parser.add_argument("--skip-ai", action="store_true")
     parser.add_argument("--skip-migration", action="store_true")
+    parser.add_argument("--migration-from", default="3,4", help="исходные версии для миграции")
     parser.add_argument("--json", default="")
     parser.add_argument("--temp-dir", default="", help="каталог для БД (например, SSD или tmpfs)")
     parser.add_argument("--worker", choices=("A", "B", "migrate"))
     parser.add_argument("--scale", type=int, default=0)
+    parser.add_argument("--from-version", type=int, default=3)
     arguments = parser.parse_args()
     if arguments.worker:
         if arguments.worker == "migrate":
-            print(json.dumps(migration_worker(arguments.scale, arguments.temp_dir or None), ensure_ascii=False))
+            print(json.dumps(migration_worker(arguments.scale, arguments.temp_dir or None,
+                                              arguments.from_version), ensure_ascii=False))
         else:
             print(json.dumps(worker(arguments.worker, arguments.scale, arguments.temp_dir or None), ensure_ascii=False))
         return 0
 
     scales = [int(value) for value in arguments.scales.split(",") if value.strip()]
+    migration_from = [int(value) for value in arguments.migration_from.split(",") if value.strip()]
     results = {"db": {}, "migration": [], "ai": {}}
     for scale in scales:
         pair = {}
@@ -696,15 +764,17 @@ def main() -> int:
         print(f"готово: {scale}", flush=True)
     if not arguments.skip_migration:
         for scale in scales:
-            command = [sys.executable, str(Path(__file__).resolve()), "--worker", "migrate", "--scale", str(scale)]
-            if arguments.temp_dir:
-                command.extend(["--temp-dir", arguments.temp_dir])
-            process = subprocess.run(command, capture_output=True, text=True)
-            if process.returncode != 0:
-                print(process.stderr, file=sys.stderr)
-                raise SystemExit(f"Миграция x {scale} завершилась с ошибкой")
-            results["migration"].append(json.loads(process.stdout))
-            print(f"миграция: {scale}", flush=True)
+            for from_version in migration_from:
+                command = [sys.executable, str(Path(__file__).resolve()), "--worker", "migrate",
+                           "--scale", str(scale), "--from-version", str(from_version)]
+                if arguments.temp_dir:
+                    command.extend(["--temp-dir", arguments.temp_dir])
+                process = subprocess.run(command, capture_output=True, text=True)
+                if process.returncode != 0:
+                    print(process.stderr, file=sys.stderr)
+                    raise SystemExit(f"Миграция v{from_version} x {scale} завершилась с ошибкой")
+                results["migration"].append(json.loads(process.stdout))
+                print(f"миграция v{from_version}: {scale}", flush=True)
     if not arguments.skip_ai:
         results["ai"] = ai_benchmark()
     print_table(results)

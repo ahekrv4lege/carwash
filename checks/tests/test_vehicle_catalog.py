@@ -292,11 +292,11 @@ class MigrationTests(unittest.TestCase):
         make_legacy(self.path)
         db = self.open_db()
         saved = db.upsert(111, "toyota camry 3,5", "Кроссовер", "2026-02-01 10:00:00",
-                          tariff="Стандарт", services=["Воск"], plate="х 000 хх 00")
+                          tariff="Стандарт", services=["Воск"], plate="А 123 АВ 77")
         self.assertEqual(saved.id, 101)
         self.assertEqual(saved.name, "Toyota Camry 3.5")
         self.assertEqual(len(raw(self.path, "SELECT * FROM vehicle_models")), 4)
-        self.assertEqual(db.list_active(111)[0].last_plate, "х 000 хх 00")
+        self.assertEqual(db.list_active(111)[0].last_plate, "А 123 АВ 77")
 
     def test_migration_refuses_empty_key_without_changing_database(self):
         rows = legacy_rows() + [(108, 666, "", "", "", "active", "x", "x", "", "[]", "")]
