@@ -73,8 +73,13 @@ def _integrity_problems(path: Path) -> list[str]:
         if result != "ok":
             problems.append("integrity_check: " + str(result))
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version != SCHEMA_VERSION:
-            problems.append(f"версия схемы {version}, ожидается {SCHEMA_VERSION}")
+        # Старые копии остаются восстановимыми: при первом открытии приложение
+        # доведёт их до текущей версии. Копию из будущей версии не принимаем.
+        if version > SCHEMA_VERSION:
+            problems.append(f"версия схемы {version} новее поддерживаемой {SCHEMA_VERSION}")
+        elif version <= 0 and not connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vehicles'").fetchone():
+            problems.append(f"версия схемы {version} не содержит таблицу автомобилей")
         return problems
     finally:
         connection.close()

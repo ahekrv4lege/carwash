@@ -4,6 +4,11 @@ SQLite на диске — единственный источник истин�
 активных клиентов, загружает их лениво и выгружает по простою. Выгрузка из кэша
 никогда не удаляет данные из базы.
 
+Названия моделей вынесены в общий справочник vehicle_models: одинаковая машина
+хранится один раз, а записи клиентов ссылаются на неё по model_id. В строке
+клиента остаются только его собственные данные: Telegram ID, класс, госномер,
+состав последнего заказа и статус.
+
 Запись появляется только после подтверждённой записи (решение Python).
 Владелец строки — Telegram ID; чужие строки не возвращаются и не меняются.
 Удаление — смена статуса, строка не переиспользуется.
@@ -27,13 +32,36 @@ from typing import Callable
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 ACTIVE, DELETED = "active", "deleted"
 MAX_PER_CUSTOMER = 10
 MAX_NAME = 120
 ENTRY_OVERHEAD_BYTES = 240  # ориентировочная стоимость записи кэша без строк
 
 _TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+_VEHICLES_TABLE = (
+    "CREATE TABLE {table} ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " telegram_id INTEGER NOT NULL,"
+    " model_id INTEGER NOT NULL REFERENCES vehicle_models(model_id) ON DELETE RESTRICT,"
+    " size_class TEXT NOT NULL DEFAULT '',"
+    " status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'deleted')),"
+    " created_at TEXT NOT NULL,"
+    " updated_at TEXT NOT NULL,"
+    " last_tariff TEXT NOT NULL DEFAULT '',"
+    " last_services TEXT NOT NULL DEFAULT '',"
+    " last_plate TEXT NOT NULL DEFAULT '')"
+)
+_MODELS_TABLE = (
+    "CREATE TABLE IF NOT EXISTS vehicle_models ("
+    " model_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " model_key TEXT NOT NULL UNIQUE,"
+    " canonical_name TEXT NOT NULL,"
+    " created_at TEXT NOT NULL)"
+)
+_ACTIVE_INDEX = ("CREATE UNIQUE INDEX IF NOT EXISTS vehicles_active_model "
+                 "ON vehicles (telegram_id, model_id) WHERE status = 'active'")
 
 
 class CarMemoryError(RuntimeError):
@@ -81,6 +109,7 @@ class VehicleDatabase:
                     connection = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None, timeout=10)
                     connection.execute("PRAGMA journal_mode=WAL")
                     connection.execute("PRAGMA synchronous=FULL")
+                    connection.execute("PRAGMA foreign_keys=ON")
                     self._migrate(connection)
                 except sqlite3.OperationalError as error:
                     if connection is not None:
@@ -117,7 +146,109 @@ class VehicleDatabase:
         return tuple(str(service) for service in parsed) if isinstance(parsed, list) else ()
 
     @staticmethod
-    def _migrate(connection: sqlite3.Connection) -> None:
+    def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+        return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+    @staticmethod
+    def _tables(connection: sqlite3.Connection) -> set[str]:
+        return {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+
+    @classmethod
+    def _create_schema(cls, connection: sqlite3.Connection) -> None:
+        connection.execute(_MODELS_TABLE)
+        connection.execute(_VEHICLES_TABLE.format(table="vehicles"))
+        connection.execute(_ACTIVE_INDEX)
+
+    @classmethod
+    def _migrate_legacy(cls, connection: sqlite3.Connection) -> None:
+        """v0–v3 -> v4: общий справочник моделей и ссылки model_id.
+
+        Все операции выполняются в одной транзакции вызывающего кода. При любой
+        ошибке (пустой ключ, активный дубль, несовпадение количества строк)
+        транзакция откатывается, user_version остаётся прежним, и приложение
+        не продолжает работу с частично мигрированной базой.
+        """
+        columns = cls._columns(connection, "vehicles")
+        if not {"car_key", "car_name"}.issubset(columns):
+            if "model_id" in columns:
+                raise CarMemoryError(
+                    "Таблица автомобилей уже содержит model_id, но версия схемы не обновлена")
+            raise CarMemoryError("В таблице автомобилей нет car_key/car_name: миграция невозможна")
+        # Очень старые базы (user_version 0) могли не иметь этих колонок.
+        for name, definition in (("last_tariff", "TEXT NOT NULL DEFAULT ''"),
+                                 ("last_services", "TEXT NOT NULL DEFAULT ''"),
+                                 ("last_plate", "TEXT NOT NULL DEFAULT ''")):
+            if name not in columns:
+                connection.execute(f"ALTER TABLE vehicles ADD COLUMN {name} {definition}")
+
+        empty = connection.execute(
+            "SELECT COUNT(*) FROM vehicles WHERE car_key IS NULL OR TRIM(car_key) = '' "
+            "OR car_name IS NULL OR TRIM(car_name) = ''").fetchone()[0]
+        if empty:
+            raise CarMemoryError(
+                f"В базе памяти {empty} записей без названия или ключа автомобиля; "
+                "миграция остановлена без изменения данных")
+        bad_status = connection.execute(
+            "SELECT COUNT(*) FROM vehicles WHERE status IS NULL OR status NOT IN ('active', 'deleted')"
+        ).fetchone()[0]
+        if bad_status:
+            raise CarMemoryError(
+                f"В базе памяти {bad_status} записей с неизвестным статусом; "
+                "миграция остановлена без изменения данных")
+
+        # Каноническое название — самое частое написание ключа. При равенстве
+        # побеждает более раннее, затем алфавитное: результат детерминирован.
+        connection.execute(_MODELS_TABLE)
+        rows = list(connection.execute(
+            "SELECT car_key, car_name, COUNT(*) AS uses, MIN(created_at) AS first_seen "
+            "FROM vehicles GROUP BY car_key, car_name "
+            "ORDER BY car_key, uses DESC, first_seen ASC, car_name ASC"))
+        models, last_key = [], None
+        for key, name, _uses, first_seen in rows:
+            if key == last_key:
+                continue
+            last_key = key
+            models.append((key, name, first_seen or ""))
+        connection.executemany(
+            "INSERT OR IGNORE INTO vehicle_models (model_key, canonical_name, created_at) "
+            "VALUES (?, ?, ?)", models)
+
+        duplicate = connection.execute(
+            "SELECT v.telegram_id, m.model_id, COUNT(*) FROM vehicles v "
+            "JOIN vehicle_models m ON m.model_key = v.car_key "
+            "WHERE v.status = 'active' "
+            "GROUP BY v.telegram_id, m.model_id HAVING COUNT(*) > 1 LIMIT 1").fetchone()
+        if duplicate:
+            raise CarMemoryError(
+                "В базе памяти есть активные дубли одной модели у клиента; "
+                "миграция остановлена без изменения данных")
+
+        before = connection.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]
+        connection.execute("DROP TABLE IF EXISTS vehicles_migrated")
+        connection.execute(_VEHICLES_TABLE.format(table="vehicles_migrated"))
+        connection.execute(
+            "INSERT INTO vehicles_migrated "
+            "(id, telegram_id, model_id, size_class, status, created_at, updated_at, "
+            " last_tariff, last_services, last_plate) "
+            "SELECT v.id, v.telegram_id, m.model_id, COALESCE(v.size_class, ''), v.status, "
+            "       COALESCE(v.created_at, ''), COALESCE(v.updated_at, ''), "
+            "       COALESCE(v.last_tariff, ''), COALESCE(v.last_services, ''), "
+            "       COALESCE(v.last_plate, '') "
+            "FROM vehicles v JOIN vehicle_models m ON m.model_key = v.car_key")
+        after = connection.execute("SELECT COUNT(*) FROM vehicles_migrated").fetchone()[0]
+        if before != after:
+            raise CarMemoryError(
+                f"Миграция потеряла записи ({before} -> {after}); изменения отменены")
+        connection.execute("DROP TABLE vehicles")
+        connection.execute("ALTER TABLE vehicles_migrated RENAME TO vehicles")
+        connection.execute(_ACTIVE_INDEX)
+        problems = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if problems:
+            raise CarMemoryError("Миграция нарушила внешние ключи; изменения отменены")
+
+    @classmethod
+    def _migrate(cls, connection: sqlite3.Connection) -> None:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         if version > SCHEMA_VERSION:
             raise CarMemoryError("База памяти создана более новой версией приложения")
@@ -125,31 +256,18 @@ class VehicleDatabase:
             return
         connection.execute("BEGIN IMMEDIATE")
         try:
-            if version <= 0:
-                connection.execute(
-                    "CREATE TABLE IF NOT EXISTS vehicles ("
-                    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                    " telegram_id INTEGER NOT NULL,"
-                    " car_key TEXT NOT NULL,"
-                    " car_name TEXT NOT NULL,"
-                    " size_class TEXT NOT NULL DEFAULT '',"
-                    " status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'deleted')),"
-                    " created_at TEXT NOT NULL,"
-                    " updated_at TEXT NOT NULL,"
-                    " last_tariff TEXT NOT NULL DEFAULT '',"
-                    " last_services TEXT NOT NULL DEFAULT '',"
-                    " last_plate TEXT NOT NULL DEFAULT '')")
-            else:
-                # Миграция по шагам: v1 -> v2 (состав заказа), v2 -> v3 (госномер).
-                if version < 2:
-                    connection.execute("ALTER TABLE vehicles ADD COLUMN last_tariff TEXT NOT NULL DEFAULT ''")
-                    connection.execute("ALTER TABLE vehicles ADD COLUMN last_services TEXT NOT NULL DEFAULT ''")
-                if version < 3:
-                    connection.execute("ALTER TABLE vehicles ADD COLUMN last_plate TEXT NOT NULL DEFAULT ''")
-            # Уникальность активного дубля обеспечивает сама база, даже при гонке двух записей.
-            connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS vehicles_active_key "
-                               "ON vehicles (telegram_id, car_key) WHERE status = 'active'")
-            connection.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
+            # Пока ждали эксклюзивную блокировку, другой процесс мог уже
+            # выполнить миграцию. Перечитываем версию под блокировкой: иначе
+            # второй открыватель увидел бы готовую v4 и принял её за поломку.
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if version > SCHEMA_VERSION:
+                raise CarMemoryError("База памяти создана более новой версией приложения")
+            if version < SCHEMA_VERSION:
+                if version <= 0 and "vehicles" not in cls._tables(connection):
+                    cls._create_schema(connection)
+                else:
+                    cls._migrate_legacy(connection)
+                connection.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
             connection.execute("COMMIT")
         except Exception:
             connection.execute("ROLLBACK")
@@ -158,14 +276,18 @@ class VehicleDatabase:
     def list_active(self, telegram_id: int) -> list[SavedCar]:
         with self._lock:
             rows = self._db().execute(
-                "SELECT id, car_name, size_class, last_tariff, last_services, last_plate FROM vehicles "
-                "WHERE telegram_id = ? AND status = ? ORDER BY updated_at DESC, id DESC",
+                "SELECT v.id, m.canonical_name, v.size_class, v.last_tariff, "
+                "       v.last_services, v.last_plate "
+                "FROM vehicles v JOIN vehicle_models m ON m.model_id = v.model_id "
+                "WHERE v.telegram_id = ? AND v.status = ? "
+                "ORDER BY v.updated_at DESC, v.id DESC",
                 (int(telegram_id), ACTIVE)).fetchall()
         return [SavedCar(id=row[0], name=row[1], size_class=row[2], last_tariff=row[3] or "",
                          last_services=self._services_list(row[4]), last_plate=row[5] or "") for row in rows]
 
     def upsert(self, telegram_id: int, name: str, size_class: str, now: str,
                tariff: str | None = None, services=None, plate: str | None = None) -> SavedCar | None:
+        name = clean_name(name)
         key = car_key(name)
         if not key:
             return None
@@ -175,21 +297,34 @@ class VehicleDatabase:
             connection = self._db()
             connection.execute("BEGIN IMMEDIATE")
             try:
+                # Атомарно заводим общую модель. ON CONFLICT не даёт двум
+                # одновременным записям создать дубль; каноническое имя уже
+                # существующей модели не перезаписывается.
+                connection.execute(
+                    "INSERT INTO vehicle_models (model_key, canonical_name, created_at) "
+                    "VALUES (?, ?, ?) ON CONFLICT(model_key) DO NOTHING",
+                    (key, name, now))
+                model = connection.execute(
+                    "SELECT model_id, canonical_name FROM vehicle_models WHERE model_key = ?",
+                    (key,)).fetchone()
+                if model is None:  # pragma: no cover - защита от повреждённой базы
+                    raise CarMemoryError("Не удалось определить модель автомобиля")
+                model_id, canonical = model
                 row = connection.execute(
-                    "SELECT id, car_name, last_tariff, last_services, last_plate FROM vehicles "
-                    "WHERE telegram_id = ? AND car_key = ? AND status = ?",
-                    (int(telegram_id), key, ACTIVE)).fetchone()
+                    "SELECT id, last_tariff, last_services, last_plate FROM vehicles "
+                    "WHERE telegram_id = ? AND model_id = ? AND status = ?",
+                    (int(telegram_id), model_id, ACTIVE)).fetchone()
                 if row:
                     # Пустые tariff/services/plate не затирают прошлый заказ: подтверждённая запись
                     # всегда несёт состав, а пустота означает пробой без подтверждения.
-                    tariff_value = (tariff or "") if tariff is not None else (row[2] or "")
-                    services_value = services_text if services_text is not None else (row[3] or "")
-                    plate_value = plate_text if plate_text is not None else (row[4] or "")
+                    tariff_value = (tariff or "") if tariff is not None else (row[1] or "")
+                    services_value = services_text if services_text is not None else (row[2] or "")
+                    plate_value = plate_text if plate_text is not None else (row[3] or "")
                     connection.execute(
-                        "UPDATE vehicles SET size_class = ?, updated_at = ?, last_tariff = ?, last_services = ?, "
-                        "last_plate = ? WHERE id = ?",
+                        "UPDATE vehicles SET size_class = ?, updated_at = ?, last_tariff = ?, "
+                        "last_services = ?, last_plate = ? WHERE id = ?",
                         (size_class, now, tariff_value, services_value, plate_value, row[0]))
-                    saved = SavedCar(id=row[0], name=row[1], size_class=size_class,
+                    saved = SavedCar(id=row[0], name=canonical, size_class=size_class,
                                      last_tariff=tariff_value, last_services=self._services_list(services_value),
                                      last_plate=plate_value)
                 else:
@@ -200,13 +335,14 @@ class VehicleDatabase:
                         log.warning("У клиента достигнут лимит сохранённых автомобилей")
                         return None
                     cursor = connection.execute(
-                        "INSERT INTO vehicles (telegram_id, car_key, car_name, size_class, status, created_at, "
-                        "updated_at, last_tariff, last_services, last_plate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (int(telegram_id), key, name, size_class, ACTIVE, now, now,
+                        "INSERT INTO vehicles (telegram_id, model_id, size_class, status, created_at, "
+                        "updated_at, last_tariff, last_services, last_plate) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (int(telegram_id), model_id, size_class, ACTIVE, now, now,
                          (tariff or "") if tariff is not None else "",
                          services_text if services_text is not None else "",
                          plate_text if plate_text is not None else ""))
-                    saved = SavedCar(id=cursor.lastrowid, name=name, size_class=size_class,
+                    saved = SavedCar(id=cursor.lastrowid, name=canonical, size_class=size_class,
                                      last_tariff=(tariff or "") if tariff is not None else "",
                                      last_services=self._services_list(services_text or ""),
                                      last_plate=plate_text if plate_text is not None else "")

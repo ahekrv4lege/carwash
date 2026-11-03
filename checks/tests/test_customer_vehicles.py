@@ -121,10 +121,11 @@ class DatabaseTests(unittest.TestCase):
         db = self.open_db()
         db.upsert(111, "BMW X5", "Кроссовер", "2026-01-01 10:00:00")
         raw = sqlite3.connect(self.path)
+        self.addCleanup(raw.close)
+        model_id = raw.execute("SELECT model_id FROM vehicle_models WHERE model_key = 'bmw x5'").fetchone()[0]
         with self.assertRaises(sqlite3.IntegrityError):
-            raw.execute("INSERT INTO vehicles (telegram_id, car_key, car_name, size_class, status, created_at, updated_at) "
-                        "VALUES (111, 'bmw x5', 'BMW X5', '', 'active', 'x', 'x')")
-        raw.close()
+            raw.execute("INSERT INTO vehicles (telegram_id, model_id, size_class, status, created_at, updated_at) "
+                        "VALUES (111, ?, '', 'active', 'x', 'x')", (model_id,))
 
     def test_limit_per_customer(self):
         db = self.open_db()
