@@ -1,8 +1,10 @@
 """Целостность идентификаторов записей и защита листа «Записи».
 
-Регрессии аудита: ID записи постоянны и не перенумеровываются сортировкой,
-адресные операции находят строку по постоянному ID, формулы и данные вне
-шапки не разрушаются, адаптивные раскладки не переписываются глобально.
+Нумерация ID — по порядку строк (1..N без пропусков): перенумерация выполняется
+при периодическом обслуживании, после хронологической сортировки и после удаления
+строк при переносе в архив; операции клиента номера не сдвигают. Адресные операции
+находят строку по ID текущей таблицы, формулы и данные вне шапки не разрушаются,
+адаптивные раскладки не переписываются глобально.
 
 Синтетические листы из tests/fakes.py умеют worksheet.update и format,
 поэтому реальный производственный путь перезаписи (refresh_bookings_sheet)
@@ -80,30 +82,29 @@ class IdentityTests(unittest.TestCase):
     def new_id(result):
         return str(result.get("booking_id", ""))
 
-    # ---------- исходный баг: сортировка перенумеровывала ID ----------
+    # ---------- исходный баг: сортировка ломала порядок нумерации ----------
 
-    def test_regression_creating_earlier_booking_must_not_renumber_ids(self):
-        # Хронологический лист с постоянными ID 1 и 2.
+    def test_periodic_sort_keeps_numbering_ascending(self):
+        # Хронологический лист с номерами 1 и 2; новая запись получает 3.
         self.seed(row(1, "01.01.2099", "10:00"), row(2, "02.01.2099", "10:00"))
         result = self.create(date_str="2099-01-01", time_str="09:00")
         self.assertTrue(result["ok"], result)
         self.assertEqual(self.new_id(result), "3")
-        # ID в листе совпадает с возвращённым и не зависит от позиции.
         self.assertEqual(self.ids(), ["1", "2", "3"])
         self.assertEqual(self.records()["3"], ("01.01.2099", "09:00"))
         # Периодическая сортировка ставит новую запись на первое место,
-        # но ID остаются при своих записях.
+        # перенумерация выставляет номера по порядку строк: 1..N по возрастанию.
         self.store.refresh_bookings_sheet(sort=True)
-        self.assertEqual(self.ids(), ["3", "1", "2"])
-        self.assertEqual(self.records(), {"3": ("01.01.2099", "09:00"),
-                                          "1": ("01.01.2099", "10:00"),
-                                          "2": ("02.01.2099", "10:00")})
-        # Отмена по ID после перестановки бьёт в ту же запись.
-        cancelled = self.store.cancel_booking("3", 111)
+        self.assertEqual(self.ids(), ["1", "2", "3"])
+        self.assertEqual(self.records(), {"1": ("01.01.2099", "09:00"),
+                                          "2": ("01.01.2099", "10:00"),
+                                          "3": ("02.01.2099", "10:00")})
+        # Отмена по свежему номеру бьёт в ту же запись (раньше это был ID 3).
+        cancelled = self.store.cancel_booking("1", 111)
         self.assertTrue(cancelled["ok"], cancelled)
-        self.assertEqual(self.records()["3"], ("01.01.2099", "09:00"))
+        self.assertEqual(self.records()["1"], ("01.01.2099", "09:00"))
         self.assertEqual(str(self.sheet.values[1][STATUS]), "Отмена")
-        self.assertEqual(self.ids(), ["3", "1", "2"])
+        self.assertEqual(self.ids(), ["1", "2", "3"])
 
     def test_real_rewrite_path_is_exercised(self):
         # Инфраструктура: сортировка действительно выполняет worksheet.update,
@@ -111,14 +112,15 @@ class IdentityTests(unittest.TestCase):
         self.seed(row(1, "03.01.2099", "10:00"), row(2, "01.01.2099", "10:00"))
         self.assertEqual(self.sheet.updates, [])
         self.store.refresh_bookings_sheet(sort=True)
-        self.assertEqual(len(self.sheet.updates), 1)
+        # Две перезаписи: хронологическая перестановка строк и перенумерация ID.
+        self.assertEqual(len(self.sheet.updates), 2)
         written = self.sheet.updates[0]
         self.assertTrue(written["range"].startswith("A2:"))
         self.assertEqual(written["value_input_option"] if "value_input_option" in written else None, None)
-        self.assertEqual([values[ID] for values in self.sheet.values[1:]], ["2", "1"])
-        # Повторная сортировка ничего не меняет — перезаписи нет.
+        self.assertEqual([values[ID] for values in self.sheet.values[1:]], ["1", "2"])
+        # Повторная сортировка ничего не меняет — перезаписей больше нет.
         self.store.refresh_bookings_sheet(sort=True)
-        self.assertEqual(len(self.sheet.updates), 1)
+        self.assertEqual(len(self.sheet.updates), 2)
 
     # ---------- создание ----------
 
@@ -158,9 +160,11 @@ class IdentityTests(unittest.TestCase):
         created = self.create(date_str="2099-01-04", time_str="10:00")
         self.assertEqual(self.new_id(created), "13")
         self.assertEqual(self.ids(), ["5", "12", "13"])
+        # Обслуживание выставляет номера по порядку строк: пропусков больше нет.
         self.store.refresh_bookings_sheet(sort=True)
-        self.assertEqual(self.ids(), ["5", "12", "13"])
-        self.assertEqual(self.records()["13"], ("04.01.2099", "10:00"))
+        self.assertEqual(self.ids(), ["1", "2", "3"])
+        self.assertEqual(self.records()["3"], ("04.01.2099", "10:00"))
+        self.assertEqual(str(self.sheet.values[2][STATUS]), "Отмена")  # прежний ID 12
 
     def test_duplicate_and_malformed_legacy_ids(self):
         self.seed(row(7, "01.01.2099", "10:00"), row(7, "02.01.2099", "10:00"),
@@ -174,7 +178,9 @@ class IdentityTests(unittest.TestCase):
         self.assertTrue(created["ok"], created)
         self.assertEqual(self.new_id(created), "8")
         self.store.refresh_bookings_sheet(sort=True)
-        self.assertEqual(self.ids(), ["7", "7", "abc", "", "8"])
+        # Обслуживание выставляет номера по порядку строк, включая строки
+        # с наследственными и пустыми ID.
+        self.assertEqual(self.ids(), ["1", "2", "3", "4", "5"])
 
     # ---------- отмена и перенос ----------
 
@@ -223,8 +229,9 @@ class IdentityTests(unittest.TestCase):
         moved = self.store.reschedule_booking("301", 111, "2099-01-04", "10:00")
         self.assertTrue(moved["ok"], moved)
         self.store.refresh_bookings_sheet(sort=True)
-        self.assertEqual(self.ids(), ["302", "303", "301"])
-        self.assertEqual(self.records()["301"], ("04.01.2099", "10:00"))
+        # Обслуживание сортирует по хронологии и выставляет номера по порядку строк.
+        self.assertEqual(self.ids(), ["1", "2", "3"])
+        self.assertEqual(self.records()["3"], ("04.01.2099", "10:00"))  # прежний ID 301
 
     # ---------- защита данных листа ----------
 
@@ -275,10 +282,32 @@ class IdentityTests(unittest.TestCase):
             rows.append([values[index] for index in order])
         self.sheet.values = [shuffled_headers, *rows]
         self.store.refresh_bookings_sheet(sort=True)
-        self.assertEqual([str(values[2]) for values in self.sheet.values[1:]], ["702", "701"])
+        # Сортировка и перенумерация работают через поиск колонок по имени.
+        self.assertEqual([str(values[2]) for values in self.sheet.values[1:]], ["1", "2"])
         self.assertEqual([str(values[0]) for values in self.sheet.values[1:]], ["01.01.2099", "02.01.2099"])
-        cancelled = self.store.cancel_booking("701", 111)
+        cancelled = self.store.cancel_booking("1", 111)  # была запись 702
         self.assertTrue(cancelled["ok"], cancelled)
+        status_index = shuffled_headers.index("Статус")
+        self.assertEqual(str(self.sheet.values[1][status_index]), "Отмена")
+
+    def test_archive_marks_permuted_status_column_by_name(self):
+        # При переставленной шапке архивация пишет «Архив» в колонку «Статус» по имени,
+        # остальные данные строки не затрагивает.
+        order = [STATUS, DATE, ID] + [index for index in range(len(HEADERS)) if index not in {STATUS, DATE, ID}]
+        shuffled_headers = [HEADERS[index] for index in order]
+        def line(item_id, date_str, status):
+            values = row(item_id, date_str, "18:00", status=status)
+            return [values[index] for index in order]
+        self.sheet.values = [shuffled_headers, line("1", "01.01.2024", "Новая"),
+                             line("2", "01.01.2024", "Отмена"), line("3", "01.01.2099", "Новая")]
+        self.assertEqual(self.store.archive_old_bookings(), 1)
+        status_index = shuffled_headers.index("Статус")
+        self.assertEqual(str(self.sheet.values[1][status_index]), "Архив")
+        self.assertEqual(str(self.sheet.values[2][status_index]), "Отмена")
+        self.assertEqual(str(self.sheet.values[3][status_index]), "Новая")
+        identity_index = shuffled_headers.index("ID")
+        for row_number, item_id in zip((1, 2, 3), ("1", "2", "3")):
+            self.assertEqual(str(self.sheet.values[row_number][identity_index]), item_id)
 
     # ---------- конкуренция и повторы ----------
 
@@ -357,33 +386,31 @@ class IdentityTests(unittest.TestCase):
         self.sheet.values.append(row(1001, "02.01.2099", "10:00"))
         self.store.refresh_bookings_sheet(sort=True)
         self.assertEqual(len(self.sheet.values), 2)
-        self.assertEqual(self.sheet.updates, [])
+        # Одиночная строка тоже приводится к нумерации с единицы.
+        self.assertEqual(str(self.sheet.values[1][ID]), "1")
 
-    def test_archive_then_periodic_sort_keeps_ids(self):
+    def test_archive_then_periodic_sort_renumbers(self):
         self.seed(row(1101, "03.01.2099", "10:00"), row(1102, "01.01.2020", "10:00"), row(1103, "01.01.2099", "10:00"))
         self.assertEqual(self.store.archive_old_bookings(), 1)
         self.store.refresh_bookings_sheet(sort=True)
-        self.assertEqual(self.ids(), ["1102", "1103", "1101"])
+        self.assertEqual(self.ids(), ["1", "2", "3"])
         self.assertEqual(str(self.sheet.values[1][STATUS]), "Архив")
-        self.assertEqual(self.records()["1101"], ("03.01.2099", "10:00"))
+        self.assertEqual(self.records()["3"], ("03.01.2099", "10:00"))  # прежний ID 1101
 
-    def test_large_sheet_sort_is_one_update_and_ids_stay_put(self):
+    def test_large_sheet_sort_is_two_updates_and_renumbered(self):
         count = 2000
         rows = [row(index, f"01.{(index % 12) + 1:02d}.2099", f"{9 + index % 10:02d}:{index % 60:02d}")
                 for index in range(count, 0, -1)]
         self.seed(*rows)
         self.assertEqual(self.ids()[0], str(count))
         self.store.refresh_bookings_sheet(sort=True)
-        self.assertEqual(len(self.sheet.updates), 1)
+        # Две перезаписи: хронологическая перестановка строк и перенумерация ID-колонки.
+        self.assertEqual(len(self.sheet.updates), 2)
         self.assertEqual(len(self.sheet.values) - 1, count)
-        identifiers = self.ids()
-        self.assertEqual(sorted(map(int, identifiers)), list(range(1, count + 1)))
-        self.assertEqual(self.ids(), identifiers)  # сортировка не меняет сами ID
+        self.assertEqual(self.ids(), [str(number) for number in range(1, count + 1)])
         target = self.store.cancel_booking("777", 111)
         self.assertTrue(target["ok"], target)
-        index = identifiers.index("777")
-        position = self.ids().index("777")
-        self.assertEqual(str(self.sheet.values[position + 1][STATUS]), "Отмена")
+        self.assertEqual(str(self.sheet.values[777][STATUS]), "Отмена")
 
     # ---------- адаптивные раскладки ----------
 

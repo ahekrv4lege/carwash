@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 from ai import Agent, ChatUser
 from conversation import model_state, validate_patch
+from sheets import BOOKING_HEADERS
 from tests.fakes import fixture
 from tests.test_conversation import ARGS, response
 
@@ -111,6 +112,36 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(values[2][-1], "Отмена")
         self.assertEqual(values[3][-1], "Новая")
         self.assertEqual(self.store.archive_old_bookings(), 0)
+
+    def test_archive_hits_status_column_by_adapter_map_when_headers_move(self):
+        # Регрессия: колонку «Статус» брали по каноническому индексу (всегда 16), а не
+        # по карте адаптива — перестановка колонок направляла «Архив» в чужое поле.
+        sheet = self.spreadsheet.worksheet("Записи")
+        layout = (["Бонус", "Статус"]
+                  + [header for header in BOOKING_HEADERS if header != "Статус"])
+        sheet.values = [layout]
+        self.store.refresh_schema(force=True)
+
+        def record(item_id, date_str, status):
+            canonical = dict(zip(BOOKING_HEADERS, [str(item_id), "", date_str, "18:00", "Иван",
+                                                   "89994994944", "Lada Priora", "Легковой",
+                                                   "", "", "", "700", "", "111", "", status]))
+            return [canonical.get(header, "") for header in layout]
+
+        sheet.values.append(record("1", "01.01.2024", "Новая"))  # прошедшая: будет «Архив»
+        sheet.values.append(record("2", "01.01.2024", "Отмена"))  # уже отменена — не трогаем
+        sheet.values.append(record("3", "01.01.2099", "Новая"))  # будущая — не трогаем
+        self.assertEqual(self.store.archive_old_bookings(), 1)
+        values = sheet.values
+        status_index = layout.index("Статус")
+        self.assertEqual(str(values[1][status_index]), "Архив")
+        self.assertEqual(str(values[2][status_index]), "Отмена")
+        self.assertEqual(str(values[3][status_index]), "Новая")
+        # Остальные данные и неизвестная адаптеру колонка сохранены как были.
+        for row in (1, 2, 3):
+            self.assertEqual(str(values[row][layout.index("Сумма")]), "700")
+            self.assertEqual(str(values[row][layout.index("Автомобиль")]), "Lada Priora")
+            self.assertEqual(str(values[row][layout.index("Бонус")]), "")
 
     async def test_recognized_car_model_in_proposal_and_sheet(self):
         self.agent._state[111] = {"facts": dict(ARGS, car="бив м5", car_model="BMW M5")}
@@ -328,7 +359,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)
 
     async def test_revision_schema_allows_known_fields_without_changing_facts(self):
-        self.agent._state[111] = {"facts": dict(ARGS), "stage": "collecting", "quote": {"total": 630}}
+        self.agent._state[111] = {"facts": {**ARGS, "plate": "а 123 ав 77"}, "stage": "collecting", "quote": {"total": 630}}
         schema = next(tool["function"]["parameters"] for tool in self.agent._tools(self.user)
                       if tool["function"]["name"] == "create_booking")
         self.assertIn("time", schema["properties"])
@@ -415,13 +446,14 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
             return next(tool["function"]["parameters"] for tool in self.agent._tools(self.user)
                         if tool["function"]["name"] == "create_booking")
         self.agent._state[111] = {"facts": {key: value for key, value in ARGS.items() if key != "phone"}}
-        self.assertEqual(schema()["required"], ["phone"])
+        # Госномер обязателен по умолчанию (CAR_PLATE_REQUIRED=true).
+        self.assertEqual(schema()["required"], ["phone", "plate"])
         self.assertIn("phone", schema()["properties"])
         self.assertNotIn("car", schema()["properties"])
         self.agent._state[111]["facts"]["phone"] = ARGS["phone"]
-        self.assertEqual(schema()["required"], [])
+        self.assertEqual(schema()["required"], ["plate"])
         self.agent._state[111]["facts"].clear()
-        self.assertEqual(set(schema()["required"]), {"date", "time", "client_name", "phone", "car", "size_class"})
+        self.assertEqual(set(schema()["required"]), {"date", "time", "client_name", "phone", "car", "size_class", "plate"})
         self.assertEqual(SCHEMAS["create_booking"]["required"], [])
 
     async def test_memory_repair_sends_only_the_forced_tool_schema(self):

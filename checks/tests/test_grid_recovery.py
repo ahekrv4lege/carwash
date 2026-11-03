@@ -163,6 +163,66 @@ class GridAuditTests(RestartTestCase):
         self.assertEqual(self.grid.values[2][1], f"Запись {created['booking_id']}")
 
 
+class CreateRecoveryTests(RestartTestCase):
+    """Неопределённый итог создания: сверка по постоянному ID, без повторов вслепую."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+
+    def identity_key(self):
+        return fingerprint({"telegram id": "111", "дата": "01.01.2099", "время": "10:00",
+                            "автомобиль": "fixture car"})
+
+    def journal_path(self, store):
+        return store._adaptive.path.with_name(store._adaptive.path.stem + "-operations.json")
+
+    def test_resume_after_unknown_outcome_repeats_without_duplicates(self):
+        store, spreadsheet, grid = grid_fixture(self.temp.name)
+        spreadsheet.worksheet("Записи").fail_write = True
+        with patch.object(store._adaptive, "_booking_row_state", return_value=None):
+            with self.assertRaisesRegex(MappingError, "записи неизвестен"):
+                store.create_booking(**booking())
+        spreadsheet.worksheet("Записи").fail_write = False
+        pending = [entry for entry in self.journal(store).values() if entry["state"] == "pending"]
+        self.assertEqual(len(pending), 1)
+        # Строка фактически не дошла до листа: сверка снимает журнал, повтор завершает запись.
+        created = store.create_booking(**booking())
+        self.assertTrue(created["ok"], created)
+        rows = spreadsheet.worksheet("Записи").values[1:]
+        self.assertEqual(len(rows), 1)  # ровно одна строка записи, дублей нет
+        self.assertEqual(self.journal(store)[self.identity_key()]["state"], "done")
+
+    def test_repeated_request_settles_journal_when_row_exists(self):
+        store, spreadsheet, grid = grid_fixture(self.temp.name)
+        created = store.create_booking(**booking())
+        # Симуляция потерянного финала: строка на листе есть, журнал остался pending.
+        self.journal_path(store).write_text(json.dumps(
+            {self.identity_key(): {"state": "pending", "sheet_id": 4, "row": 2, "at": 0.0,
+                                   "id": str(created["booking_id"])}}), encoding="utf-8")
+        repeated = store.create_booking(**booking())
+        self.assertFalse(repeated["ok"])
+        self.assertIn("уже есть", repeated["error"])
+        self.assertEqual(str(repeated["booking_id"]), str(created["booking_id"]))
+        self.assertEqual(len(spreadsheet.worksheet("Записи").values[1:]), 1)  # дубль не создан
+        self.assertEqual(self.journal(store)[self.identity_key()]["state"], "done")  # свёрнуто по ID
+
+    def test_occupied_row_without_booking_id_stays_blocked(self):
+        store, spreadsheet, grid = grid_fixture(self.temp.name)
+        self.journal_path(store).write_text(json.dumps(
+            {self.identity_key(): {"state": "pending", "sheet_id": 4, "row": 2, "at": 0.0, "id": "1"}}),
+            encoding="utf-8")
+        spreadsheet.worksheet("Записи").values.append(
+            ["", "", "", "", "Аноним", "", "", "", "", "", "", "", "", "", "", ""])  # чужие данные без ID
+        # Чужая строка без записи делает чтение листа невозможным: запись не выполняется,
+        # журнал с уликами сохранён для ручной сверки, лист не изменён.
+        with self.assertRaises(MappingError):
+            store.create_booking(**booking())
+        pending = [entry for entry in self.journal(store).values() if entry["state"] == "pending"]
+        self.assertEqual(len(pending), 1)  # журнал с уликами сохранён для ручной сверки
+        self.assertEqual(len(spreadsheet.worksheet("Записи").values[1:]), 1)  # лист не изменён
+
+
 class RescheduleRecoveryTests(RestartTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

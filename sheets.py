@@ -68,6 +68,11 @@ SERVICE_FIXED_COLS = {"услуга", "описание", "доступна", "�
 # Колонки листа «Записи». Порядок в таблице может быть любым — бот ищет колонки по названию.
 BOOKING_HEADERS = BOOKING_FIELDS
 
+# Фоны строк в RGB 0..1: отмена — красноватый, архив и прошедшее — серый, пустой ряд — белый.
+CANCEL_COLOR = (0.98, 0.80, 0.80)
+ARCHIVE_COLOR = (0.93, 0.93, 0.93)
+WHITE_COLOR = (1.0, 1.0, 1.0)
+
 
 # ───────────────────────────── вспомогательные функции ─────────────────────────────
 
@@ -958,11 +963,42 @@ class Store:
             return report
 
     def analytics_snapshot(self) -> tuple[list[dict[str, Any]], dict]:
-        """Свежие строки «Записи» и вместимость «Слоты» для статистики (только чтение)."""
+        """Свежие строки «Записей» и архива и вместимость «Слотов» для статистики.
+
+        Отменённые и архивные записи живут в листе «Архив», но метрики периода
+        (доля отмен, выполненные) должны считаться как раньше, — строки архива
+        добавляются к строкам «Записей».
+        """
         with self._lock:
             self._invalidate("bookings", "slots")
-            _, rows = self._get_bookings()
+            rows = self._get_bookings()[1] + self._archive_rows()
             return rows, self._get_slots()
+
+    def _archive_rows(self) -> list[dict[str, Any]]:
+        """Строки архивного листа в том же виде, что возвращает _table.
+
+        Лист служебный и в картах адаптива не участвует, поэтому читается напрямую;
+        отсутствует или не читается — статистика считается без него.
+        """
+        try:
+            values = self._get_spreadsheet().worksheet(self.config.sheet_archive).get_all_values()
+        except (WorksheetNotFound, StopIteration):
+            return []
+        except Exception as error:
+            log.warning("Архив для статистики не прочитан (%s)", type(error).__name__)
+            return []
+        headers = [str(header).strip() for header in values[0]] if values else []
+        rows: list[dict[str, Any]] = []
+        for index, raw in enumerate(values[1:], start=2):
+            if not any(str(cell).strip() for cell in raw):
+                continue
+            record: dict[str, Any] = {
+                header: (raw[column_index] if column_index < len(raw) else "")
+                for column_index, header in enumerate(headers) if header
+            }
+            record["__row__"] = index
+            rows.append(record)
+        return rows
 
     def _load_bookings(self) -> tuple[list[str], list[dict[str, Any]]]:
         return self._table(self.config.sheet_bookings)
@@ -1105,7 +1141,7 @@ class Store:
     def create_booking(
         self, *, date_str: str, time_str: str, name: str, phone: str, car: str,
         size_class: str, tariff: str | None, services: list[str], comment: str,
-        telegram_id: int, username: str | None,
+        telegram_id: int, username: str | None, plate: str = "",
         expected_quote: dict | None = None,
     ) -> dict:
         booking_date, booking_time = parse_date(date_str), parse_time(to_work_time(time_str))
@@ -1137,10 +1173,20 @@ class Store:
             self._invalidate("slots", "bookings")  # слоты и записи — только свежие данные
             slots = self._get_slots()
             headers, booking_rows = self._get_bookings()
+            # Госномер обязателен только если настройка включена и в таблице есть колонка:
+            # старые таблицы без поля продолжают работать.
+            plate = (plate or "").strip()[:40]
+            plate_column_present = ("Госномер" in self._adaptive.booking_fields()) if self._adaptive else "Госномер" in headers
+            if self.config.car_plate_required and not plate and plate_column_present:
+                return _failure("Не указан госномер автомобиля")
             duplicate = next((record for record in booking_rows if pick(record, "Telegram ID") == str(telegram_id)
                               and parse_date(pick(record, "Дата")) == booking_date and parse_time(pick(record, "Время")) == booking_time
                               and pick(record, "Автомобиль").casefold() == car.casefold() and self._is_active(record)), None)
             if duplicate:
+                # Повтор запроса после потерянного ответа: сверяем незакрытый журнал создания
+                # по постоянному ID и подтверждаем оригинал, вторая строка не создаётся.
+                if self._adaptive:
+                    self._adaptive.settle_create(pick(duplicate, "ID"), telegram_id)
                 return _failure("У клиента уже есть такая запись", booking_id=pick(duplicate, "ID"))
             duration_minutes = None
             if isinstance(slots, DurationSchedule):
@@ -1210,6 +1256,7 @@ class Store:
                 "telegram id": str(telegram_id),
                 "username": f"@{username}" if username else "",
                 "статус": "Новая",
+                "госномер": plate,
                 **({} if duration_minutes is None else {"длительность": str(duration_minutes)}),
             }
             if self._adaptive:
@@ -1244,11 +1291,15 @@ class Store:
     # ---------- записи клиента ----------
     @staticmethod
     def _next_booking_id(rows: list[dict]) -> int:
-        """Постоянный идентификатор записи: максимум среди известных ID + 1.
+        """Номер новой записи: максимум среди известных ID + 1.
 
-        ID живёт вечно: сортировка, отмена, перенос и архивация его не меняют.
-        Отменённые и архивные строки сохраняют ID и защищают его от повторного
-        использования; нечисловые наследственные ID при выделении игнорируются.
+        Между циклами обслуживания номера растут и заново не используются:
+        отменённые и архивные строки сохраняют ID и защищают его от повторного
+        выделения; нечисловые наследственные ID при выделении игнорируются.
+        Периодическая перенумерация (после хронологической сортировки и после
+        удаления строк при переносе в архив) выставляет номера по порядку строк
+        заново, поэтому ссылка на запись по номеру надёжна внутри интервала
+        между циклами обслуживания.
         """
         identifiers = [int(item) for item in (pick(record, "ID") for record in rows) if str(item).isdigit()]
         return max(identifiers, default=0) + 1
@@ -1256,9 +1307,11 @@ class Store:
     def refresh_bookings_sheet(self, *, sort: bool = False) -> None:
         """«Записи»: цветовая разметка строк; сортировка — только по явному запросу.
 
-        Идентификаторы записей постоянны: сортировка, создание, отмена, перенос
-        и архивация никогда не перенумеровывают колонку «ID» и не меняют ID
-        у существующих строк.
+        Нумерация ID держится по порядку строк (1..N без пропусков): перенумерация
+        выполняется при периодическом обслуживании после сортировки и после
+        удаления строк при переносе в архив. Операции клиента (создание, отмена,
+        перенос) номера не сдвигают, чтобы ссылки по ID не менялись посреди диалога;
+        новая запись получает максимум известных ID + 1.
 
         Физическая перестановка строк (sort=True, периодическое обслуживание)
         выполняется только когда она безопасна:
@@ -1282,6 +1335,7 @@ class Store:
             headers, body = values[0], values[1:]
             if sort:
                 body = self._sort_bookings_body(worksheet, headers, body) or body
+                self._renumber_booking_ids(worksheet, headers)
             self._paint_bookings(worksheet, headers, body)
             self._invalidate("bookings")
 
@@ -1324,6 +1378,56 @@ class Store:
         worksheet.update(f"A2:{last_column}{len(body) + 1}", ordered_raw, value_input_option="RAW")
         return [list((body[index] + [""] * width)[:width]) for index in order]
 
+    def _renumber_booking_ids(self, worksheet, headers: list[str]) -> int:
+        """Перенумерация колонки «ID» по порядку строк: 1..N по возрастанию без пропусков.
+
+        Нумерация листа — пользовательская: после удаления строк (перенос в архив,
+        правка администратором) и хронологической сортировки номера выставляются
+        заново сверху вниз. Выполняется только при обслуживании (sort-путь и следом
+        за удалениями при переносе в архив) — операции клиента номера не сдвигают.
+        Безопасность: пустые ряды среди данных сначала убирает перенос в архив,
+        поэтому перенумерация их ждёт; формулы в данных и колонка «ID» с формулой
+        блокируют перезапись; адаптивные раскладки не трогаются (их маркеры
+        «Запись <ID>» завязаны на текущие номера). Возвращает число строк.
+        """
+        if self._adaptive:
+            return 0
+        id_index = header_index(headers, "ID", "id")
+        if id_index is None:
+            return 0
+        try:
+            values = worksheet.get_all_values(value_render_option="FORMULA")
+        except Exception as error:
+            log.warning("«Записи»: ID не перенумерованы — лист не прочитан (%s)", type(error).__name__)
+            return 0
+        if len(values) < 2:
+            return 0
+        if any(str(cell).startswith("=") for row_values in values[1:] for cell in row_values):
+            log.warning("«Записи»: в данных есть формулы — перенумерация ID пропущена")
+            return 0
+        filled = [index for index, row_values in enumerate(values[1:], 1)
+                  if any(str(cell).strip() for cell in row_values)]
+        if not filled:
+            return 0
+        last = filled[-1]
+        if len(filled) != last:
+            return 0  # пустые ряды среди данных уберёт перенос в архив, следом перенумерация
+        current = [str(row_values[id_index]).strip() if id_index < len(row_values) else ""
+                   for row_values in values[1:last + 1]]
+        expected = [str(number) for number in range(1, last + 1)]
+        if current == expected:
+            return 0  # нумерация уже по порядку
+        letter = re.match(r"[A-Z]+", cell_name(1, id_index + 1)).group()
+        grid = [[number] for number in expected]
+        try:
+            worksheet.update(f"{letter}2:{letter}{last + 1}", grid, value_input_option="RAW")
+        except AttributeError:
+            # Синтетические листы в тестах умеют только поячеечную запись.
+            for offset, value in enumerate(grid, start=2):
+                worksheet.update_cell(offset, id_index + 1, value[0])
+        log.info("«Записи»: колонка «ID» перенумерована по порядку строк: %d строк", last)
+        return last
+
     def _paint_bookings(self, worksheet, headers, rows) -> None:
         if not hasattr(worksheet, "format"):
             return
@@ -1347,22 +1451,64 @@ class Store:
             if created is not None and created.tzinfo is None:
                 created = created.replace(tzinfo=self.timezone)
             if status.startswith("отмен"):
-                color = (0.98, 0.80, 0.80)  # отмена - красноватый
+                color = CANCEL_COLOR  # отмена - красноватый
             elif status.startswith("архив") or (booking_date and booking_date < today):
-                color = (0.93, 0.93, 0.93)  # прошлое - серый
+                color = ARCHIVE_COLOR  # прошлое - серый
             elif created and (now_value - created) <= timedelta(hours=24):
                 color = (0.85, 0.94, 0.82)  # новая за сутки - зелёный
             elif booking_date and booking_date >= today:
                 color = (1.0, 0.97, 0.78)  # предстоящая - жёлтый
+            elif not any(str(cell).strip() for cell in row):
+                color = WHITE_COLOR  # пустой ряд сбрасываем в белый: старая краска не должна висеть
             else:
-                color = (0.93, 0.93, 0.93)
+                color = ARCHIVE_COLOR
             colors.setdefault(color, []).append(f"A{sheet_row}:{last_col}{sheet_row}")
         # Один HTTP-запрос на цвет: gspread объединяет список диапазонов в один batch_update.
         for color, ranges in colors.items():
             worksheet.format(ranges, {"backgroundColor": {"red": color[0], "green": color[1], "blue": color[2]}})
 
+    def _paint_archive_sheet(self, archive) -> None:
+        """Архивный лист: отменённые записи — красным, остальной архив — серым.
+
+        Раскраска идёт по колонке «Статус»: отмены видно сразу среди истории.
+        Пустые ряды сбрасываются в белый, чтобы старая краска не висела.
+        """
+        if not hasattr(archive, "format"):
+            return
+        try:
+            values = archive.get_all_values()
+        except Exception as error:
+            log.warning("Архив: лист не раскрашен — не прочитан (%s)", type(error).__name__)
+            return
+        if len(values) < 2:
+            return
+        headers = [str(header).strip() for header in values[0]]
+        status_index = header_index(headers, "Статус", "status")
+        last_col = chr(ord("A") + len(headers) - 1) if 0 < len(headers) <= 26 else "Z"
+        colors: dict[tuple[float, float, float], list[str]] = {}
+        for offset, row_values in enumerate(values[1:]):
+            sheet_row = offset + 2
+            status = (str(row_values[status_index]).strip().lower()
+                      if status_index is not None and status_index < len(row_values) else "")
+            if not any(str(cell).strip() for cell in row_values):
+                color = WHITE_COLOR  # пустой ряд сбрасываем в белый
+            elif status.startswith("отмен"):
+                color = CANCEL_COLOR  # отмена - красный
+            else:
+                color = ARCHIVE_COLOR  # архив - серый
+            colors.setdefault(color, []).append(f"A{sheet_row}:{last_col}{sheet_row}")
+        # Один HTTP-запрос на цвет: gspread объединяет список диапазонов в один batch_update.
+        for color, ranges in colors.items():
+            archive.format(ranges, {"backgroundColor": {"red": color[0], "green": color[1], "blue": color[2]}})
+
     def archive_old_bookings(self) -> int:
-        """Прошедшие даты со статусом «Новая» помечаем «Архив»."""
+        """Прошедшие даты со статусом «Новая» помечаем «Архив».
+
+        Колонку «Статус» берём из карты адаптива (rule["columns"]) — это физический
+        адрес колонки листа. Позиция в каноническом списке полей (headers.index)
+        с физикой не совпадает при перестановке колонок и направила бы «Архив»
+        в чужое поле. Остальные данные строки не затрагиваются.
+        """
         from adaptive import cell_name
 
         today = self.now().date()
@@ -1370,18 +1516,31 @@ class Store:
             headers, rows = self._table(self.config.sheet_bookings)
             if not rows or "Статус" not in headers:
                 return 0
-            status_col = headers.index("Статус") + 1
-            worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
-            updates, cells = [], []
+            candidates = []
             for record in rows:
                 booking_date = parse_date(str(record.get("Дата", "")))
                 status = str(record.get("Статус", "")).strip()
                 if (booking_date and booking_date < today
                         and (not status or status.lower().startswith("нов"))):
-                    updates.append({"range": cell_name(record["__row__"], status_col), "values": [["Архив"]]})
-                    cells.append((record["__row__"], status_col))
-            if not updates:
+                    candidates.append(record)
+            if not candidates:
                 return 0
+            if self._adaptive:
+                status_columns = {}
+                for sheet_id in {record["__sheet_id__"] for record in candidates}:
+                    try:
+                        status_columns[sheet_id] = self._adaptive.writable_column(sheet_id, "Статус")
+                    except MappingError as error:
+                        log.warning("Архивация остановлена: %s", error)
+                        return 0  # статус пишем только в подтверждённую картой колонку
+            else:
+                status_columns = {0: headers.index("Статус") + 1}
+            updates, cells = [], []
+            for record in candidates:
+                column = status_columns[record["__sheet_id__"] if self._adaptive else 0]
+                updates.append({"range": cell_name(record["__row__"], column), "values": [["Архив"]]})
+                cells.append((record["__row__"], column))
+            worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
             try:
                 worksheet.batch_update(updates, value_input_option="RAW")
             except AttributeError:
@@ -1391,6 +1550,252 @@ class Store:
             changed = len(updates)
             self._invalidate("bookings")
             return changed
+
+    def move_archived_bookings(self) -> int:
+        """Записи со статусами «Архив» и «Отмена» переносятся в отдельный архивный лист.
+
+        Статус «Архив» ставит archive_old_bookings прошедшим датам; отменённые
+        записи («Отмена») уезжают в архив сразу, независимо от даты, — в «Записях»
+        остаются только живые записи. Лист хранит id и все данные записи
+        (услуги, состав, сумму, статус) с той же шапкой, что у «Записей»;
+        создаётся при первом переносе (имя — SHEET_ARCHIVE, по умолчанию
+        «Архив»). Перенос идемпотентен: дубль — это та же запись, у которой
+        совпали неизменяемые поля (ID, создано, дата, время, телефон); по одному
+        ID сверяться нельзя — после перенумерации номера в «Записях» начинаются
+        заново и совпадают с давними архивными. После успешной копии исходная
+        строка удаляется из «Записей» физически; пустые ряды (в том числе
+        оставшиеся от прежних чисток) убираются при каждом цикле — без пустых
+        промежутков, следом колонка «ID» перенумеровывается по порядку строк.
+        Строки с формулами или данными правее зоны бота не трогаются.
+        Записи без распознанного ID не переносятся. Архивный лист раскрашивается:
+        отмены — красным, остальной архив — серым; лист служебный, вне карт
+        адаптива. Возвращает число скопированных записей.
+        """
+        with self._lock:
+            headers, rows = self._table(self.config.sheet_bookings)
+            candidates = []
+            for record in rows:
+                status = pick(record, "Статус").lower()
+                booking_id = pick(record, "ID")
+                if (status.startswith("архив") or status.startswith("отмен")) and booking_id:
+                    candidates.append((booking_id, record))
+            copied, to_clear = 0, []
+            if candidates:
+                spreadsheet = self._get_spreadsheet()
+                try:
+                    archive = spreadsheet.worksheet(self.config.sheet_archive)
+                    existing = archive.get_all_values()
+                except (WorksheetNotFound, StopIteration):
+                    try:
+                        archive = spreadsheet.add_worksheet(self.config.sheet_archive,
+                                                            rows=max(100, len(rows) + 1),
+                                                            cols=max(16, len(headers)))
+                    except AttributeError:
+                        log.warning("Архив: лист «%s» не создан — перенос пропущен",
+                                    self.config.sheet_archive)
+                        return 0
+                    archive.append_row(list(headers), value_input_option="RAW")
+                    existing = [list(headers)]
+                if not existing:
+                    archive.append_row(list(headers), value_input_option="RAW")
+                    existing = [list(headers)]
+                archive_headers = [str(header).strip() for header in existing[0]]
+                if "ID" not in archive_headers:
+                    log.warning("Архив: в шапке листа «%s» нет колонки «ID» — перенос пропущен",
+                                self.config.sheet_archive)
+                    return 0
+                # Дубль — совпадение неизменяемых полей записи; одного ID мало,
+                # перенумерация использует номера повторно.
+                key_fields = [header for header in ("ID", "Создано", "Дата", "Время", "Телефон", "Telegram ID")
+                              if header in archive_headers]
+
+                def archive_key(row_values):
+                    if not key_fields:
+                        return tuple(str(cell).strip() for cell in row_values)
+                    cells = {header: (str(row_values[index]).strip() if index < len(row_values) else "")
+                             for index, header in enumerate(archive_headers)}
+                    return tuple(cells.get(field, "") for field in key_fields)
+
+                known = {archive_key(row_values) for row_values in existing[1:]
+                         if any(str(cell).strip() for cell in row_values)}
+                for booking_id, record in candidates:
+                    key = archive_key([pick(record, header) for header in archive_headers])
+                    if key in known:
+                        to_clear.append(record)  # копия уже в архиве с прошлого запуска
+                        continue
+                    try:
+                        archive.append_row([pick(record, header) for header in archive_headers],
+                                           value_input_option="RAW")
+                    except Exception as error:
+                        log.warning("Архив: запись %s не скопирована (%s) — источник не очищается",
+                                    booking_id, type(error).__name__)
+                        continue
+                    known.add(key)
+                    copied += 1
+                    to_clear.append(record)
+            deleted = self._remove_moved_bookings(to_clear, headers)
+            if copied or deleted:
+                try:
+                    worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
+                except (WorksheetNotFound, StopIteration):
+                    worksheet = None
+                if worksheet is not None:
+                    self._renumber_booking_ids(worksheet, headers)
+            try:
+                self._paint_archive_sheet(self._get_spreadsheet().worksheet(self.config.sheet_archive))
+            except (WorksheetNotFound, StopIteration):
+                pass  # архива ещё нет — красить нечего
+            except Exception as error:
+                log.warning("Архив: лист не раскрашен (%s)", type(error).__name__)
+            if copied or deleted:
+                log.info("В архивный лист «%s» перенесено записей: %d, удалено из «Записей»: %d",
+                         self.config.sheet_archive, copied, deleted)
+            return copied
+
+    def _remove_moved_bookings(self, records, headers) -> int:
+        """Физическое удаление перенесённых строк и пустых рядов из «Записей».
+
+        Данные каждой удалённой строки уже лежат в архиве; пустые ряды (в том
+        числе оставшиеся от прежних чисток) убираются при каждом цикле, чтобы
+        в таблице не было промежутков. Безопасность: лист с формулами не
+        трогается (удаление сдвинуло бы чужие ссылки); строка с данными правее
+        зоны бота не удаляется. Возвращает число удалённых строк.
+        """
+        deleted, tails = 0, []
+        if self._adaptive:
+            grouped: dict = {sheet_id: [] for sheet_id in self._adaptive.booking_sheet_ids()}
+            for record in records:
+                grouped.setdefault(record["__sheet_id__"], []).append(record)
+            jobs = [(sheet_id, self._get_spreadsheet().get_worksheet_by_id(sheet_id), sheet_records)
+                    for sheet_id, sheet_records in grouped.items()]
+        else:
+            jobs = [(0, self._get_spreadsheet().worksheet(self.config.sheet_bookings), records)]
+        for sheet_id, worksheet, sheet_records in jobs:
+            delete = getattr(worksheet, "delete_rows", None)
+            if delete is None:
+                log.warning("Архив: лист %s не поддерживает удаление строк", sheet_id)
+                continue
+            try:
+                values = worksheet.get_all_values(value_render_option="FORMULA")
+            except Exception as error:
+                log.warning("Архив: не удалось прочитать область %s (%s)", sheet_id, type(error).__name__)
+                continue
+            if any(str(cell).startswith("=") for row in values for cell in row):
+                log.warning("Архив: в области %s есть формулы — строки не удаляются", sheet_id)
+                continue
+            mapped_by_row = {}
+            for record in sheet_records:
+                mapped = set()
+                for field in record:
+                    if field.startswith("__"):
+                        continue
+                    try:
+                        if self._adaptive:
+                            mapped.add(self._adaptive.writable_column(sheet_id, field))
+                        elif field in headers:
+                            # Офлайн: колонка поля — позиция в шапке листа «Записей».
+                            mapped.add(headers.index(field) + 1)
+                    except Exception as error:
+                        log.warning("Архив: колонка поля %s не найдена (%s)", field, type(error).__name__)
+                mapped_by_row[record["__row__"]] = mapped or set(range(1, len(headers) + 1))
+            row_numbers = []
+            for record in sheet_records:
+                row_number = record["__row__"]
+                mapped = mapped_by_row.get(row_number, set())
+                row_values = values[row_number - 1] if row_number <= len(values) else []
+                outside = [str(cell).strip() for index, cell in enumerate(row_values, 1)
+                           if index not in mapped and str(cell).strip()]
+                if outside:
+                    log.warning("Архив: строка %d содержит данные вне зоны бота — не удаляется", row_number)
+                    continue
+                row_numbers.append(row_number)
+            # Пустые ряды (в том числе от прежних чисток) убираем, чтобы не было промежутков.
+            moved = set(row_numbers)
+            for index in range(2, len(values) + 1):
+                if index in moved or any(str(cell).strip() for cell in values[index - 1]):
+                    continue
+                row_numbers.append(index)
+            for row_number in sorted(set(row_numbers), reverse=True):
+                delete(row_number)
+                deleted += 1
+            tails.append((worksheet, values, deleted))
+        # После удаления строк под данными может остаться старая краска (серые
+        # ряды прошлых чисток): сбрасываем фон хвоста в белый, чтобы таблица
+        # выглядела опрятно независимо от того, кто и когда её красил.
+        last_col = chr(ord("A") + max(15, len(headers) - 1)) if 0 < len(headers) <= 26 else "Z"
+        for worksheet, values, removed in tails:
+            if not hasattr(worksheet, "format"):
+                continue
+            tail_start = len(values) - removed + 1  # первый ряд без данных после удаления
+            last_row = getattr(worksheet, "row_count", None) or len(values) + 200
+            if last_row >= tail_start:
+                worksheet.format(f"A{tail_start}:{last_col}{last_row}",
+                                 {"backgroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}})
+        if deleted:
+            self._invalidate("bookings")
+        return deleted
+
+    def clean_expired_slots(self) -> int:
+        """Физическая очистка устаревших дат в листе «Слоты».
+
+        Локальный день бота — часовой пояс задан в .env. Линейную раскладку
+        («Дата, Время, Постов») чистим адресно: прошлые строки пустеют, лист не
+        сдвигается. Сеточные раскладки (дата в названии листа), график
+        «Начало/Конец» без колонки «Дата», строки с формулами и данные вне
+        раскладки остаются без изменений. Возвращает число очищенных строк.
+        """
+        today = self.now().date()
+        with self._lock:
+            if self._adaptive:
+                cleared = self._adaptive.clean_expired_slots(today)
+                if cleared:
+                    self._invalidate("slots")
+                return cleared
+            try:
+                worksheet = self._get_spreadsheet().worksheet(self.config.sheet_slots)
+                values = worksheet.get_all_values(value_render_option="FORMULA",
+                                                  date_time_render_option="FORMATTED_STRING")
+            except Exception as error:
+                log.warning("Слоты не прочитаны; очистка пропущена (%s)", type(error).__name__)
+                return 0
+            if not values:
+                return 0
+            headers = [str(header).strip() for header in values[0]]
+            if "Дата" not in headers:
+                return 0  # график работы или незнакомая раскладка
+            date_column = headers.index("Дата") + 1
+            columns = {index + 1 for index, header in enumerate(headers)
+                       if header in {"Дата", "Время", "Постов", "Мест", "Боксов"}}
+            updates, cleared_rows = [], 0
+            for row, row_values in enumerate(values[1:], 2):
+                if not any(str(field_value).strip() for field_value in row_values):
+                    continue
+                slot_date = parse_date(str(row_values[date_column - 1]).strip()) if len(row_values) >= date_column else None
+                if not slot_date or slot_date >= today:
+                    continue  # будущий или сегодняшний день не трогаем
+                if any(str(field_value).startswith("=") for field_value in row_values):
+                    log.warning("Слоты, строка %d: формула в прошедшей строке — не очищается", row)
+                    continue
+                for column in columns:
+                    updates.append({"range": cell_name(row, column), "values": [[""]]})
+                cleared_rows += 1
+            if not updates:
+                return 0
+            try:
+                worksheet.batch_update(updates, value_input_option="RAW")
+            except AttributeError:
+                # Синтетические листы в тестах умеют только поячеечную запись.
+                for update in updates:
+                    match = re.fullmatch(r"([A-Z]+)(\d+)", update["range"])
+                    if not match:
+                        continue
+                    column_number = 0
+                    for letter in match.group(1):
+                        column_number = column_number * 26 + ord(letter) - 64
+                    worksheet.update_cell(int(match.group(2)), column_number, update["values"][0][0])
+            self._invalidate("slots")
+            log.info("Слоты: очищено устаревших строк: %d", cleared_rows)
+            return cleared_rows
 
     def my_bookings(self, telegram_id: int) -> dict:
         with self._lock:

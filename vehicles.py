@@ -7,9 +7,13 @@ SQLite на диске — единственный источник истин�
 Запись появляется только после подтверждённой записи (решение Python).
 Владелец строки — Telegram ID; чужие строки не возвращаются и не меняются.
 Удаление — смена статуса, строка не переиспользуется.
+Колонка last_tariff/last_services — последний подтверждённый заказ этой машины
+(«повторная запись как в прошлый раз»); цена и слоты при повторе всегда
+пересчитываются заново, память даёт только состав заказа.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sqlite3
@@ -23,7 +27,7 @@ from typing import Callable
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ACTIVE, DELETED = "active", "deleted"
 MAX_PER_CUSTOMER = 10
 MAX_NAME = 120
@@ -41,6 +45,8 @@ class SavedCar:
     id: int
     name: str
     size_class: str
+    last_tariff: str = ""
+    last_services: tuple = ()
 
 
 def car_key(name: str) -> str:
@@ -91,6 +97,25 @@ class VehicleDatabase:
         return self._connection
 
     @staticmethod
+    def _services_text(services) -> str:
+        """Услуги прошлого заказа — JSON-список; None ничего не меняет."""
+        if services is None:
+            return ""
+        try:
+            return json.dumps([str(service).strip() for service in services if str(service).strip()],
+                              ensure_ascii=False)
+        except (TypeError, ValueError):
+            return ""
+
+    @staticmethod
+    def _services_list(text: str) -> tuple:
+        try:
+            parsed = json.loads(text or "[]")
+        except (TypeError, ValueError):
+            return ()
+        return tuple(str(service) for service in parsed) if isinstance(parsed, list) else ()
+
+    @staticmethod
     def _migrate(connection: sqlite3.Connection) -> None:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         if version > SCHEMA_VERSION:
@@ -99,16 +124,23 @@ class VehicleDatabase:
             return
         connection.execute("BEGIN IMMEDIATE")
         try:
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS vehicles ("
-                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                " telegram_id INTEGER NOT NULL,"
-                " car_key TEXT NOT NULL,"
-                " car_name TEXT NOT NULL,"
-                " size_class TEXT NOT NULL DEFAULT '',"
-                " status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'deleted')),"
-                " created_at TEXT NOT NULL,"
-                " updated_at TEXT NOT NULL)")
+            if version <= 0:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS vehicles ("
+                    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    " telegram_id INTEGER NOT NULL,"
+                    " car_key TEXT NOT NULL,"
+                    " car_name TEXT NOT NULL,"
+                    " size_class TEXT NOT NULL DEFAULT '',"
+                    " status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'deleted')),"
+                    " created_at TEXT NOT NULL,"
+                    " updated_at TEXT NOT NULL,"
+                    " last_tariff TEXT NOT NULL DEFAULT '',"
+                    " last_services TEXT NOT NULL DEFAULT '')")
+            else:
+                # Миграция v1 -> v2: состав последнего заказа («как в прошлый раз»).
+                connection.execute("ALTER TABLE vehicles ADD COLUMN last_tariff TEXT NOT NULL DEFAULT ''")
+                connection.execute("ALTER TABLE vehicles ADD COLUMN last_services TEXT NOT NULL DEFAULT ''")
             # Уникальность активного дубля обеспечивает сама база, даже при гонке двух записей.
             connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS vehicles_active_key "
                                "ON vehicles (telegram_id, car_key) WHERE status = 'active'")
@@ -121,25 +153,36 @@ class VehicleDatabase:
     def list_active(self, telegram_id: int) -> list[SavedCar]:
         with self._lock:
             rows = self._db().execute(
-                "SELECT id, car_name, size_class FROM vehicles WHERE telegram_id = ? AND status = ? "
-                "ORDER BY updated_at DESC, id DESC", (int(telegram_id), ACTIVE)).fetchall()
-        return [SavedCar(id=row[0], name=row[1], size_class=row[2]) for row in rows]
+                "SELECT id, car_name, size_class, last_tariff, last_services FROM vehicles "
+                "WHERE telegram_id = ? AND status = ? ORDER BY updated_at DESC, id DESC",
+                (int(telegram_id), ACTIVE)).fetchall()
+        return [SavedCar(id=row[0], name=row[1], size_class=row[2], last_tariff=row[3] or "",
+                         last_services=self._services_list(row[4])) for row in rows]
 
-    def upsert(self, telegram_id: int, name: str, size_class: str, now: str) -> SavedCar | None:
+    def upsert(self, telegram_id: int, name: str, size_class: str, now: str,
+               tariff: str | None = None, services=None) -> SavedCar | None:
         key = car_key(name)
         if not key:
             return None
+        services_text = self._services_text(services) if services is not None else None
         with self._lock:
             connection = self._db()
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    "SELECT id, car_name FROM vehicles WHERE telegram_id = ? AND car_key = ? AND status = ?",
+                    "SELECT id, car_name, last_tariff, last_services FROM vehicles "
+                    "WHERE telegram_id = ? AND car_key = ? AND status = ?",
                     (int(telegram_id), key, ACTIVE)).fetchone()
                 if row:
-                    connection.execute("UPDATE vehicles SET size_class = ?, updated_at = ? WHERE id = ?",
-                                       (size_class, now, row[0]))
-                    saved = SavedCar(id=row[0], name=row[1], size_class=size_class)
+                    # Пустые tariff/services не затирают прошлый заказ: подтверждённая запись
+                    # всегда несёт состав, а пустота означает пробой без подтверждения.
+                    tariff_value = (tariff or "") if tariff is not None else (row[2] or "")
+                    services_value = services_text if services_text is not None else (row[3] or "")
+                    connection.execute(
+                        "UPDATE vehicles SET size_class = ?, updated_at = ?, last_tariff = ?, last_services = ? "
+                        "WHERE id = ?", (size_class, now, tariff_value, services_value, row[0]))
+                    saved = SavedCar(id=row[0], name=row[1], size_class=size_class,
+                                     last_tariff=tariff_value, last_services=self._services_list(services_value))
                 else:
                     count = connection.execute("SELECT COUNT(*) FROM vehicles WHERE telegram_id = ? AND status = ?",
                                                (int(telegram_id), ACTIVE)).fetchone()[0]
@@ -148,10 +191,14 @@ class VehicleDatabase:
                         log.warning("У клиента достигнут лимит сохранённых автомобилей")
                         return None
                     cursor = connection.execute(
-                        "INSERT INTO vehicles (telegram_id, car_key, car_name, size_class, status, created_at, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (int(telegram_id), key, name, size_class, ACTIVE, now, now))
-                    saved = SavedCar(id=cursor.lastrowid, name=name, size_class=size_class)
+                        "INSERT INTO vehicles (telegram_id, car_key, car_name, size_class, status, created_at, "
+                        "updated_at, last_tariff, last_services) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (int(telegram_id), key, name, size_class, ACTIVE, now, now,
+                         (tariff or "") if tariff is not None else "",
+                         services_text if services_text is not None else ""))
+                    saved = SavedCar(id=cursor.lastrowid, name=name, size_class=size_class,
+                                     last_tariff=(tariff or "") if tariff is not None else "",
+                                     last_services=self._services_list(services_text or ""))
                 connection.execute("COMMIT")
                 return saved
             except Exception:
@@ -202,7 +249,9 @@ class VehicleCache:
 
     @staticmethod
     def _size(cars: tuple) -> int:
-        return ENTRY_OVERHEAD_BYTES + sum(len(car.name) * 2 + len(car.size_class) * 2 + 32 for car in cars)
+        return ENTRY_OVERHEAD_BYTES + sum(
+            len(car.name) * 2 + len(car.size_class) * 2 + len(car.last_tariff) * 2
+            + sum(len(service) * 2 for service in car.last_services) + 40 for car in cars)
 
     def get(self, telegram_id: int) -> tuple | None:
         entry = self._entries.get(telegram_id)
@@ -326,11 +375,12 @@ class VehicleMemory:
         self.for_user(telegram_id)
 
     # ---- запись: сначала транзакция в базе, потом кэш
-    def remember(self, telegram_id: int, name: str, size_class: str) -> SavedCar | None:
+    def remember(self, telegram_id: int, name: str, size_class: str,
+                 tariff: str | None = None, services=None) -> SavedCar | None:
         name = clean_name(name)
         now = datetime.now().strftime(_TIME_FORMAT)
         with self._lock:
-            saved = self.db.upsert(int(telegram_id), name, size_class, now)
+            saved = self.db.upsert(int(telegram_id), name, size_class, now, tariff=tariff, services=services)
             self.cache.drop(int(telegram_id))
         return saved
 

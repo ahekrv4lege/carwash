@@ -269,14 +269,17 @@ class AdaptiveTests(unittest.TestCase):
         with self.assertRaises(MappingError):
             self.a.table("bookings")
 
-    def test_unknown_write_result_is_not_retried(self):
+    def test_unknown_write_result_is_reconciled_by_booking_id(self):
         self.worksheet.fail_write = True
         with self.assertRaisesRegex(MappingError, "неизвестен"):
             self.store.create_booking(**booking())
         self.worksheet.fail_write = False
-        with self.assertRaisesRegex(MappingError, "повтор заблокирован"):
-            self.store.create_booking(**booking())
-        self.assertFalse(self.worksheet.writes)
+        # Сверка по постоянному ID: строка не дошла до листа — повтор завершает создание.
+        result = self.store.create_booking(**booking())
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(self.worksheet.values) - 1, 1)  # ровно одна строка записи
+        self.assertEqual([entry["state"] for entry in
+                          self.a._journal()[1].values() if entry["id"] == str(result["booking_id"])], ["done"])
 
     def test_cancel_rechecks_identity(self):
         self.store.create_booking(**booking())

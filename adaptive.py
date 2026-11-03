@@ -27,6 +27,9 @@ NON_PRICE_HEADERS = {"id", "duration", "duration minutes", "duration hours", "д
                      "длительность работы", "время мин", "время работы", "минуты", "часы", "номер", "код"}
 BOOKING_FIELDS = ["ID", "Создано", "Дата", "Время", "Имя", "Телефон", "Автомобиль", "Класс",
                   "Тариф", "Доп. услуги", "Состав", "Сумма", "Комментарий", "Telegram ID", "Username", "Статус"]
+# Дополнительные поля записей: колонка может отсутствовать в старых таблицах,
+# поэтому не обязана для записи и не участвует в канонической раскладке.
+EXTRA_ROLE_FIELDS = {"bookings": ["Госномер"]}
 ALIASES = {
     "ID": ["id", "номер записи", "booking id", "номер брони"],
     "Создано": ["создано", "created", "created at", "дата создания"],
@@ -44,6 +47,8 @@ ALIASES = {
     "Telegram ID": ["telegram id", "tg id", "telegram_id", "tg_id", "id клиента"],
     "Username": ["username", "ник", "telegram username"],
     "Статус": ["статус", "status", "состояние"],
+    "Госномер": ["госномер", "гос номер", "госномер автомобиля", "номер авто", "номер машины",
+                 "plate", "license plate", "car plate"],
     "Постов": ["постов", "мест", "боксов", "capacity", "bays", "пост", "бокс"],
     "Услуга": ["услуга", "service", "service name", "название услуги"],
     "Описание": ["описание", "description", "details"],
@@ -269,7 +274,8 @@ def atomic_json(path: Path, data: dict) -> None:
 def header_mapping(headers: list, role: str) -> tuple[dict, list[str]]:
     columns = {}
     errors = []
-    for field in ALL_ROLE_FIELDS[role]:
+    # Дополнительные поля (например «Госномер») мапятся, только когда колонка есть в листе.
+    for field in (*ALL_ROLE_FIELDS[role], *EXTRA_ROLE_FIELDS.get(role, ())):
         aliases = {normalize_header(alias) for alias in ALIASES[field]}
         hits = [index for index, header in enumerate(headers, 1) if normalize_header(header) in aliases]
         if len(hits) == 1:
@@ -670,6 +676,8 @@ class AdaptiveSheets:
         if len(set(columns.values())) != len(columns):
             errors.append("Два поля ссылаются на одну колонку")
         allowed = set(ROLE_FIELDS.get(rule["role"], OPTIONAL_ROLE_FIELDS.get(rule["role"], set())))
+        # Дополнительные поля (например «Госномер») разрешены, когда колонка есть в листе.
+        allowed |= set(EXTRA_ROLE_FIELDS.get(rule["role"], ()))
         allowed = allowed | set(rule.get("price_fields", []))
         if rule.get("pivot_prices"):
             allowed.update({"Класс", "Сумма"})
@@ -1463,6 +1471,34 @@ class AdaptiveSheets:
             raise MappingError("Запись в выбранную область не разрешена; проверьте mappings")
         return rules[0]
 
+    def writable_column(self, sheet_id: int, field: str) -> int:
+        """Физическая колонка канонического поля области листа (для адресных правок)."""
+        rule = self._target(sheet_id=sheet_id)
+        if field not in rule["columns"]:
+            raise MappingError(f"В области «{rule['sheet_title']}» нет колонки {field}")
+        return int(rule["columns"][field])
+
+    def booking_fields(self) -> set:
+        """Знать канонические поля записей всех подтвержённых областей (для проверок Store)."""
+        with self.lock:
+            try:
+                rules = self._rules("bookings")
+            except MappingError:
+                return set()
+            fields: set = set()
+            for rule in rules:
+                fields.update(rule["columns"])
+            return fields
+
+    def booking_sheet_ids(self) -> list:
+        """Физические листы всех подтвержённых областей записей (для обслуживания)."""
+        with self.lock:
+            try:
+                rules = self._rules("bookings")
+            except MappingError:
+                return []
+            return [rule["sheet_id"] for rule in rules]
+
     def _date_cell_values(self, rule: dict) -> list[list]:
         """Сетка, содержащая только ячейку-источник даты, вместо чтения всего листа."""
         cell = (rule.get("date_source") or {}).get("cell")
@@ -1535,7 +1571,11 @@ class AdaptiveSheets:
             raise SlotUnavailable("На это время свободных постов нет")
         cell = cell_name(row, column)
         current = worksheet.get(f"{cell}:{cell}", value_render_option="FORMULA")
-        if not self._grid_cell_free(rule, current[0][0] if current and current[0] else ""):
+        value = current[0][0] if current and current[0] else ""
+        if not self._grid_cell_free(rule, value):
+            if str(value).strip() == marker.strip():
+                # Своё занятие прошлой попытки (ответ потерян): повтор законен, клетку не трогаем.
+                return {"sheet_id": rule["sheet_id"], "row": row, "column": column, "marker": marker}
             raise SlotUnavailable("Пост только что занят; выберите другое время")
         worksheet.batch_update([{"range": cell, "values": [[marker]]}], value_input_option="RAW")
         return {"sheet_id": rule["sheet_id"], "row": row, "column": column, "marker": marker}
@@ -1604,7 +1644,10 @@ class AdaptiveSheets:
             key = fingerprint({field_name: str(data[field_name]).strip().casefold() for field_name in ("telegram id", "дата", "время", "автомобиль")})
             journal_path, journal = self._journal()
             if key in journal:
-                raise MappingError("Такая операция уже выполнена или ожидает ручной сверки; повтор заблокирован")
+                # Неопределённый итог прошлой попытки: своряем факт по постоянному ID,
+                # а не повторяем запись вслепую.
+                if self._reconcile_create(rule, data, journal, journal_path, key):
+                    return  # строка с этим ID уже на листе: повторная запись не выполнялась
             # Сравниваем в том же режиме, что и таблица (FORMATTED_VALUE): в FORMULA телефон «+7…»,
             # в отображении «7…», и любая сверка ложно видит «строки изменились».
             values = worksheet.get_all_values(value_render_option="FORMATTED_VALUE")
@@ -1642,7 +1685,8 @@ class AdaptiveSheets:
             grid_rules = self._grid_rules(data["дата"])
             # Журнал пишем до занятия клетки: сбой между занятием и журналом оставлял бы
             # маркер без записи и без доказательства для ручной сверки.
-            journal[key] = {"state": "pending", "sheet_id": rule["sheet_id"], "row": row, "at": time.time()}
+            journal[key] = {"state": "pending", "sheet_id": rule["sheet_id"], "row": row, "at": time.time(),
+                            "id": str(data["id"])}
             atomic_json(journal_path, journal)
             if grid_rules:
                 try:
@@ -1673,6 +1717,53 @@ class AdaptiveSheets:
             except Exception:
                 # Строка уже подтверждена; сбой журнала не должен превращать успех в отказ.
                 log.warning("Журнал операций не обновлён после подтверждённой записи")
+
+    def _reconcile_create(self, rule: dict, data: dict, journal: dict, path, key: str) -> bool | None:
+        """Неопределённый итог создания: сверяем лист по постоянному ID записи.
+
+        Строка с этим ID и той же личностью есть — операция уже состоялась, ответ был
+        потерян: журнал закрывается, повтор не выполняется. Строк с этим ID нет, а
+        адресованная строка журнала пуста — первая попытка не доехала до листа:
+        журнал снимается, повтор разрешается. Иначе исход спорный: остаётся
+        заблокированным до ручной сверки, журнал не изменяется.
+        Возвращает True — запись уже на листе; None — можно повторять.
+        """
+        worksheet = self._worksheet(rule["sheet_id"])
+        try:
+            values = worksheet.get_all_values(value_render_option="FORMATTED_VALUE")
+        except Exception as error:
+            log.warning("Сверка прошлой записи %s не удалась (%s)", data["id"], type(error).__name__)
+            raise MappingError("Не удалось сверить прошлую запись; повторите позже") from None
+        id_column = rule["columns"].get("ID")
+        last_row = min(len(values), rule.get("end_row") or len(values))
+        matches = [row_index for row_index in range(rule["first_data_row"], last_row + 1)
+                   if id_column and str(value_at(values, row_index, id_column)).strip() == str(data["id"]).strip()]
+        entry = journal.get(key) or {}
+        if len(matches) > 1:
+            raise MappingError("Несколько строк с этим ID записи; нужна ручная сверка") from None
+        if len(matches) == 1:
+            identity = {"ID": str(data["id"]), "Telegram ID": str(data["telegram id"]),
+                        "Дата": data["дата"], "Время": data["время"]}
+            if self._booking_row_state(rule, matches[0], identity) is not True:
+                raise MappingError("Строка с этим ID хранит другие данные; нужна ручная сверка") from None
+            entry["state"] = "done"
+            try:
+                atomic_json(path, journal)
+            except Exception:
+                # Строка подтверждена листом; сбой журнала не отменяет восстановление.
+                log.warning("Журнал операций не обновлён после сверки создания")
+            log.info("Создание восстановлено: запись %s уже на листе, повтор не выполнялся", data["id"])
+            return True
+        row = int(entry.get("row") or 0)
+        if row and any(str(field_value).strip() for field_value in (values[row - 1] if row <= len(values) else [])):
+            raise MappingError("Строка прошлой попытки занята другими данными; нужна ручная сверка") from None
+        journal.pop(key, None)
+        try:
+            atomic_json(path, journal)
+        except Exception:
+            log.warning("Не удалось очистить журнал после сверки создания")
+        log.info("Создание восстановлено: строка не дошла до листа, повтор разрешён")
+        return None
 
     def cancel(self, record: dict, telegram_id: int) -> None:
         with self.lock:
@@ -1829,6 +1920,74 @@ class AdaptiveSheets:
         return any(entry.get("marker") == marker and entry.get("state") in {"pending", "done"}
                    for entry in journal.values())
 
+    def clean_expired_slots(self, today) -> int:
+        """Физическая очистка устаревших дат в слотовых областях (линейная раскладка).
+
+        Сеточные раскладки не трогаются: их дата живёт в названии листа. Прошедшие
+        строки очищаются адресной записью пустых значений только в колонки
+        раскладки — строки листа не сдвигаются, будущие слоты, непонятные строки,
+        строки с формулами и данные вне раскладки остаются без изменений.
+        today — локальный день в часовом поясе бота (сравнение строгое: только
+        даты раньше сегодняшней). Возвращает число очищенных строк.
+        """
+        with self.lock:
+            try:
+                rules = self._rules("slots")
+            except MappingError:
+                return 0
+            cleared_rows = 0
+            for rule in rules:
+                if rule.get("grid_columns") or "Дата" not in rule["columns"]:
+                    continue  # дата содержится в названии листа — очисткой не занимаемся
+                worksheet = self._worksheet(rule["sheet_id"])
+                try:
+                    values = worksheet.get_all_values(value_render_option="FORMULA",
+                                                      date_time_render_option="FORMATTED_STRING")
+                except Exception as error:
+                    log.warning("Слоты «%s» не прочитаны; очистка пропущена (%s)",
+                                rule["sheet_title"], type(error).__name__)
+                    continue
+                end_row = min(len(values), rule.get("end_row") or len(values))
+                date_transform = rule.get("transforms", {}).get("Дата", "date")
+                date_column = rule["columns"]["Дата"]
+                updates: list[dict] = []
+                for row in range(rule["first_data_row"], end_row + 1):
+                    row_values = values[row - 1] if row <= len(values) else []
+                    if not any(str(field_value).strip() for field_value in row_values):
+                        continue  # и так пустая
+                    try:
+                        expired = datetime.strptime(date_value(value_at(values, row, date_column), date_transform),
+                                                    "%d.%m.%Y").date()
+                    except (MappingError, ValueError, TypeError):
+                        continue  # строка не датируется: не очищаем
+                    if expired >= today:
+                        continue  # будущий или сегодняшний день не трогаем
+                    if any(str(field_value).startswith("=") for field_value in row_values):
+                        log.warning("Слоты «%s», строка %d: формула в прошедшей строке — не очищается",
+                                    rule["sheet_title"], row)
+                        continue
+                    for column in rule["columns"].values():
+                        updates.append({"range": cell_name(row, column), "values": [[""]]})
+                    cleared_rows += 1
+                if updates:
+                    try:
+                        worksheet.batch_update(updates, value_input_option="RAW")
+                    except AttributeError:
+                        # Синтетические листы в тестах умеют только поячеечную запись.
+                        for update in updates:
+                            match = re.fullmatch(r"([A-Z]+)(\d+)", update["range"])
+                            if not match:
+                                continue
+                            column_number = 0
+                            for letter in match.group(1):
+                                column_number = column_number * 26 + ord(letter) - 64
+                            worksheet.update_cell(int(match.group(2)), column_number, update["values"][0][0])
+                    except Exception as error:
+                        log.warning("Слоты «%s»: очистка не удалась (%s)", rule["sheet_title"], type(error).__name__)
+                        continue
+                    log.info("Слоты «%s»: очищено устаревших строк: %d", rule["sheet_title"], cleared_rows)
+            return cleared_rows
+
     def reconcile_cancel(self, record: dict) -> bool | None:
         """Доводим прерванную отмену: запись уже «Отмена», клетка могла остаться занятой.
 
@@ -1854,6 +2013,41 @@ class AdaptiveSheets:
                 except Exception:
                     log.warning("Журнал операций не обновлён после сверки отмены")
             return released
+
+    def settle_create(self, booking_id: str, telegram_id: int) -> None:
+        """Сверка незакрытого создания по постоянному ID: строка уже на листе.
+
+        Потерянный ответ оставлял журнал pending; клиент повторил запрос, и дубль-проверка
+        нашла его запись. Подтверждаем личность по строке закрываем журнал, чтобы не
+        оставлять вечный маркер блокировки.
+        """
+        with self.lock:
+            try:
+                path, journal = self._journal()
+            except MappingError:
+                return
+            targets = {key: entry for key, entry in journal.items()
+                       if entry.get("state") == "pending" and str(entry.get("id", "")) == str(booking_id).strip()}
+            if not targets:
+                return
+            settled = []
+            for key, entry in targets.items():
+                try:
+                    rule = self._target(sheet_id=entry["sheet_id"])
+                except MappingError:
+                    continue  # область недоступна: журнал остаётся до ручной сверки
+                if self._booking_row_state(rule, entry.get("row"),
+                                           {"ID": str(booking_id).strip(), "Telegram ID": str(telegram_id)}) is True:
+                    settled.append(key)
+            if not settled:
+                return  # строка не подтверждает личность: сверку делает администратор
+            for key in settled:
+                journal[key]["state"] = "done"
+            log.info("Создание восстановлено по повтору клиента: запись %s подтверждена листом, журнал закрыт", booking_id)
+            try:
+                atomic_json(path, journal)
+            except Exception:
+                log.warning("Журнал операций не обновлён после сверки создания по ID")
 
     def validate_reschedule(self, record: dict, new_date: str) -> dict:
         rule = self._target(sheet_id=record["__sheet_id__"])

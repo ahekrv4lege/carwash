@@ -190,6 +190,9 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
                  patch("bot.Store", return_value=store), patch("bot.Agent", return_value=agent), \
                  patch("bot.Dispatcher", return_value=dispatcher):
                 await bot.main()
+                # Фоновые задачи уходят в to_thread; на Windows при уборке папки
+                # открытый tmp-файл карты заблокирует удаление — дожидаемся все потоки.
+                await asyncio.get_running_loop().shutdown_default_executor()
             transport.delete_webhook.assert_awaited_once_with(drop_pending_updates=False)
             dispatcher.start_polling.assert_awaited_once_with(transport, close_bot_session=False)
             transport.session.close.assert_awaited_once()
@@ -201,6 +204,7 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
         for minimum, elapsed, expected in ((1.5, 0.2, 1.3), (1.5, 3, 0), (0, 0.2, 0)):
             with self.subTest(minimum=minimum, elapsed=elapsed):
                 agent = Mock(config=N(reply_min_delay_sec=minimum), reply=AsyncMock(return_value="Подскажу цены."))
+                agent.slot_keyboard = AsyncMock(return_value=None)
                 message = Mock(from_user=N(id=111, username=None, full_name="Тест"), chat=N(id=111), answer=AsyncMock())
                 reporter = Mock(dialog=AsyncMock())
                 sender = Mock(__aenter__=AsyncMock(), __aexit__=AsyncMock())
@@ -389,6 +393,7 @@ class MessageBatchingTests(unittest.IsolatedAsyncioTestCase):
                         "from": {"id": 999, "is_bot": True, "first_name": "Carwash"},
                         "text": "Предложение"}, "data": "booking:edit:offer-1"})
         self.agent.proposal_action = AsyncMock(return_value="Что изменить?")
+        self.agent.slot_keyboard = AsyncMock(return_value=None)
         self.agent.delivery_token.return_value = None
         reporter = Mock(dialog=AsyncMock())
         with patch.object(Message, "answer", new_callable=AsyncMock):

@@ -158,16 +158,16 @@ class AuditSafetyTests(unittest.TestCase):
                 self.store.my_bookings(111)
         self.assertEqual(len(self.store.my_bookings(111)["bookings"]), 1)
 
-    def test_unknown_write_result_survives_restart(self):
+    def test_unknown_write_result_is_reconciled_across_restart(self):
         self.worksheet.fail_write = True
         with self.assertRaises(MappingError):
             self.store.create_booking(**booking())
         self.worksheet.fail_write = False
         restarted, _ = fixture(self.temp.name)
         restarted._spreadsheet = self.spreadsheet
-        with self.assertRaises(MappingError):
-            restarted.create_booking(**booking())
-        self.assertFalse(self.worksheet.writes)
+        result = restarted.create_booking(**booking())
+        self.assertTrue(result["ok"], result)  # сверка по ID сняла незакрытый журнал
+        self.assertEqual(len(self.worksheet.values) - 1, 1)  # дубля нет
 
     def test_failed_refresh_keeps_last_good_mapping_file(self):
         self.a.refresh()

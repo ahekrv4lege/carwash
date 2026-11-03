@@ -288,7 +288,7 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Записала', answer)
         self.assertEqual(len(self.spreadsheet.worksheet('Записи').writes), 1)
 
-    async def test_restart_preserves_uncertain_write_journal_without_saving_profile(self):
+    async def test_restart_preserves_uncertain_write_journal_and_reconciles_on_retry(self):
         from sheets import Store
         from adaptive import MappingError
         from tests.fakes import booking
@@ -298,9 +298,9 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
         restarted=Store(self.store.config)
         restarted._spreadsheet=self.spreadsheet
         self.spreadsheet.worksheet('Записи').fail_write=False
-        with self.assertRaises(MappingError):
-            restarted.create_booking(**booking())
-        self.assertFalse(self.spreadsheet.worksheet('Записи').writes)
+        result=restarted.create_booking(**booking())
+        self.assertTrue(result['ok'],result)  # сверка по постоянному ID сняла незакрытый журнал
+        self.assertEqual(len(self.spreadsheet.worksheet('Записи').values)-1,1)  # без дублей
 
     async def test_ordinary_reply_after_booking_is_not_replaced_in_history(self):
         await self.offer()
@@ -416,7 +416,7 @@ class Phase2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(m['role']=='tool' and '630' in m['content'] for m in messages))
 
     async def test_repeated_occupied_proposal_is_memoized_after_snapshot_update(self):
-        self.agent._state[111]={'facts':dict(ARGS)}
+        self.agent._state[111]={'facts':{**ARGS,'plate':'а 123 ав 777'}}
         self.spreadsheet.worksheet('Слоты').values[1][2]='0'
         self.transport.side_effect=[response(calls=[('create_booking',{})]) for _ in range(6)]
         with patch.object(self.store,'calculate_price',wraps=self.store.calculate_price) as quote:

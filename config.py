@@ -130,11 +130,14 @@ class Config:
     reply_min_delay_sec: float = 1.5
     reply_batch_sec: float = 0.4
     reply_concurrency: int = 8
+    # Госномер спрашивается всегда; отключить можно через CAR_PLATE_REQUIRED=false.
+    car_plate_required: bool = True
     ai_session_ttl_sec: int = 3600
     ai_max_sessions: int = 1000
     admin_user_ids: tuple[int, ...] = ()  # явный список админов для /stats по Telegram ID
     # Лист с длительностями услуг («Услуга», «Длительность»); лист может отсутствовать.
     sheet_durations: str = "Длительности"
+    sheet_archive: str = "Архив"   # отдельный архивный лист: записи старше недели
     llm_fallbacks: tuple[ProviderConfig, ...] = ()
     # Память об автомобилях клиентов: SQLite на диске и RAM-кэш по пользователю.
     vehicle_memory_file: str = ".runtime/customer_vehicles.sqlite3"
@@ -235,7 +238,7 @@ def table_mapping_path(spreadsheet_id: str) -> str:
 
 def _sheet_settings() -> dict:
     defaults = {"services": "Услуги", "tariffs": "Тарифы", "slots": "Слоты", "bookings": "Записи",
-                "classes": "Классы", "durations": "Длительности"}
+                "classes": "Классы", "durations": "Длительности", "archive": "Архив"}
     names = {
         f"sheet_{role}": os.getenv(f"SHEET_{role.upper()}", default).strip()
         for role, default in defaults.items()
@@ -282,6 +285,7 @@ def load_config(sheets_only: bool = False) -> Config:
         reply_min_delay_sec=_number("REPLY_MIN_DELAY_SEC", "1.5", 0),
         reply_batch_sec=_number("REPLY_BATCH_SEC", "0.4", 0),
         reply_concurrency=_integer("REPLY_CONCURRENCY", "8", 1),
+        car_plate_required=_bool("CAR_PLATE_REQUIRED", True),
         vehicle_memory_file=_path("VEHICLE_MEMORY_FILE", ".runtime/customer_vehicles.sqlite3"),
         vehicle_cache_mb=_number("VEHICLE_CACHE_MB", "4", 0.5),
         vehicle_cache_ttl_min=_number("VEHICLE_CACHE_TTL_MIN", "30", 1),
