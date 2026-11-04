@@ -439,7 +439,7 @@ TLS-проверка сертификатов остаётся включённ�
 ./.venv/bin/python checks/run.py              # Linux
 ```
 
-- **Офлайн-набор: 939 тестов** (сейчас; см. `CHANGES.md`). Ни сети, ни ключей, ни квот —
+- **Офлайн-набор: 941 тест** (сейчас; см. `CHANGES.md`). Ни сети, ни ключей, ни квот —
   таблица и модель синтетические (`checks/tests/fakes.py`).
 - `checks/tests/test_conversation.py` + `test_phase2.py` — диалог, память, подтверждения.
 - `checks/tests/test_vehicle_catalog.py` — общий справочник моделей: один `model_id` на

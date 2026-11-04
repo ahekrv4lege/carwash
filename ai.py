@@ -1711,19 +1711,24 @@ car — слова клиента с исходной цитатой; car_model 
             if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[1], str):
                 car_quote = entry[1]
                 break
-        if ({"car", "car_model", "plate"} & changes.keys()) and car_ownership(source, car_quote) and not self._state[user.id].get("vehicle_ambiguous"):
+        if ({"car", "car_model", "plate"} & changes.keys()) and not self._state[user.id].get("vehicle_ambiguous"):
             facts = self._state[user.id].get("facts", {})
             plate = facts.get("plate")
             # Номер из прошлой машины не должен приклеиться к новой: берём его,
             # только если он действительно назван в текущем сообщении.
-            saved = await self._remember_vehicle(
-                user, facts.get("car_model") or facts.get("car") or "", facts.get("size_class") or "",
-                plate=plate if plate and plate_mentioned(plate, source) else None)
-            # Если у новой/исправленной машины номера нет, старый номер из фактов
-            # больше не принадлежит ей. Для той же машины saved.last_plate сохранит его.
-            if (saved is not None and not saved.last_plate and facts.get("plate")
-                    and not plate_mentioned(facts["plate"], source)):
-                facts.pop("plate", None)
+            mentioned = plate if plate and plate_mentioned(plate, source) else None
+            saved = None
+            if car_ownership(source, car_quote):
+                saved = await self._remember_vehicle(
+                    user, facts.get("car_model") or facts.get("car") or "", facts.get("size_class") or "",
+                    plate=mentioned)
+            if not mentioned:
+                if saved is not None and saved.last_plate:
+                    # Подтверждённый номер именно этой машины можно переиспользовать.
+                    facts["plate"] = saved.last_plate
+                elif "car" in changes:
+                    # У новой/исправленной машины номера нет: старый номер ей не принадлежит.
+                    facts.pop("plate", None)
         if conflicts:
             labels = {"car": "автомобиль", "car_model": "модель автомобиля", "size_class": "класс автомобиля",
                       "date": "дату", "time": "время", "phone": "телефон", "client_name": "имя",
@@ -1874,6 +1879,8 @@ car — слова клиента с исходной цитатой; car_model 
             for field in ("car", "size_class", "tariff", "services", "plate"):
                 if not repeat.get(field) or result.get(field) or (field in facts and facts.get(field)):
                     continue
+                if field == "plate" and car_key(result.get("car") or facts.get("car") or "") != car_key(repeat.get("car") or ""):
+                    continue  # номер прошлой машины не переносим на другую
                 result[field] = repeat[field]
                 repeat_fields.add(field)
         if selection and not quote.get("stale"):
@@ -2025,6 +2032,19 @@ car — слова клиента с исходной цитатой; car_model 
             # Ссылка на индивидуальную запись: снимок диалога не хранит model_id.
             state["restored_vehicle"] = {"id": saved.id, "car": saved.name}
         return saved
+
+    def _saved_plate(self, user_id: int, car: str) -> str:
+        """Подтверждённый госномер именно этой машины; при неоднозначности не угадываем."""
+        key = car_key(car)
+        if not key:
+            return ""
+        try:
+            cars = self.cars.for_user(user_id)
+        except Exception as error:
+            log.warning("Память об автомобилях недоступна (%s)", type(error).__name__)
+            return ""
+        matches = [item for item in cars if car_key(item.name) == key and item.last_plate]
+        return matches[0].last_plate if len(matches) == 1 else ""
 
     def forget_vehicle_facts(self, user_id: int, car) -> None:
         """Удалённый из памяти автомобиль больше не участвует в текущем диалоге."""
@@ -2558,15 +2578,107 @@ car — слова клиента с исходной цитатой; car_model 
                 possible.add(sum(combination))
         return all(value in known or value in possible for value in positive)
 
+    def _catalog_total_matches(self, user_id, text, claimed) -> bool:
+        """Итог совпадает с детерминированным расчётом по свежему прайсу.
+
+        Берём только названия услуг/тарифов, которые есть в ответе или уже
+        выбраны клиентом. Класс, доступность и скидки считает Catalog, поэтому
+        произвольная сумма цен разных классов не проходит.
+        """
+        state = self._state[user_id]
+        catalog_state = state.get("catalog") or {}
+        if not self._state_fresh(catalog_state, self._catalog_ttl_sec):
+            return False
+        try:
+            catalog = self.store.get_catalog()
+        except Exception:
+            return False
+        facts = state.get("facts", {})
+        selection = state.get("selection") or {}
+        answer = folded(text or "")
+        services = list(catalog_state.get("services") or [])
+        tariffs = list(catalog_state.get("tariffs") or [])
+        names = list(dict.fromkeys([*services, *tariffs]))
+        matched = sorted((name for name in names if folded(name) and folded(name) in answer),
+                         key=lambda name: len(folded(name)), reverse=True)
+        mentioned = []
+        for name in matched:
+            if not any(folded(name) in folded(longer) for longer in mentioned):
+                mentioned.append(name)
+        chosen_services = [name for name in mentioned if name in services]
+        chosen_tariffs = [name for name in mentioned if name in tariffs]
+        if not chosen_services:
+            chosen_services = list(facts.get("services") or selection.get("services") or [])
+        if not chosen_tariffs:
+            chosen_tariff = facts.get("tariff") or selection.get("tariff")
+            chosen_tariffs = [chosen_tariff] if chosen_tariff else []
+        chosen_services = list(dict.fromkeys(chosen_services))[:6]
+        tariff_options = list(dict.fromkeys(chosen_tariffs))[:2] or [None]
+        size_class = facts.get("size_class") or selection.get("size_class")
+        classes = [size_class] if size_class else list(catalog.size_classes)
+        car = facts.get("car_model") or facts.get("car") or ""
+        if not chosen_services and not chosen_tariffs:
+            # Состав не сопоставился по названиям: проверяем ту же арифметику
+            # по ценам доступных услуг одного класса. Слагаемые должны быть
+            # названы в ответе, поэтому произвольная сумма не проходит.
+            values = [int(re.sub(r"\D", "", match[1]) or 0)
+                      for match in re.finditer(r"(\d[\d\s.,]{0,12})\s*(?:₽|руб)", text or "", re.I)]
+            components = [value for value in values if value != claimed]
+            for class_name in classes:
+                if not class_name or catalog.class_rule_problem(car, class_name):
+                    continue
+                prices = {service.prices[class_name] for service in catalog.services.values()
+                          if service.available and class_name in service.prices}
+                usable = [value for value in components if value in prices]
+                for size in (2, 3):
+                    for combination in combinations(usable, size):
+                        if sum(combination) == claimed:
+                            return True
+            return False
+        for class_name in classes:
+            if not class_name or catalog.class_rule_problem(car, class_name):
+                continue
+            for tariff_name in tariff_options:
+                subsets = [[]]
+                for size in range(1, min(3, len(chosen_services)) + 1):
+                    subsets.extend(combinations(chosen_services, size))
+                for subset in subsets:
+                    if not tariff_name and not subset:
+                        continue
+                    try:
+                        quote = catalog.quote(class_name, tariff_name, list(subset))
+                    except Exception:
+                        continue
+                    if quote.get("ok") and int(quote.get("total", -1)) == claimed:
+                        return True
+        return False
+
     def _unverified_total(self, user_id, text) -> bool:
         """«Итого N ₽» должно совпадать с проверенным расчётом или отсутствовать.
 
-        Итог считает Python: модель не суммирует цены сама и не завышает сумму.
+        Для записи итог даёт только Python. Для обычного вопроса допускаем
+        детерминированную проверку по свежему прайсу, без ещё одного вызова AI.
         """
+        state = self._state[user_id]
+        quote = state.get("quote")
+        authoritative = None
+        if self._state_fresh(quote, self._catalog_ttl_sec):
+            authoritative = quote.get("total")
+        else:
+            pending = self._pending.get(user_id)
+            if pending and pending.get("quote"):
+                authoritative = pending["quote"].get("total")
+            elif isinstance(state.get("booking"), dict):
+                authoritative = state["booking"].get("total")
         for match in self._TOTAL_CLAIM.finditer(text):
             claimed = int(re.sub(r"\D", "", match[1]) or 0)
-            quote = self._state[user_id].get("quote")
-            if not self._state_fresh(quote, self._catalog_ttl_sec) or claimed != quote.get("total"):
+            if authoritative is not None:
+                if claimed != authoritative:
+                    return True
+                continue
+            if user_id in self._pending or state.get("stage") in {"awaiting_confirmation", "writing"}:
+                return True
+            if not self._catalog_total_matches(user_id, text, claimed):
                 return True
         return False
 
@@ -3211,8 +3323,17 @@ car — слова клиента с исходной цитатой; car_model 
             # Python сам — без второго поколения модели.
             if name == "create_booking":
                 state_now = self._state.get(user.id, {})
+                facts_now = state_now.setdefault("facts", {})
                 repeat = state_now.get("repeat_last") or {}
-                plate_known = (args.get("plate") or state_now.get("facts", {}).get("plate") or repeat.get("plate"))
+                selected_car = (facts_now.get("car_model") or args.get("car") or facts_now.get("car")
+                                or repeat.get("car") or "")
+                if self.config.car_plate_required and not (args.get("plate") or facts_now.get("plate")):
+                    saved_plate = await asyncio.to_thread(self._saved_plate, user.id, selected_car)
+                    if saved_plate:
+                        args["plate"] = facts_now["plate"] = saved_plate
+                repeat_plate = (repeat.get("plate")
+                                if repeat and car_key(selected_car) == car_key(repeat.get("car") or "") else None)
+                plate_known = (args.get("plate") or facts_now.get("plate") or repeat_plate)
                 if self.config.car_plate_required and not plate_known:
                     return {"ok": False, "field": "plate", "direct_reply": _CLARIFICATION_QUESTIONS["plate"]}
             if any(field_name not in args or not args[field_name] for field_name in schema["required"]):
