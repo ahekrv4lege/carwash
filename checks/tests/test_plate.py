@@ -26,8 +26,8 @@ class OfflinePlateTests(unittest.TestCase):
         self.store, self.spreadsheet = fixture(self.temp.name, sheets_adaptive_enabled=False)
         self.sheet = self.spreadsheet.worksheet("Записи")
 
-    def with_plate_column(self):
-        self.sheet.values[0].append("Госномер")
+    def with_plate_column(self, header="Госномер"):
+        self.sheet.values[0].append(header)
         return self.store.create_booking(**booking(plate="а 123 ав 77"))
 
     def test_plate_is_written_to_the_sheet(self):
@@ -37,6 +37,13 @@ class OfflinePlateTests(unittest.TestCase):
         result = self.store.create_booking(**booking(telegram_id=222, car="Other", plate="в 777 вв 11"))
         self.assertTrue(result["ok"], result)
         self.assertEqual(str(self.sheet.values[2][-1]), "в 777 вв 11")
+
+    def test_plate_is_written_via_alias_header(self):
+        # Реальная колонка может называться «Гос. Номер»: ищем по алиасам заголовка.
+        result = self.with_plate_column("Гос. Номер")
+        self.assertTrue(result["ok"], result)
+        plate_column = self.sheet.values[0].index("Гос. Номер")
+        self.assertEqual(str(self.sheet.values[1][plate_column]), "а 123 ав 77")
 
     def test_flag_demands_the_plate_when_column_exists(self):
         required = replace(self.store.config, car_plate_required=True)
@@ -159,6 +166,14 @@ class DirectPlateAskTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("госномер", answer.lower())
         self.assertEqual(self.transport.call_count, 1)  # один вызов модели: вопрос задал Python
         self.assertFalse(self.spreadsheet.worksheet("Записи").writes)  # запись не начиналась
+
+    def test_proposal_message_shows_the_plate(self):
+        offer = {"action": "create_booking", "args": {"date": "2099-01-01", "time": "10:00",
+                 "car": "Toyota Camry", "plate": "а 123 ав 77", "client_name": "Саша",
+                 "phone": "70001112233", "comment": ""},
+                 "quote": {"size_class": "Легковой", "tariff": "Базовый", "lines": [], "total": 700, "currency": "₽"}}
+        text = self.agent._proposal_text(offer)
+        self.assertIn("Госномер: а 123 ав 77", text)
 
 
 if __name__ == "__main__":

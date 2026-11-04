@@ -23,7 +23,7 @@ from requests.exceptions import ConnectionError as HTTPConnectionError, Timeout 
 from google.auth.exceptions import TransportError
 
 from config import Config
-from adaptive import (AdaptiveSheets, BOOKING_FIELDS, MappingError, SlotUnavailable, cell_name,
+from adaptive import (AdaptiveSheets, ALIASES, BOOKING_FIELDS, MappingError, SlotUnavailable, cell_name,
                       is_duration_header, normalize_header, parse_duration_minutes)
 
 log = logging.getLogger(__name__)
@@ -1287,9 +1287,12 @@ class Store:
             if not booking_time or not self._is_future(booking_date, booking_time):
                 return _failure("Это время уже прошло или слишком близко к текущему моменту")
             # Госномер обязателен только если настройка включена и в таблице есть колонка:
-            # старые таблицы без поля продолжают работать.
+            # старые таблицы без поля продолжают работать. Колонка ищется по алиасам —
+            # так же, как и остальные поля («Госномер», «Гос. Номер», «Номер авто», plate…).
             plate = (plate or "").strip()[:40]
-            plate_column_present = ("Госномер" in self._adaptive.booking_fields()) if self._adaptive else "Госномер" in headers
+            plate_aliases = {normalize_header(alias) for alias in ALIASES["Госномер"]}
+            plate_column_present = ("Госномер" in self._adaptive.booking_fields()) if self._adaptive else any(
+                normalize_header(header) in plate_aliases for header in headers)
             if self.config.car_plate_required and not plate and plate_column_present:
                 return _failure("Не указан госномер автомобиля")
             duplicate = next((record for record in booking_rows if pick(record, "Telegram ID") == str(telegram_id)
@@ -1388,6 +1391,12 @@ class Store:
                 if self._get_slots() != slots or self._get_bookings() != (headers, booking_rows):
                     return _failure("Расписание или записи изменились. Проверьте время заново")
                 row = [data.get(header.strip().lower(), "") for header in headers]
+                # Колонка госномера ищется по алиасам заголовка: заголовок может быть
+                # «Гос. Номер», «Номер авто» и т.п., а ключ в data — только «госномер».
+                plate_column = next((index + 1 for index, header in enumerate(headers)
+                                     if normalize_header(header) in plate_aliases), None)
+                if plate_column and plate_column <= len(row):
+                    row[plate_column - 1] = plate
                 worksheet.append_row(row, value_input_option="RAW")
             self._invalidate("bookings")
             self.refresh_bookings_sheet()

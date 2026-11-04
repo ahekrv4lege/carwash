@@ -3399,11 +3399,12 @@ car — слова клиента с исходной цитатой; car_model 
                 value += "\nСейчас недоступно:\n" + "\n".join("— " + item for item in line["not_included_now"])
             lines.append(value)
         composition = "\n".join(lines)
+        plate_line = f"\nГосномер: {arguments['plate']}" if arguments.get("plate") else ""
         return (f"Предлагаю запись:\nДата: {day(arguments['date'])}\nВремя: {arguments['time']}\n"
                 f"Автомобиль: {arguments['car']}, класс «{quote['size_class']}»\n"
                 f"Тариф: {quote['tariff'] or 'без тарифа'}\nСостав:\n{composition}\n"
                 f"Итого: {quote['total']} {quote['currency']}\nИмя: {arguments['client_name']}\n"
-                f"Телефон: {arguments['phone']}\nПожелания: {arguments.get('comment') or 'нет'}\n\n"
+                f"Телефон: {arguments['phone']}{plate_line}\nПожелания: {arguments.get('comment') or 'нет'}\n\n"
                 "Проверьте данные и выберите кнопку «Подтвердить». Если что-то неверно, напишите правильные данные в чат.")
 
     async def _confirm(self, user, pending):
