@@ -23,7 +23,7 @@ from requests.exceptions import ConnectionError as HTTPConnectionError, Timeout 
 from google.auth.exceptions import TransportError
 
 from config import Config
-from adaptive import (AdaptiveSheets, ALIASES, BOOKING_FIELDS, MappingError, SlotUnavailable, cell_name,
+from adaptive import (AdaptiveSheets, BOOKING_HEADERS, BOOKING_FIELDS, MappingError, SlotUnavailable, cell_name,
                       is_duration_header, normalize_header, parse_duration_minutes)
 
 log = logging.getLogger(__name__)
@@ -66,7 +66,7 @@ def within_work_hours(value: str) -> bool:
 SERVICE_FIXED_COLS = {"услуга", "описание", "доступна", "длительность"}
 
 # Колонки листа «Записи». Порядок в таблице может быть любым — бот ищет колонки по названию.
-BOOKING_HEADERS = BOOKING_FIELDS
+BOOKING_FIELDS = list(BOOKING_FIELDS)
 
 # Фоны строк в RGB 0..1: отмена — красноватый, архив и прошедшее — серый, пустой ряд — белый.
 CANCEL_COLOR = (0.98, 0.80, 0.80)
@@ -543,18 +543,23 @@ class Store:
         self._write_lock = BookingLock(config.booking_coordination_file)
         self._cache: dict[str, tuple[float, Any]] = {}
         self._spreadsheet = None  # gspread.Spreadsheet, подключаемся лениво
-        self._adaptive = None
+        # Единственный backend: AI-карта + адресные операции по физическим координатам.
+        self._adaptive = AdaptiveSheets(config, self._get_spreadsheet)
         self._observed = None
         self._class_rules_absent = False  # лист «Классы» отсутствует: не перечитываем его зря
-        if config.sheets_adaptive_enabled:
-            self._adaptive = AdaptiveSheets(config, self._get_spreadsheet)
 
-    def refresh_schema(self, force: bool = True, validate: bool = False) -> dict:
-        if not self._adaptive:
-            raise RuntimeError("Включите SHEETS_ADAPTIVE_ENABLED для проверки mappings")
+    def refresh_schema(self, force: bool = True, validate: bool = False, *,
+                       explicit: bool = False) -> dict:
         with self._lock:
             self._class_rules_absent = False
-            document = self._adaptive.refresh(force=force, validate=validate)
+            document = self._adaptive.refresh(force=force, validate=validate, explicit=explicit)
+            self._invalidate("catalog", "slots", "bookings", "bays")
+            return document
+
+    def check_schema(self, *, explicit: bool = False) -> dict:
+        """Фоновая структурная проверка; AI только при реальном изменении."""
+        with self._lock:
+            document = self._adaptive.check_structure(explicit=explicit)
             self._invalidate("catalog", "slots", "bookings", "bays")
             return document
 
@@ -571,25 +576,15 @@ class Store:
         return self._spreadsheet
 
     def _table(self, title: str, observed=None) -> tuple[list[str], list[dict[str, Any]]]:
-        """Лист -> (заголовки, список строк-словарей). Пустые строки пропускаются."""
-        if self._adaptive:
-            roles = {self.config.sheet_services: "services", self.config.sheet_tariffs: "tariffs",
-                     self.config.sheet_slots: "slots", self.config.sheet_bookings: "bookings"}
-            return self._adaptive.table(roles[title], _observed=self._observed if observed is None else observed)
-        values = self._get_spreadsheet().worksheet(title).get_all_values()
-        if not values:
-            return [], []
-        headers = [header.strip() for header in values[0]]
-        rows: list[dict[str, Any]] = []
-        for index, raw in enumerate(values[1:], start=2):
-            if not any(str(cell).strip() for cell in raw):
-                continue
-            record: dict[str, Any] = {
-                header: (raw[column_index] if column_index < len(raw) else "") for column_index, header in enumerate(headers) if header
-            }
-            record["__row__"] = index
-            rows.append(record)
-        return headers, rows
+        """Роль карты -> (канонические заголовки, строки-словари)."""
+        roles = {self.config.sheet_services: "services", self.config.sheet_tariffs: "tariffs",
+                 self.config.sheet_slots: "slots", self.config.sheet_bookings: "bookings",
+                 self.config.sheet_durations: "durations", self.config.sheet_classes: "classes",
+                 self.config.sheet_archive: "archive", self.config.sheet_resources: "resources"}
+        if title not in roles:
+            raise MappingError(f"Неизвестная роль листа для «{title}»")
+        return self._adaptive.table(roles[title],
+                                    _observed=self._observed if observed is None else observed)
 
     @contextmanager
     def fresh_tables(self):
@@ -598,7 +593,7 @@ class Store:
             previous = self._observed
             self._invalidate("catalog", "slots", "bookings", "bays")
             try:
-                self._observed = self._adaptive.observe() if self._adaptive else None
+                self._observed = self._adaptive.observe()
                 yield
             except BaseException:
                 self._invalidate("catalog", "slots", "bookings", "bays")
@@ -648,7 +643,7 @@ class Store:
                 if "Нет подтверждённой области tariffs" not in str(error):
                     raise
                 issues = (self._adaptive.document or {}).get("issues", [])
-                if any("область tariffs" in issue for issue in issues):
+                if any("tariffs" in issue for issue in issues):
                     raise  # лист тарифов есть, но не распознан: молча терять его нельзя
                 observed = self._adaptive.observe(roles=("services",))
         headers, rows = self._table(self.config.sheet_services, observed)
@@ -689,6 +684,9 @@ class Store:
         except MappingError as error:
             if "Нет подтверждённой области" not in str(error):
                 raise  # лист тарифов есть, но повреждён: молча терять его нельзя
+            issues = (self._adaptive.document or {}).get("issues", [])
+            if any("tariffs" in issue for issue in issues):
+                raise  # лист тарифов есть, но не распознан
             # Тарифов в книге может не быть: цена считается по услугам, выдумывать пакеты нельзя.
             tariff_headers, tariff_rows = [], []
         tariff_duration_header = next((header for header in tariff_headers if is_duration_header(header)), None)
@@ -753,31 +751,10 @@ class Store:
                 services[name] = replace(service, duration_minutes=minutes)
 
     def _duration_overrides(self) -> dict[str, int]:
-        if self._adaptive:
-            try:
-                _, rows = self._adaptive.table("durations")
-            except MappingError:
-                return {}  # листа длительностей нет или он не подтверждён: это допустимо
-        else:
-            try:
-                values = self._get_spreadsheet().worksheet(self.config.sheet_durations).get_all_values()
-            except (WorksheetNotFound, StopIteration):
-                return {}
-            except Exception as error:
-                log.warning("Не удалось прочитать лист «%s» (%s)", self.config.sheet_durations, type(error).__name__)
-                return {}
-            if not values:
-                return {}
-            headers = [str(header).strip() for header in values[0]]
-            service_column = next((index for index, header in enumerate(headers)
-                                   if header.lower() in {"услуга", "service", "название"}), None)
-            duration_column = next((index for index, header in enumerate(headers) if is_duration_header(header)), None)
-            if service_column is None or duration_column is None:
-                log.warning("Лист «%s»: нужны колонки «Услуга» и «Длительность»", self.config.sheet_durations)
-                return {}
-            rows = [{headers[service_column]: (raw[service_column] if service_column < len(raw) else ""),
-                     headers[duration_column]: (raw[duration_column] if duration_column < len(raw) else "")}
-                    for raw in values[1:]]
+        try:
+            _, rows = self._adaptive.table("durations")
+        except MappingError:
+            return {}  # листа длительностей нет или он не подтверждён: это допустимо
         overrides: dict[str, int] = {}
         for record in rows:
             name = str(pick(record, "Услуга") or "").strip()
@@ -788,50 +765,33 @@ class Store:
 
     # ---------- правила классов (лист «Классы») ----------
     def _load_class_rules(self, classes: list[str]) -> list[tuple[str, str]]:
-        """Читаем необязательные правила, отбрасывая неизвестные и противоречивые классы."""
+        """Необязательные правила «модель автомобиля → класс» из карты Sheets."""
         if self._class_rules_absent:
             return []
         try:
-            values = self._get_spreadsheet().worksheet(self.config.sheet_classes).get_all_values()
-        except (WorksheetNotFound, StopIteration):
-            # Листа нет: запоминаем, чтобы не повторять заведомо пустой запрос при каждом прайсе.
+            _, records = self._adaptive.table("classes")
+        except MappingError:
             self._class_rules_absent = True
-            return []
-        except Exception as error:
-            log.warning("Не удалось прочитать лист «%s» (%s)", self.config.sheet_classes, type(error).__name__)
-            return []
-        if not values:
-            return []
-        wanted_car = {"автомобиль", "модель", "машина"}
-        wanted_class = {"класс", "категория", "габарит"}
-        headers = [str(header).strip().lower() for header in values[0]]
-        car_column = next((index for index, header in enumerate(headers) if header in wanted_car), None)
-        class_column = next((index for index, header in enumerate(headers) if header in wanted_class), None)
-        if car_column is None or class_column is None:
-            log.warning("Лист «%s»: нужны колонки «Автомобиль» и «Класс»", self.config.sheet_classes)
-            return []
+            return []  # листа классов может не быть — это допустимо
         by_lower = {class_name.lower(): class_name for class_name in classes}
         pairs: list[tuple[str, str]] = []
-        for raw in values[1:]:
-            car = str(raw[car_column]).strip() if car_column < len(raw) else ""
-            rule_class = str(raw[class_column]).strip() if class_column < len(raw) else ""
+        for record in records:
+            car = pick(record, "Автомобиль").strip()
+            rule_class = pick(record, "Класс").strip()
             if not car or not rule_class:
                 continue
             matched = by_lower.get(rule_class.lower())
             if not matched:
-                log.warning("Лист «%s»: правило «%s → %s» отброшено: класса нет в прайсе",
-                            self.config.sheet_classes, car, rule_class)
+                log.warning("Правило «%s → %s» отброшено: класса нет в прайсе", car, rule_class)
                 continue
             pairs.append((car, matched))
-        # Один автомобиль под разными классами — противоречие: не используем оба правила.
         variants: dict[str, set[str]] = {}
         for car, matched in pairs:
             variants.setdefault(car.casefold(), set()).add(matched)
         conflicts = {key for key, matched_classes in variants.items() if len(matched_classes) > 1}
         for key in conflicts:
-            matched_classes = variants[key]
-            log.warning("Лист «%s»: у «%s» противоречивые классы (%s) — правило не используется",
-                        self.config.sheet_classes, key, ", ".join(sorted(matched_classes)))
+            log.warning("У «%s» противоречивые классы (%s) — правило не используется",
+                        key, ", ".join(sorted(variants[key])))
         return [(car, matched) for car, matched in pairs if car.casefold() not in conflicts]
 
     def price_list(self) -> dict:
@@ -978,10 +938,11 @@ class Store:
     def _get_bays(self):
         def load():
             try:
-                values = self._get_spreadsheet().worksheet(self.config.sheet_resources).get_all_values()
-            except (WorksheetNotFound, StopIteration):
+                headers, rows = self._adaptive.table("resources")
+            except MappingError:
                 return None
             from resources import parse_bays
+            values = [headers] + [[pick(record, header) for header in headers] for record in rows]
             catalog = self.get_catalog()
             return parse_bays(values, catalog.size_classes, catalog.services)
         return self._cached("bays", self.config.slots_cache_sec, load)
@@ -1056,11 +1017,12 @@ class Store:
             return rows, self._get_slots()
 
     def _archive_rows(self) -> list[dict[str, Any]]:
-        """Строки архивного листа в том же виде, что возвращает _table.
-
-        Лист служебный и в картах адаптива не участвует, поэтому читается напрямую;
-        отсутствует или не читается — статистика считается без него.
-        """
+        """Архив из карты, а для вновь созданного служебного листа — по его шапке."""
+        try:
+            _, rows = self._adaptive.table("archive")
+            return rows
+        except MappingError:
+            pass
         try:
             values = self._get_spreadsheet().worksheet(self.config.sheet_archive).get_all_values()
         except (WorksheetNotFound, StopIteration):
@@ -1286,15 +1248,18 @@ class Store:
             booking_time = self.booking_time(time_str, slots)
             if not booking_time or not self._is_future(booking_date, booking_time):
                 return _failure("Это время уже прошло или слишком близко к текущему моменту")
-            # Госномер обязателен только если настройка включена и в таблице есть колонка:
-            # старые таблицы без поля продолжают работать. Колонка ищется по алиасам —
-            # так же, как и остальные поля («Госномер», «Гос. Номер», «Номер авто», plate…).
+            # Госномер пишется только по физическому адресу из проверенной карты.
+            # Если CAR_PLATE_REQUIRED=true, а колонки нет — запись блокируется,
+            # чтобы не потерять обязательные данные молча.
             plate = (plate or "").strip()[:40]
-            plate_aliases = {normalize_header(alias) for alias in ALIASES["Госномер"]}
-            plate_column_present = ("Госномер" in self._adaptive.booking_fields()) if self._adaptive else any(
-                normalize_header(header) in plate_aliases for header in headers)
-            if self.config.car_plate_required and not plate and plate_column_present:
-                return _failure("Не указан госномер автомобиля")
+            plate_column_present = "Госномер" in self._adaptive.booking_fields()
+            if self.config.car_plate_required:
+                if not plate_column_present:
+                    return _failure("В таблице записей нет подтверждённой колонки для госномера; запись недоступна")
+                if not plate:
+                    return _failure("Не указан госномер автомобиля")
+            elif plate and not plate_column_present:
+                log.warning("Госномер не сохранён: в карте записей нет подходящей колонки")
             duplicate = next((record for record in booking_rows if pick(record, "Telegram ID") == str(telegram_id)
                               and parse_date(pick(record, "Дата")) == booking_date and parse_time(pick(record, "Время")) == booking_time
                               and pick(record, "Автомобиль").casefold() == car.casefold() and self._is_active(record)), None)
@@ -1381,23 +1346,10 @@ class Store:
                 **({} if duration_minutes is None else {"длительность": str(duration_minutes)}),
                 **({"бокс": bay} if isinstance(slots, DurationSchedule) and bay else {}),
             }
-            if self._adaptive:
-                try:
-                    self._adaptive.create(data, expected_bookings=booking_rows)
-                except SlotUnavailable as error:
-                    return _failure(str(error), free_times_that_day=self._free_times(booking_date, slots, busy))
-            else:
-                self._invalidate("slots", "bookings")
-                if self._get_slots() != slots or self._get_bookings() != (headers, booking_rows):
-                    return _failure("Расписание или записи изменились. Проверьте время заново")
-                row = [data.get(header.strip().lower(), "") for header in headers]
-                # Колонка госномера ищется по алиасам заголовка: заголовок может быть
-                # «Гос. Номер», «Номер авто» и т.п., а ключ в data — только «госномер».
-                plate_column = next((index + 1 for index, header in enumerate(headers)
-                                     if normalize_header(header) in plate_aliases), None)
-                if plate_column and plate_column <= len(row):
-                    row[plate_column - 1] = plate
-                worksheet.append_row(row, value_input_option="RAW")
+            try:
+                self._adaptive.create(data, expected_bookings=booking_rows)
+            except SlotUnavailable as error:
+                return _failure(str(error), free_times_that_day=self._free_times(booking_date, slots, busy))
             self._invalidate("bookings")
             self.refresh_bookings_sheet()
 
@@ -1433,167 +1385,10 @@ class Store:
         return max(identifiers, default=0) + 1
 
     def refresh_bookings_sheet(self, *, sort: bool = False) -> None:
-        """«Записи»: цветовая разметка строк; сортировка — только по явному запросу.
-
-        Нумерация ID держится по порядку строк (1..N без пропусков): перенумерация
-        выполняется при периодическом обслуживании после сортировки и после
-        удаления строк при переносе в архив. Операции клиента (создание, отмена,
-        перенос) номера не сдвигают, чтобы ссылки по ID не менялись посреди диалога;
-        новая запись получает максимум известных ID + 1.
-
-        Физическая перестановка строк (sort=True, периодическое обслуживание)
-        выполняется только когда она безопасна:
-        - колонки «Дата»/«Время» ищутся по названиям, а не по фиксированным позициям;
-        - при формулах в данных или данных правее шапки перестановка пропускается:
-          полная перезапись разрушила бы их;
-        - записываются значения в FORMULA-рендере («как введено»), поэтому литералы
-          возвращаются без искажения типов; RAW безопасен, потому что формул в данных нет.
-        Адаптивные раскладки этот код не переписывает: адресные операции adaptive.py
-        не нуждаются в перестановке строк, а их структуру знает только mappings.
-        """
+        """Сортировка/перенумерация только через карту физических координат."""
         with self._write_lock, self._lock:
-            if self._adaptive:
-                return
-            worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
-            if not hasattr(worksheet, "update"):
-                return  # синтетический лист без перезаписи: перезапись и цвета недоступны
-            values = worksheet.get_all_values()
-            if len(values) < 2:
-                return
-            headers, body = values[0], values[1:]
-            if sort:
-                body = self._sort_bookings_body(worksheet, headers, body) or body
-                self._renumber_booking_ids(worksheet, headers)
-            self._paint_bookings(worksheet, headers, body)
+            self._adaptive.sort_bookings(sort=sort)
             self._invalidate("bookings")
-
-    def _sort_bookings_body(self, worksheet, headers: list[str], body: list[list]) -> list[list] | None:
-        """Хронологическая перестановка строк без изменения их содержимого и ID.
-
-        Возвращает переставленный body для раскраски или None, если перестановка
-        не нужна или небезопасна.
-        """
-        date_index = header_index(headers, "Дата", "date")
-        time_index = header_index(headers, "Время", "time")
-        if date_index is None or time_index is None:
-            log.warning("«Записи»: колонки «Дата»/«Время» не распознаны — сортировка пропущена")
-            return None
-        width = len(headers)
-        # Данные правее шапки боту не принадлежат: их перемещение может их разрушить.
-        if any(len(row) > width and any(str(cell).strip() for cell in row[width:]) for row in body):
-            log.warning("«Записи»: есть данные правее распознанной шапки — сортировка пропущена")
-            return None
-        raw = worksheet.get_all_values(value_render_option="FORMULA")
-        raw_body = raw[1:] if len(raw) > 1 else []
-        if len(raw_body) != len(body):
-            log.warning("«Записи»: лист изменился между чтениями — сортировка пропущена")
-            return None
-        if any(str(cell).startswith("=") for row in raw_body for cell in row):
-            log.warning("«Записи»: в данных есть формулы — сортировка пропущена, чтобы их не разрушить")
-            return None
-
-        def order_key(index: int):
-            row = body[index]
-            booking_date = parse_date(str(row[date_index])) if date_index < len(row) else None
-            booking_time = parse_time(str(row[time_index])) if time_index < len(row) else ""
-            return (booking_date or date(9999, 12, 31), booking_time or "99:99")
-
-        order = sorted(range(len(body)), key=order_key)
-        if order == list(range(len(body))):
-            return None  # уже по хронологии: перезапись не нужна
-        ordered_raw = [list((raw_body[index] + [""] * width)[:width]) for index in order]
-        last_column = re.match(r"[A-Z]+", cell_name(1, width)).group()
-        worksheet.update(f"A2:{last_column}{len(body) + 1}", ordered_raw, value_input_option="RAW")
-        return [list((body[index] + [""] * width)[:width]) for index in order]
-
-    def _renumber_booking_ids(self, worksheet, headers: list[str]) -> int:
-        """Перенумерация колонки «ID» по порядку строк: 1..N по возрастанию без пропусков.
-
-        Нумерация листа — пользовательская: после удаления строк (перенос в архив,
-        правка администратором) и хронологической сортировки номера выставляются
-        заново сверху вниз. Выполняется только при обслуживании (sort-путь и следом
-        за удалениями при переносе в архив) — операции клиента номера не сдвигают.
-        Безопасность: пустые ряды среди данных сначала убирает перенос в архив,
-        поэтому перенумерация их ждёт; формулы в данных и колонка «ID» с формулой
-        блокируют перезапись; адаптивные раскладки не трогаются (их маркеры
-        «Запись <ID>» завязаны на текущие номера). Возвращает число строк.
-        """
-        if self._adaptive:
-            return 0
-        id_index = header_index(headers, "ID", "id")
-        if id_index is None:
-            return 0
-        try:
-            values = worksheet.get_all_values(value_render_option="FORMULA")
-        except Exception as error:
-            log.warning("«Записи»: ID не перенумерованы — лист не прочитан (%s)", type(error).__name__)
-            return 0
-        if len(values) < 2:
-            return 0
-        if any(str(cell).startswith("=") for row_values in values[1:] for cell in row_values):
-            log.warning("«Записи»: в данных есть формулы — перенумерация ID пропущена")
-            return 0
-        filled = [index for index, row_values in enumerate(values[1:], 1)
-                  if any(str(cell).strip() for cell in row_values)]
-        if not filled:
-            return 0
-        last = filled[-1]
-        if len(filled) != last:
-            return 0  # пустые ряды среди данных уберёт перенос в архив, следом перенумерация
-        current = [str(row_values[id_index]).strip() if id_index < len(row_values) else ""
-                   for row_values in values[1:last + 1]]
-        expected = [str(number) for number in range(1, last + 1)]
-        if current == expected:
-            return 0  # нумерация уже по порядку
-        letter = re.match(r"[A-Z]+", cell_name(1, id_index + 1)).group()
-        grid = [[number] for number in expected]
-        try:
-            worksheet.update(f"{letter}2:{letter}{last + 1}", grid, value_input_option="RAW")
-        except AttributeError:
-            # Синтетические листы в тестах умеют только поячеечную запись.
-            for offset, value in enumerate(grid, start=2):
-                worksheet.update_cell(offset, id_index + 1, value[0])
-        log.info("«Записи»: колонка «ID» перенумерована по порядку строк: %d строк", last)
-        return last
-
-    def _paint_bookings(self, worksheet, headers, rows) -> None:
-        if not hasattr(worksheet, "format"):
-            return
-        now_value = self.now()
-        today = now_value.date()
-        created_idx = headers.index("Создано") if "Создано" in headers else None
-        status_idx = headers.index("Статус") if "Статус" in headers else None
-        date_idx = headers.index("Дата") if "Дата" in headers else 2
-        last_col = chr(ord("A") + len(headers) - 1) if len(headers) <= 26 else "Z"
-        colors: dict[tuple[float, float, float], list[str]] = {}
-        for offset, row in enumerate(rows):
-            sheet_row = offset + 2
-            status = str(row[status_idx]).strip().lower() if status_idx is not None and status_idx < len(row) else ""
-            booking_date = parse_date(str(row[date_idx])) if date_idx < len(row) else None
-            created = None
-            if created_idx is not None and created_idx < len(row):
-                try:
-                    created = datetime.strptime(str(row[created_idx]).strip(), "%d.%m.%Y %H:%M")
-                except ValueError:
-                    created = None
-            if created is not None and created.tzinfo is None:
-                created = created.replace(tzinfo=self.timezone)
-            if status.startswith("отмен"):
-                color = CANCEL_COLOR  # отмена - красноватый
-            elif status.startswith("архив") or (booking_date and booking_date < today):
-                color = ARCHIVE_COLOR  # прошлое - серый
-            elif created and (now_value - created) <= timedelta(hours=24):
-                color = (0.85, 0.94, 0.82)  # новая за сутки - зелёный
-            elif booking_date and booking_date >= today:
-                color = (1.0, 0.97, 0.78)  # предстоящая - жёлтый
-            elif not any(str(cell).strip() for cell in row):
-                color = WHITE_COLOR  # пустой ряд сбрасываем в белый: старая краска не должна висеть
-            else:
-                color = ARCHIVE_COLOR
-            colors.setdefault(color, []).append(f"A{sheet_row}:{last_col}{sheet_row}")
-        # Один HTTP-запрос на цвет: gspread объединяет список диапазонов в один batch_update.
-        for color, ranges in colors.items():
-            worksheet.format(ranges, {"backgroundColor": {"red": color[0], "green": color[1], "blue": color[2]}})
 
     def _paint_archive_sheet(self, archive) -> None:
         """Архивный лист: отменённые записи — красным, остальной архив — серым.
@@ -1637,8 +1432,6 @@ class Store:
         с физикой не совпадает при перестановке колонок и направила бы «Архив»
         в чужое поле. Остальные данные строки не затрагиваются.
         """
-        from adaptive import cell_name
-
         today = self.now().date()
         with self._write_lock, self._lock:
             headers, rows = self._table(self.config.sheet_bookings)
@@ -1768,7 +1561,7 @@ class Store:
                 except (WorksheetNotFound, StopIteration):
                     worksheet = None
                 if worksheet is not None:
-                    self._renumber_booking_ids(worksheet, headers)
+                    pass  # ID остаются ссылками клиентов; явная сортировка нумерует отдельно
             try:
                 self._paint_archive_sheet(self._get_spreadsheet().worksheet(self.config.sheet_archive))
             except (WorksheetNotFound, StopIteration):
@@ -1814,12 +1607,12 @@ class Store:
             mapped_by_row = {}
             for record in sheet_records:
                 mapped = set()
-                for field in record:
-                    if field.startswith("__"):
+                for field_name in record:
+                    if field_name.startswith("__"):
                         continue
                     try:
                         if self._adaptive:
-                            mapped.add(self._adaptive.writable_column(sheet_id, field))
+                            mapped.add(self._adaptive.writable_column(sheet_id, field_name))
                         elif field in headers:
                             # Офлайн: колонка поля — позиция в шапке листа «Записей».
                             mapped.add(headers.index(field) + 1)
@@ -1864,181 +1657,21 @@ class Store:
         return deleted
 
     def clean_expired_slots(self) -> int:
-        """Обслуживание листа «Слоты»: очистка прошедших дат, сдвиг строк вверх,
-        дописывание недостающих будущих дат по прошлой неделе.
-
-        Локальный день бота — часовой пояс задан в .env. Линейную раскладку
-        («Дата, Время, Постов») обслуживаем адресно; сдвиг пропускается при
-        формулах или непонятных непустых строках; сеточные раскладки (дата
-        в названии листа) и график «Начало/Конец» без колонки «Дата» не
-        трогаются. Возвращает число очищенных строк.
-        """
+        """Обслуживание слотов по карте: прошедшие строки, сдвиг, будущие даты."""
         today = self.now().date()
         with self._write_lock, self._lock:
-            if self._adaptive:
-                cleared, added = self._adaptive.clean_expired_slots(today)
-                if cleared or added:
-                    self._invalidate("slots")
-                return cleared
-            try:
-                worksheet = self._get_spreadsheet().worksheet(self.config.sheet_slots)
-                values = worksheet.get_all_values(value_render_option="FORMULA",
-                                                  date_time_render_option="FORMATTED_STRING")
-            except Exception as error:
-                log.warning("Слоты не прочитаны; обслуживание пропущено (%s)", type(error).__name__)
-                return 0
-            if not values:
-                return 0
-            headers = [str(header).strip() for header in values[0]]
-            if "Дата" not in headers:
-                return 0  # график работы или незнакомая раскладка
-            date_column = headers.index("Дата") + 1
-            columns = {index + 1 for index, header in enumerate(headers)
-                       if header in {"Дата", "Время", "Постов", "Мест", "Боксов"}}
-            width = max(columns)
-            known, has_formulas = {}, False
-            for row, row_values in enumerate(values[1:], 2):
-                if not any(str(field_value).strip() for field_value in row_values):
-                    continue
-                if any(str(field_value).startswith("=") for field_value in row_values):
-                    has_formulas = True
-                slot_date = parse_date(str(row_values[date_column - 1]).strip()) if len(row_values) >= date_column else None
-                if slot_date:
-                    known.setdefault(slot_date, []).append((row, row_values))
-            # Шаг 1: автопроизводство недостающих будущих дат до чистки — шаблоном
-            # служат ещё живые строки прошлых недель.
-            added, appended_entries = self._slots_fill_future(worksheet, values, today)
-
-            past_updates, cleared_rows = [], 0
-            for slot_date, entries in list(known.items()):
-                if slot_date >= today:
-                    continue  # будущий или сегодняшний день не трогаем
-                for row, row_values in entries:
-                    if any(str(field_value).startswith("=") for field_value in row_values):
-                        log.warning("Слоты, строка %d: формула в прошедшей строке — не очищается", row)
-                        continue
-                    for column in columns:
-                        past_updates.append({"range": cell_name(row, column), "values": [[""]]})
-                    cleared_rows += 1
-                known.pop(slot_date)
-            if past_updates:
-                self._batch_sheet_cells(worksheet, past_updates)
-            if cleared_rows:
-                log.info("Слоты: очищено устаревших строк: %d", cleared_rows)
-
-            if not has_formulas:
-                future_entries = sorted(
-                    tuple((row, raw) for entries in known.values() for (row, raw) in entries)
-                    + tuple(appended_entries),
-                    key=lambda item: item[0])
-                self._slots_shift_up(worksheet, future_entries, width)
-            else:
-                log.info("Слоты: формулы в области — сдвиг пропущен")
-            if cleared_rows or added:
+            cleared, added = self._adaptive.clean_expired_slots(today)
+            if cleared or added:
                 self._invalidate("slots")
-            if added:
-                log.info("Слоты: добавлено строк будущего расписания: %d", added)
-            return cleared_rows
-
-    def _batch_sheet_cells(self, worksheet, updates: list[dict]) -> None:
-        try:
-            worksheet.batch_update(updates, value_input_option="RAW")
-        except AttributeError:
-            # Синтетические листы в тестах умеют только поячеечную запись.
-            for update in updates:
-                match = re.fullmatch(r"([A-Z]+)(\d+)", update["range"])
-                if not match:
-                    continue
-                column_number = 0
-                for letter in match.group(1):
-                    column_number = column_number * 26 + ord(letter) - 64
-                worksheet.update_cell(int(match.group(2)), column_number, update["values"][0][0])
-        except Exception as error:
-            log.warning("Слоты: запись ячеек не удалась (%s)", type(error).__name__)
-
-    def _slots_shift_up(self, worksheet, entries: list, width: int) -> None:
-        """Переписать будущие строки плотно со второй строки листа и очистить хвост."""
-        updates: list[dict] = []
-        for offset, (source_row, raw) in enumerate(entries):
-            target_row = 2 + offset
-            if target_row == source_row:
-                continue
-            full = (list(raw) + [""] * width)[:width]
-            for column, value in enumerate(full, 1):
-                updates.append({"range": cell_name(target_row, column), "values": [[value]]})
-        if updates:
-            self._batch_sheet_cells(worksheet, updates)
-            tail = [{"range": cell_name(row, column), "values": [[""]]}
-                    for row in range(2 + len(entries), len(worksheet.get_all_values()) + 1)
-                    for column in range(1, width + 1)]
-            self._batch_sheet_cells(worksheet, tail)
-
-    def _slots_fill_future(self, worksheet, values: list, today) -> tuple[int, list]:
-        """Дописать недостающие будущие даты по прошлым неделям (тот же день недели).
-
-        Шаблон берётся из исходного снимка; новые строки дописываются за
-        последним слотом. Возвращает (добавлено строк, [(строка, содержимое)]) —
-        сдвиг потом поднимает их вместе с остальными будущими строками.
-        """
-        width = 0
-        for row_values in values[1:]:
-            if row_values:
-                width = max(width, len(row_values))
-        existing_dates: set = set()
-        grouped: dict = {}
-        for row_values in values[1:]:
-            if not any(str(field_value).strip() for field_value in row_values):
-                continue
-            if any(str(field_value).startswith("=") for field_value in row_values):
-                continue  # формулы не используются как шаблон и не считаются содержимым дня
-            slot_date = parse_date(str(row_values[0]).strip())
-            if slot_date:
-                existing_dates.add(slot_date)
-                grouped.setdefault(slot_date, []).append(list(row_values))
-        missing = []
-        for offset in range(1, 8):
-            day = today + timedelta(days=offset)
-            if day not in existing_dates:
-                missing.append(day)
-        if not missing:
-            return 0, []
-        start_row = len(values) + 1
-        for row in range(len(values), 0, -1):
-            row_values = values[row - 1] if row <= len(values) else []
-            if any(str(field_value).strip() for field_value in row_values):
-                start_row = row + 1
-                break
-            if row == 1:
-                start_row = 2
-                break
-        updates: list[dict] = []
-        added_rows = 0
-        appended: list = []
-        for day in missing:
-            template = None
-            for weeks_back in range(1, 5):
-                candidate = day - timedelta(days=7 * weeks_back)
-                if candidate in grouped:
-                    template = grouped[candidate]
-                    break
-            if not template:
-                continue
-            new_raw = (list(template) + [""] * max(width, len(template)))[:max(width, len(template))]
-            new_raw[0] = day.strftime("%d.%m.%Y")
-            for column, value in enumerate(new_raw, 1):
-                updates.append({"range": cell_name(start_row, column), "values": [[value]]})
-            appended.append((start_row, new_raw))
-            start_row += 1
-            added_rows += 1
-        if not updates:
-            return 0, []
-        self._batch_sheet_cells(worksheet, updates)
-        return added_rows, appended
+            return cleared
 
     def my_bookings(self, telegram_id: int) -> dict:
         with self._lock:
             self._invalidate("bookings")
             _, rows = self._get_bookings()
+        identifiers = Counter(pick(record, "ID") for record in rows if pick(record, "ID"))
+        if any(count > 1 for count in identifiers.values()):
+            raise MappingError("повторяется идентификатор записи; список записей неоднозначен")
         output = []
         for record in rows:
             if pick(record, "Telegram ID") != str(telegram_id) or not self._is_active(record):
@@ -2096,17 +1729,7 @@ class Store:
             column = next((index for index, header in enumerate(headers, 1) if header.strip().lower() == "статус"), None)
             if not column:
                 return _failure("В таблице нет колонки «Статус»")
-            grid_released = None
-            if self._adaptive:
-                grid_released = self._adaptive.cancel(record, telegram_id)
-            else:
-                worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
-                self._invalidate("bookings")
-                current_headers, current_rows = self._get_bookings()
-                current = [row for row in current_rows if pick(row, "ID") == str(booking_id).strip()]
-                if current_headers != headers or len(current) != 1 or current[0] != record:
-                    return _failure("Запись изменилась. Проверьте её и подтвердите отмену заново")
-                worksheet.update_cell(record["__row__"], column, "Отмена")
+            grid_released = self._adaptive.cancel(record, telegram_id)
             self._invalidate("bookings")
             self.refresh_bookings_sheet()
             return {
@@ -2150,11 +1773,10 @@ class Store:
                 return _failure("Расположение записи изменилось. Подтвердите перенос заново")
             if (old_date, old_time) == (new_date, new_time):
                 return _failure("Запись уже назначена на это время; перенос не требуется")
-            if self._adaptive:
-                try:
-                    self._adaptive.validate_reschedule(record, new_date.isoformat())
-                except MappingError as error:
-                    return _failure(str(error))
+            try:
+                self._adaptive.validate_reschedule(record, new_date.isoformat())
+            except MappingError as error:
+                return _failure(str(error))
             if isinstance(slots, DurationSchedule):
                 raw = str(pick(record, "Длительность") or "").strip()
                 moved_duration = parse_duration_minutes(raw) if raw else None
@@ -2187,28 +1809,12 @@ class Store:
                 return result
             user_no = str(self._user_booking_position(rows, telegram_id, new_date, new_time, exclude=record))
             result["user_no"] = user_no
-            if self._adaptive:
-                try:
-                    result["grid_released"] = self._adaptive.reschedule(record, telegram_id, new_date.isoformat(), new_time, bay=bay)
-                except SlotUnavailable as error:
-                    return _failure(f"{error}. Исходная запись сохранена", free_times_that_day=self._free_times(new_date, slots, busy))
-            else:
-                columns = {header.strip().lower(): index for index, header in enumerate(headers, 1)}
-                if not {"дата", "время"} <= columns.keys():
-                    return _failure("В таблице нет колонок даты и времени; исходная запись сохранена")
-                from adaptive import cell_name
-                worksheet = self._get_spreadsheet().worksheet(self.config.sheet_bookings)
-                self._invalidate("slots", "bookings")
-                if self._get_slots() != slots or self._get_bookings() != (headers, rows):
-                    return _failure("Расписание или записи изменились. Проверьте перенос заново")
-                updates = [
-                    {"range": cell_name(record["__row__"], columns["дата"]), "values": [[new_date.strftime("%d.%m.%Y")]]},
-                    {"range": cell_name(record["__row__"], columns["время"]), "values": [[new_time]]},
-                ]
-                if bay:
-                    if "бокс" not in columns:return _failure("Для переносов нужен столбец «Бокс»")
-                    updates.append({"range": cell_name(record["__row__"], columns["бокс"]), "values": [[bay]]})
-                worksheet.batch_update(updates, value_input_option="RAW")
+            try:
+                result["grid_released"] = self._adaptive.reschedule(
+                    record, telegram_id, new_date.isoformat(), new_time, bay=bay)
+            except SlotUnavailable as error:
+                return _failure(f"{error}. Исходная запись сохранена",
+                                free_times_that_day=self._free_times(new_date, slots, busy))
             self._invalidate("bookings")
             self.refresh_bookings_sheet()
             return result

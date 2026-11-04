@@ -140,7 +140,16 @@ def validate_config(sheets_only: bool = False):
 def prepare_new_table(config, store_factory=None):
     from config import table_mapping_path
     from sheets import Store
-    target = Path(table_mapping_path(config.spreadsheet_id))
+    base = Path(table_mapping_path(config.spreadsheet_id))
+    target = base
+    if base.exists():
+        try:
+            existing_id = json.loads(base.read_text(encoding="utf-8")).get("spreadsheet_id")
+        except (OSError, ValueError, AttributeError):
+            existing_id = None
+        if existing_id not in {None, config.spreadsheet_id}:
+            key = hashlib.sha256(config.spreadsheet_id.encode()).hexdigest()[:16]
+            target = base.with_name(f"{base.stem}-{key}{base.suffix}")
     old_path = Path(config.sheets_mapping_file)
     old_journal = old_path.with_name(old_path.stem + "-operations.json")
     if not target.exists() and old_path != target and old_path.exists():
@@ -448,7 +457,9 @@ def main() -> int:
             if sheets_only:
                 from sheets import Store
                 store = Store(config)
-                document = store.refresh_schema(force=args.refresh_schema, validate=args.validate_mappings)
+                document = store.refresh_schema(force=args.refresh_schema,
+                                                validate=args.validate_mappings,
+                                                explicit=args.refresh_schema)
                 print(f"Структура: {document['validation_status']}; запись разрешена: {document['writes_enabled']}")
                 print("Конфигурация сохранена локально; Google Sheets не изменялась")
                 return 0 if document["validation_status"] == "valid" else 2

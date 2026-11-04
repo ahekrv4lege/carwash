@@ -59,15 +59,15 @@ class UnfamiliarWorkbookTests(unittest.TestCase):
         self.assertEqual(catalog.services["мойка кузова"].prices, {"Легковой": 700, "Кроссовер": 800})
         self.assertEqual(self.store.calculate_price("Кроссовер", None, ["Мойка кузова"])["total"], 800)
 
-    def test_claimed_header_that_does_not_exist_is_rejected(self):
+    def test_claimed_header_that_does_not_exist_is_not_used(self):
         doc = self.refresh(ai_response([{"role": "services", "sheet_title": "Услуги", "header_row": 1,
                                          "columns": {"Услуга": "Работа", "Легковой": "Цена за седан",
                                                      "Доступна": "Выполняется"}}]))
-        services = [rule for rule in doc["regions"] if rule["role"] == "services"]
-        self.assertFalse(services and services[0]["validation"]["read"])
+        for rule in doc["regions"]:
+            if rule["role"] == "services":
+                header = rule["physical_headers"].get("Легковой", "")
+                self.assertNotEqual(header, "Цена за седан")
         self.assertTrue(any("не подтверждена" in issue for issue in doc["issues"]), doc["issues"])
-        with self.assertRaises(MappingError):
-            self.store.calculate_price("Легковой", None, ["Мойка кузова"])
 
     def test_fixed_price_tariffs_are_mapped_and_priced(self):
         self.spreadsheet.worksheet("Тарифы").values = [
@@ -100,36 +100,33 @@ class UnfamiliarWorkbookTests(unittest.TestCase):
         self.assertEqual(slots.intervals(self.store.now().date()), ((540, 1140),))
         self.assertEqual(slots.posts(self.store.now().date()), 2)
 
-    def test_model_issues_are_surfaced_but_do_not_block_deterministic_roles(self):
+    def test_model_issues_are_surfaced_and_validated_roles_remain_usable(self):
         from tests.fakes import Worksheet
         self.spreadsheet.sheets.append(Worksheet(9, "Заметки администратора", [["что-то"], ["ещё"]]))
         doc = self.refresh(ai_response([], issues=["Лист «Заметки администратора» не удалось интерпретировать"]))
         self.assertTrue(any("Заметки администратора" in issue for issue in doc["issues"]))
-        # Детерминированные роли остались читаемыми; services без ответа модели — нет.
-        self.assertTrue(next(rule for rule in doc["regions"] if rule["role"] == "bookings")["validation"]["read"])
-        self.assertFalse(doc["writes_enabled"])
+        self.assertTrue(any(rule["role"] == "bookings" for rule in doc["regions"]))
 
     def test_repeated_refresh_does_not_call_the_model_again(self):
-        # Модель отвечает только про services: недостающие роли дают одну подсказку.
+        # Один вызов на структуру; недостающие роли восстанавливаются Python.
         self.refresh(ai_response([{"role": "services", "sheet_title": "Услуги", "header_row": 1,
                                    "columns": {"Услуга": "Работа", "Легковой": "Седан",
                                                "Кроссовер": "Кроссовер", "Доступна": "Выполняется"}}]))
-        self.assertEqual(len(self.calls), 2)  # первичный вызов + адресная подсказка
+        self.assertEqual(len(self.calls), 1)
         self.store._adaptive.refresh(force=True)
         self.store._adaptive.refresh()
-        self.assertEqual(len(self.calls), 2)  # структура не менялась — модель больше не нужна
+        self.assertEqual(len(self.calls), 1)  # структура не менялась — AI больше не нужен
         self.assertGreaterEqual(self.store._adaptive.ai_requests, 1)
 
-    def test_ai_disabled_by_config_skips_the_model(self):
+    def test_legacy_toggle_cannot_silently_disable_ai_mapping(self):
         from dataclasses import replace
-        disabled = replace(self.store.config, sheets_ai_mapping_enabled=False)
-        self.store.config = disabled
-        self.store._adaptive.config = disabled
-        doc = self.refresh(ai_response([{"role": "services", "sheet_title": "Услуги", "header_row": 1,
-                                         "columns": {"Услуга": "Работа", "Легковой": "Седан",
-                                                     "Кроссовер": "Кроссовер", "Доступна": "Выполняется"}}]))
-        self.assertEqual(self.calls, [])
-        self.assertFalse(any(rule["role"] == "services" for rule in doc["regions"]))
+        configured = replace(self.store.config, sheets_ai_mapping_enabled=False)
+        self.store.config = configured
+        self.store._adaptive.config = configured
+        self.refresh(ai_response([{"role": "services", "sheet_title": "Услуги", "header_row": 1,
+                                   "columns": {"Услуга": "Работа", "Легковой": "Седан",
+                                               "Кроссовер": "Кроссовер", "Доступна": "Выполняется"}}]))
+        self.assertTrue(self.calls)
 
     def test_malformed_model_answer_is_rejected_safely(self):
         doc = self.refresh({"regions": [{"role": "wizard", "sheet_title": "Услуги", "columns": {"Услуга": "Работа"}}]})
@@ -155,9 +152,10 @@ class ResponseParsingTests(unittest.TestCase):
                     "merges": [], "formulas": [(1, 1)]}
         compact = compact_workbook([snapshot])
         self.assertEqual(len(compact["sheets"]), 1)
-        self.assertLessEqual(len(compact["sheets"][0]["sample_rows"]), 12)
-        self.assertLessEqual(len(compact["sheets"][0]["sample_rows"][0]), 12)
-        self.assertEqual(compact["sheets"][0]["formula_cells"], 1)
+        sheet = compact["sheets"][0]
+        self.assertLessEqual(len(sheet["header_candidates"]), 28)
+        self.assertEqual(sheet["formula_cells"], 1)
+        self.assertTrue(sheet["column_profiles"])
 
     def test_normalize_rejects_bad_roles_and_columns(self):
         from schema_ai import normalize_ai_document

@@ -147,20 +147,20 @@ class AdaptiveTests(unittest.TestCase):
         self.a.refresh()
         self.worksheet.values[0][3] = "Arrival window"
         self.a.refresh(force=True)
-        self.assertFalse(self.rule()["validation"]["read"])
         with self.assertRaises(MappingError):
             self.store.create_booking(**booking())
-        rule = self.rule()
-        rule["columns"]["Время"] = 4
-        self.save()
+        # Неопознанная структура остаётся заблокированной и после ручной проверки:
+        # нужна новая AI-разметка, а не угаданный столбец.
         self.a.refresh(validate=True)
-        self.assertTrue(self.store.create_booking(**booking())["ok"])
+        self.assertFalse(self.a.document["writes_enabled"])
+        with self.assertRaises(MappingError):
+            self.store.create_booking(**booking())
 
     def test_deleted_required_column_blocks_read_and_write(self):
         self.a.refresh()
         self.worksheet.values[0].remove("Статус")
         self.a.refresh(force=True)
-        self.assertFalse(self.rule()["validation"]["read"])
+        self.assertFalse(self.a.document["writes_enabled"])
         with self.assertRaises(MappingError):
             self.a.table("bookings")
         self.assertFalse(self.worksheet.writes)
@@ -255,7 +255,7 @@ class AdaptiveTests(unittest.TestCase):
         self.assertTrue(self.store.create_booking(**booking())["ok"])
         self.assertEqual(self.worksheet.values[1][16], "=1+1")
         self.assertEqual(self.worksheet.formatting, formatting)
-        self.assertEqual(self.worksheet.writes[0][0]["range"], "A3")
+        self.assertEqual(self.worksheet.writes[0][0]["range"], "A3:P3")
 
     def test_formula_in_booking_field_blocks_writes(self):
         self.assertTrue(self.store.create_booking(**booking())["ok"])
@@ -303,11 +303,12 @@ class AdaptiveTests(unittest.TestCase):
         self.assertNotIn("Fixture car", text)
 
     def test_legacy_bot_mode_keeps_existing_behavior(self):
+        # Старый переключатель больше не создаёт второй backend: поведение единое.
         store = Store(replace(self.store.config, sheets_adaptive_enabled=False))
         store._spreadsheet = self.spreadsheet
+        self.assertIsNotNone(store._adaptive)
         self.assertTrue(store.create_booking(**booking())["ok"])
         self.assertTrue(store.cancel_booking(1, 111)["ok"])
-        self.assertFalse(self.a.path.exists())
 
     def test_restart_uses_validated_mapping_without_any_ai_requests(self):
         self.spreadsheet.worksheet("Записи").values[0][3] = "Время"

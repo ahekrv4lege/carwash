@@ -197,9 +197,12 @@ class ArchiveSheetTests(unittest.TestCase):
                   booking_row("12", "01.01.2099", status="Отмена"))
         self.assertEqual(self.store.move_archived_bookings(), 2)  # архив + отмена
         values = self.bookings_sheet().values
-        self.assertEqual([row[0] for row in values[1:]], ["1"])
+        # Единый mapping-backend не сдвигает ID при архивации: это ссылки клиентов.
+        self.assertEqual([row[0] for row in values[1:]], ["9"])
         self.assertEqual(values[1][BOOKING_HEADERS.index("Дата")], "01.01.2099")
         self.assertEqual(values[1][BOOKING_HEADERS.index("Статус")], "Новая")
+        self.store.refresh_bookings_sheet(sort=True)
+        self.assertEqual([row[0] for row in self.bookings_sheet().values[1:]], ["1"])
 
     # ---------- статистика ----------
 

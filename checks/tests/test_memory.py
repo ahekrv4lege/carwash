@@ -254,7 +254,9 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.agent, "_call_tool", wraps=self.agent._call_tool) as tool:
             answer = await self.agent.reply(self.user, "Какие услуги есть?")
         results = [json.loads(message["content"]) for message in self.transport.call_args.kwargs["messages"] if message["role"] == "tool"]
-        self.assertEqual(answer, "Цена 700 ₽.")
+        # Новая проверка цен не принимает сумму без подтверждённого класса:
+        # вместо выдуманного итога бот уточняет автомобиль, сохраняя кэш каталога.
+        self.assertIn("марку", answer.lower())
         self.assertEqual(tool.call_count, 1)
         self.assertIn("services", results[0])
         self.assertIn("tariffs", results[0])

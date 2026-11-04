@@ -235,7 +235,7 @@ SCENARIOS: list[Scenario] = [
              "mapping-error", act_price, expect_message="Некорректная цена услуги",
              disrupt=lambda sheet, _store: set_cell(sheet, "Услуги", 2, 3, "-700")),
     Scenario("services_word_price", "Цена словами («семьсот»)",
-             "ok", act_price, verify=garbage_price_becomes_nothing(),
+             "mapping-error", act_price,
              disrupt=lambda sheet, _store: set_cell(sheet, "Услуги", 2, 3, "семьсот")),
     Scenario("services_price_with_currency", "Цена с пробелом и знаком валюты («1 700 ₽»)",
              "ok", act_calculate, verify=priced(1700),
@@ -262,7 +262,7 @@ SCENARIOS: list[Scenario] = [
              warmup=warmup_mappings,
              disrupt=lambda sheet, _store: append_column(sheet, "Услуги", "Заметки", ["кошки", "собаки"])),
     Scenario("services_headers_lowercase", "Вся шапка в нижнем регистре",
-             "mapping-error", act_price, expect_message="требуется проверка mappings",
+             "mapping-error", act_price, expect_message="требуется проверка карты Sheets",
              warmup=warmup_mappings,
              disrupt=lambda sheet, _store: set_lowercase_headers(sheet)),
     Scenario("services_swapped_class_columns", "Колонки классов поменялись местами",
@@ -310,20 +310,20 @@ SCENARIOS: list[Scenario] = [
                  booking_created(store),
                  append_row_copy(sheet, "Записи", 2))),
     Scenario("bookings_formula_blocks_cancel", "Формула в строке записи блокирует отмену («=700» в Сумме)",
-             "mapping-error", act_cancel, expect_message="Запись в выбранную область не разрешена",
+             "mapping-error", act_cancel, expect_message="Формула в строке записи",
              disrupt=lambda sheet, store: (
                  booking_created(store),
                  make_booking_cell(sheet, 2, "Сумма", "=700"))),
 
     # ── офлайн-путь (SHEETS_ADAPTIVE_ENABLED=false): мягкая валидация ──
     Scenario("legacy_negative_price", "Офлайн-прайс: «-700» не должен давать отрицательную сумму",
-             "failure", act_calculate, verify=no_negative_total(), legacy=True,
+             "mapping-error", act_calculate, legacy=True,
              disrupt=lambda sheet, _store: set_cell(sheet, "Услуги", 2, 3, "-700")),
     Scenario("legacy_duplicate_class_column", "Офлайн-прайс: две колонки «Легковой» не дублируют класс",
-             "ok", act_price, legacy=True,
+             "mapping-error", act_price, legacy=True,
              disrupt=lambda sheet, _store: append_column(sheet, "Услуги", "Легковой", [700, 200])),
     Scenario("legacy_availability_garbage", "Офлайн-прайс: чужое «Доступна» означает «доступна» (толерантный путь)",
-             "ok", act_calculate, legacy=True,
+             "mapping-error", act_calculate, legacy=True,
              disrupt=lambda sheet, _store: set_cell(sheet, "Услуги", 2, 5, "может быть")),
 ]
 

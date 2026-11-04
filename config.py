@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import hashlib
+import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 import math
@@ -102,13 +104,14 @@ class Config:
     sheet_bookings: str
     sheet_classes: str         # правила для машин с несколькими классами (напр. BMW X5)
 
-    sheets_adaptive_enabled: bool = False
-    # Интерпретация структуры книги моделью (DeepSeek): включена вместе с адаптивом.
+    # Единый mapping-backend всегда включён. Поля оставлены для совместимости
+    # со старыми .env, но больше не отключают AI-first архитектуру.
+    sheets_adaptive_enabled: bool = True
     sheets_ai_mapping_enabled: bool = True
     sheets_ai_model: str = ""          # пусто — используется основная модель диалога
-    sheets_ai_timeout_sec: float = 90.0
-    sheets_discover_on_start: bool = False
-    sheets_schema_check_interval_hours: float = 24.0
+    sheets_ai_timeout_sec: float = 120.0
+    sheets_discover_on_start: bool = True
+    sheets_schema_check_interval_hours: float = 6.0
     sheets_force_schema_refresh: bool = False
     sheets_mapping_file: str = str(ROOT / ".runtime/sheets-mapping.json")
     ai_enabled: bool = True
@@ -237,8 +240,17 @@ def _ai_settings(sheets_only: bool) -> dict:
 
 
 def table_mapping_path(spreadsheet_id: str) -> str:
+    """Путь карты; чужая карта в общем файле не перезаписывается."""
     base = Path(_path("SHEETS_MAPPING_FILE", ".runtime/sheets-mapping.json"))
-    key = hashlib.sha256(spreadsheet_id.encode()).hexdigest()[:24]
+    if not base.exists():
+        return str(base)
+    try:
+        existing_id = json.loads(base.read_text(encoding="utf-8")).get("spreadsheet_id")
+    except (OSError, ValueError, AttributeError):
+        existing_id = "__invalid__"
+    if existing_id == spreadsheet_id:
+        return str(base)
+    key = hashlib.sha256(spreadsheet_id.encode()).hexdigest()[:16]
     return str(base.with_name(f"{base.stem}-{key}{base.suffix}"))
 
 
@@ -251,18 +263,30 @@ def _sheet_settings() -> dict:
     }
     if any(not name for name in names.values()) or len(set(names.values())) != len(names):
         raise RuntimeError("SHEET_*: нужны непустые разные имена ролей")
-    table_mapping = table_mapping_path(os.getenv("SPREADSHEET_ID", "").strip())
-    has_table_mapping = Path(table_mapping).is_file()
+    # Старые переключатели читаются, но не могут выключить единый mapping-backend.
+    # Иначе на VPS могла тихо включиться устаревшая hardcoded-архитектура.
+    for name, note in (
+        ("SHEETS_ADAPTIVE_ENABLED", "единый mapping-backend включён всегда"),
+        ("SHEETS_AI_MAPPING", "AI-разметка структуры включена всегда"),
+        ("SHEETS_DISCOVER_ON_START", "проверка структуры на старте выполняется всегда"),
+    ):
+        if name in os.environ and not _bool(name, True):
+            logging.getLogger(__name__).warning(
+                "%s=false устарел и игнорируется: %s", name, note)
+    interval = _number("SHEETS_SCHEMA_CHECK_INTERVAL_HOURS", "6", 0.001)
+    if interval != 6.0 and not os.getenv("SHEETS_TEST_INTERVAL"):
+        logging.getLogger(__name__).warning(
+            "SHEETS_SCHEMA_CHECK_INTERVAL_HOURS=%s; для production требуется 6 часов", interval)
     return dict(
         **names,
-        sheets_adaptive_enabled=_bool("SHEETS_ADAPTIVE_ENABLED", has_table_mapping),
-        sheets_ai_mapping_enabled=_bool("SHEETS_AI_MAPPING", True),
+        sheets_adaptive_enabled=True,
+        sheets_ai_mapping_enabled=True,
         sheets_ai_model=os.getenv("SHEETS_AI_MODEL", "").strip(),
-        sheets_ai_timeout_sec=_number("SHEETS_AI_TIMEOUT_SEC", "90", 1),
-        sheets_discover_on_start=_bool("SHEETS_DISCOVER_ON_START"),
-        sheets_schema_check_interval_hours=_number("SHEETS_SCHEMA_CHECK_INTERVAL_HOURS", "24", 0.001),
+        sheets_ai_timeout_sec=_number("SHEETS_AI_TIMEOUT_SEC", "120", 1),
+        sheets_discover_on_start=True,
+        sheets_schema_check_interval_hours=interval,
         sheets_force_schema_refresh=_bool("SHEETS_FORCE_SCHEMA_REFRESH"),
-        sheets_mapping_file=table_mapping if has_table_mapping else _path("SHEETS_MAPPING_FILE", ".runtime/sheets-mapping.json"),
+        sheets_mapping_file=table_mapping_path(os.getenv("SPREADSHEET_ID", "").strip()),
     )
 
 

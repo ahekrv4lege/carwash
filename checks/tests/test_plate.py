@@ -59,17 +59,18 @@ class OfflinePlateTests(unittest.TestCase):
         self.assertTrue(created["ok"], created)
         self.assertEqual(str(self.sheet.values[1][-1]), "а 123 ав 77")
 
-    def test_old_table_without_plate_column_keeps_working(self):
-        # Флаг включён, но колонки в старом листе нет: запись работает, номер просто некуда писать.
+    def test_old_table_without_plate_column_blocks_when_required(self):
+        # Если флаг включён, а подтверждённой колонки нет, запись блокируется:
+        # иначе обязательный номер был бы молча потерян.
         required = replace(self.store.config, car_plate_required=True)
         from sheets import Store
         store = Store(required)
         store._spreadsheet = self.spreadsheet
         store._invalidate("bookings")
         result = store.create_booking(**booking())
-        self.assertTrue(result["ok"], result)  # старая таблица продолжает работать
-        self.assertNotIn("госномер", str(self.sheet.values[0]))  # колонку за клиентом не создали
-        self.assertEqual(len(self.sheet.values) - 1, 1)  # ровно одна строка записи
+        self.assertFalse(result["ok"])
+        self.assertIn("госномер", result["error"].lower())
+        self.assertEqual(len(self.sheet.values) - 1, 0)
 
     def test_long_plate_value_is_trimmed(self):
         self.with_plate_column()
@@ -96,11 +97,13 @@ class AdaptivePlateTests(unittest.TestCase):
         self.assertEqual(str(self.sheet.values[1][2]), "01.01.2099")
 
     def test_without_column_the_sheet_stays_valid_and_writable(self):
-        # Обычный адаптивный лист без колонки «Госномер» работает как раньше.
-        store2, _ = fixture(self.temp.name, sheets_adaptive_enabled=False)
+        # Отдельная таблица без колонки «Госномер» работает при CAR_PLATE_REQUIRED=false.
+        second = tempfile.TemporaryDirectory()
+        self.addCleanup(second.cleanup)
+        store2, spreadsheet2 = fixture(second.name, sheets_adaptive_enabled=False)
         result = store2.create_booking(**booking())
         self.assertTrue(result["ok"], result)
-        self.assertEqual(len(self.sheet.values) - 1, 0)  # колонку не создали — ничего не дописали
+        self.assertEqual(len(spreadsheet2.worksheet("Записи").values) - 1, 1)
 
 
 class AgentSchemaTests(unittest.TestCase):

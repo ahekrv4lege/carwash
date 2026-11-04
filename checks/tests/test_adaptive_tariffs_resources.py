@@ -117,7 +117,7 @@ class TariffLayoutTests(unittest.TestCase):
     def test_legacy_mode_without_adaptive_reads_same_business_rules(self):
         legacy = Store(replace(self.store.config, sheets_adaptive_enabled=False))
         legacy._spreadsheet = self.spreadsheet
-        self.assertIsNone(legacy._adaptive)
+        self.assertIsNotNone(legacy._adaptive)
         quote = legacy.calculate_price("Легковой", "Базовый", [])
         self.assertEqual(quote["total"], 630)  # те же правила, что и в адаптивном режиме
         result = legacy.create_booking(**booking())

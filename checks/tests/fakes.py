@@ -69,12 +69,26 @@ class Worksheet:
             raise OSError("simulated unknown response")
         self.writes.append(deepcopy(updates))
         for update in updates:
-            row, column = coord(update["range"])
-            while len(self.values) < row:
-                self.values.append([])
-            while len(self.values[row - 1]) < column:
-                self.values[row - 1].append("")
-            self.values[row - 1][column - 1] = update["values"][0][0]
+            range_name = update["range"]
+            if ":" in range_name:
+                start, end = range_name.split(":", 1)
+                r1, c1 = coord(start)
+                r2, c2 = coord(end)
+            else:
+                r1, c1 = coord(range_name)
+                r2, c2 = r1, c1
+            grid = update["values"]
+            for row_offset, row_values in enumerate(grid):
+                row_number = r1 + row_offset
+                while len(self.values) < row_number:
+                    self.values.append([])
+                for column_offset, cell in enumerate(row_values):
+                    column = c1 + column_offset
+                    if column > c2 and len(grid) == 1:
+                        break
+                    while len(self.values[row_number - 1]) < column:
+                        self.values[row_number - 1].append("")
+                    self.values[row_number - 1][column - 1] = cell
 
     def update(self, range_name, values, value_input_option=None, **kwargs):
         # Реальный путь gspread Worksheet.update: точечная запись сетки значений.
@@ -137,8 +151,14 @@ class Spreadsheet:
 
     def values_batch_get(self, ranges, params=None):
         self.batch_reads = getattr(self, "batch_reads", 0) + 1
-        return {"valueRanges": [{"values": self.worksheet(name[1:-1].replace("''", "'")).get_all_values(
-            value_render_option=params.get("valueRenderOption"))} for name in ranges]}
+        value_ranges = []
+        for name in ranges:
+            title = name.split("!", 1)[0].strip()
+            if title.startswith("'") and title.endswith("'"):
+                title = title[1:-1].replace("''", "'")
+            value_ranges.append({"values": self.worksheet(title).get_all_values(
+                value_render_option=(params or {}).get("valueRenderOption"))})
+        return {"valueRanges": value_ranges}
 
     def get_worksheet_by_id(self, id):
         return next(s for s in self.sheets if s.id == id)

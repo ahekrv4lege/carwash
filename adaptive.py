@@ -1,35 +1,105 @@
-"""Детерминированные правила извлечения Sheets. Содержимое записей не сохраняется."""
+"""AI-first карта Google Sheets и безопасные операции по физическим координатам.
+
+Жизненный цикл:
+1. снимок всей книги (метаданные, строки, формулы, объединения);
+2. один вызов модели для смысловой разметки областей;
+3. независимая проверка каждой координаты, типа и связи в Python;
+4. атомарное сохранение проверенной карты, привязанной к SPREADSHEET_ID;
+5. обычные операции читают и пишут только по сохранённым координатам;
+6. структурный отпечаток проверяется на старте и каждые 6 часов;
+7. изменилась структура — карта строится заново, проверяется и заменяется
+   атомарно; данные, цены и обычные строки не вызывают AI.
+
+Модуль не использует названия колонок как источник истины во время работы:
+после активации карты единственный источник физических адресов — документ карты.
+"""
 from __future__ import annotations
 
-from copy import deepcopy
 from datetime import datetime, timedelta
-from functools import lru_cache
 import hashlib
 import json
 import logging
 import math
 import os
+import re
 import tempfile
 from pathlib import Path
-import re
 import threading
 import time
 from typing import Any
 
 log = logging.getLogger(__name__)
 
-VERSION = 1
-MAX_DISCOVERY_CELLS = 1_000_000
-ENGINE_REVISION = 3
-KNOWN_PRICE_CLASSES = {"легковой", "кроссовер", "внедорожник", "минивэн", "внедорожник минивэн", "микроавтобус",
-                       "седан", "хэтчбек", "универсал", "sedan", "suv", "crossover", "van", "minivan", "passenger car"}
-NON_PRICE_HEADERS = {"id", "duration", "duration minutes", "duration hours", "длительность", "длительность мин",
-                     "длительность работы", "время мин", "время работы", "минуты", "часы", "номер", "код"}
-BOOKING_FIELDS = ["ID", "Создано", "Дата", "Время", "Имя", "Телефон", "Автомобиль", "Класс",
-                  "Тариф", "Доп. услуги", "Состав", "Сумма", "Комментарий", "Telegram ID", "Username", "Статус"]
-# Дополнительные поля записей: колонка может отсутствовать в старых таблицах,
-# поэтому не обязана для записи и не участвует в канонической раскладке.
-EXTRA_ROLE_FIELDS = {"bookings": ["Госномер", "Бокс"]}
+VERSION = 2
+ENGINE_REVISION = 4
+MAX_DISCOVERY_CELLS = 2_000_000
+MAX_HEADER_SCAN_ROWS = 200
+MAX_PROBE_ROWS = 40
+
+BOOKING_FIELDS = [
+    "ID", "Создано", "Дата", "Время", "Имя", "Телефон", "Автомобиль", "Класс",
+    "Тариф", "Доп. услуги", "Состав", "Сумма", "Комментарий", "Telegram ID",
+    "Username", "Статус", "Госномер", "Бокс", "Длительность",
+]
+# Базовый контракт записи: дополнительные поля (госномер/бокс/длительность)
+# могут отсутствовать в старой книге и не должны блокировать запись сами по себе.
+BOOKING_HEADERS = BOOKING_FIELDS[:16]
+BOOKING_WRITE_REQUIRED = set(BOOKING_HEADERS)
+EXTRA_ROLE_FIELDS = {"bookings": ["Госномер", "Бокс", "Длительность"]}
+ROLE_FIELDS = {
+    "bookings": BOOKING_FIELDS,
+    "slots": ["Дата", "Время", "Постов", "Начало", "Конец", "Бокс"],
+    "services": ["Услуга", "Описание", "Доступна", "Длительность"],
+    "tariffs": ["Тариф", "Состав", "Скидка %", "Доступен", "Длительность", "Сумма"],
+    "durations": ["Услуга", "Длительность"],
+    "classes": ["Автомобиль", "Класс"],
+    "resources": ["Бокс", "Дата", "Открытие поста", "Закрытие поста", "Статус", "Ограничение"],
+    "archive": BOOKING_FIELDS,
+}
+OPTIONAL_ROLE_FIELDS = {
+    "durations": ["Услуга", "Длительность"],
+    "classes": ["Автомобиль", "Класс"],
+    "resources": ["Бокс", "Открытие поста", "Закрытие поста", "Статус"],
+    "archive": ["ID", "Статус"],
+}
+ALL_ROLE_FIELDS = {
+    role: list(dict.fromkeys([*ROLE_FIELDS.get(role, ()), *OPTIONAL_ROLE_FIELDS.get(role, ())]))
+    for role in set(ROLE_FIELDS) | set(OPTIONAL_ROLE_FIELDS)
+}
+CORE_ROLES = {"bookings", "services", "slots"}
+WRITE_ROLES = {"bookings", "slots"}
+READ_REQUIRED = {
+    "bookings": {"ID", "Дата", "Время", "Telegram ID", "Статус"},
+    "archive": {"ID", "Статус"},
+    "slots": {"Время"},
+    "services": {"Услуга"},
+    "tariffs": {"Тариф"},
+    "durations": {"Услуга", "Длительность"},
+    "classes": {"Автомобиль", "Класс"},
+    "resources": {"Бокс", "Открытие поста", "Закрытие поста", "Статус"},
+}
+SCHEDULE_REQUIRED = {"Начало", "Конец"}
+STATUS_MAP = {
+    "новая": "Новая", "new": "Новая", "новая заявка": "Новая",
+    "confirmed": "Подтверждена", "подтверждена": "Подтверждена",
+    "cancelled": "Отмена", "canceled": "Отмена", "отменена": "Отмена",
+    "отмена": "Отмена", "отказ": "Отмена",
+    "выполнена": "Выполнена", "done": "Выполнена", "completed": "Выполнена",
+    "архив": "Архив", "archive": "Архив", "archived": "Архив",
+}
+KNOWN_PRICE_CLASSES = {
+    "легковой", "кроссовер", "внедорожник", "минивэн", "внедорожник минивэн",
+    "микроавтобус", "седан", "хэтчбек", "универсал", "sedan", "suv",
+    "crossover", "van", "minivan", "passenger car",
+}
+NON_PRICE_HEADERS = {
+    "id", "duration", "duration minutes", "duration hours", "длительность",
+    "длительность мин", "длительность работы", "время мин", "время работы",
+    "минуты", "часы", "номер", "код",
+}
+
+# Синонимы используются только для восстановления явно пропущенного моделью
+# поля и для ручной диагностики. Первичное распознавание делает модель.
 ALIASES = {
     "Бокс": ["бокс", "пост", "ресурс", "bay", "resource"],
     "ID": ["id", "номер записи", "booking id", "номер брони"],
@@ -48,40 +118,65 @@ ALIASES = {
     "Telegram ID": ["telegram id", "tg id", "telegram_id", "tg_id", "id клиента"],
     "Username": ["username", "ник", "telegram username"],
     "Статус": ["статус", "status", "состояние"],
-    "Госномер": ["госномер", "гос номер", "госномер автомобиля", "номер авто", "номер машины",
-                 "plate", "license plate", "car plate"],
+    "Госномер": ["госномер", "гос номер", "гос. номер", "госномер автомобиля",
+                 "номер авто", "номер машины", "регистрационный знак", "plate",
+                 "license plate", "car plate"],
     "Постов": ["постов", "мест", "боксов", "capacity", "bays", "пост", "бокс"],
-    "Услуга": ["услуга", "service", "service name", "название услуги"],
-    "Описание": ["описание", "description", "details"],
-    "Доступна": ["доступна", "available", "active", "enabled", "активна", "выполняется", "выполняем"],
-    "Доступен": ["доступен", "available", "active", "enabled", "активен", "доступна", "выполняется"],
-    "Скидка %": ["скидка", "скидка %", "скидка процентов", "discount", "discount %", "discount percent"],
-    "Длительность": ["длительность", "длительность мин", "длительность минуты", "длительность работы",
-                     "время мин", "время работы", "время выполнения", "минуты", "мин",
-                     "часы", "час", "duration", "duration minutes", "duration hours"],
-    "Начало": ["начало", "start", "открытие", "старт"],
-    "Конец": ["конец", "окончание", "закрытие", "end", "финиш"],
+    "Услуга": ["услуга", "service", "service name", "название услуги", "работа",
+               "наименование работы"],
+    "Описание": ["описание", "description", "details", "примечание"],
+    "Доступна": ["доступна", "available", "active", "enabled", "активна",
+                 "выполняется", "выполняем", "выполняется ли"],
+    "Доступен": ["доступен", "available", "active", "enabled", "активен",
+                 "доступна", "выполняется"],
+    "Скидка %": ["скидка", "скидка %", "скидка процентов", "discount",
+                 "discount %", "discount percent"],
+    "Длительность": ["длительность", "длительность мин", "длительность минуты",
+                     "длительность работы", "время мин", "время работы",
+                     "время выполнения", "минуты", "мин", "часы", "час",
+                     "duration", "duration minutes", "duration hours",
+                     "минут на работу"],
+    "Начало": ["начало", "start", "открытие", "старт", "открываемся", "открытие поста"],
+    "Конец": ["конец", "окончание", "закрытие", "end", "финиш", "закрываемся",
+              "закрытие поста"],
+    "Открытие поста": ["открытие поста", "открытие", "начало работы поста"],
+    "Закрытие поста": ["закрытие поста", "закрытие", "конец работы поста"],
+    "Ограничение": ["ограничение", "допуск", "ограничения", "restriction"],
 }
-ROLE_FIELDS = {
-    "bookings": BOOKING_FIELDS,
-    "slots": ["Дата", "Время", "Постов"],
-    "services": ["Услуга", "Описание", "Доступна"],
-    "tariffs": ["Тариф", "Состав", "Скидка %", "Доступен"],
+
+_FIELD_SYNONYMS = {
+    "госномер": "Госномер", "гос номер": "Госномер", "гос. номер": "Госномер",
+    "номер авто": "Госномер", "номер машины": "Госномер",
+    "регистрационный знак": "Госномер", "license plate": "Госномер",
+    "plate": "Госномер", "car plate": "Госномер",
+    "created": "Создано", "created at": "Создано", "дата создания": "Создано",
+    "date": "Дата", "booking date": "Дата", "time": "Время", "start time": "Время",
+    "name": "Имя", "client": "Имя", "client name": "Имя", "фио": "Имя",
+    "phone": "Телефон", "телефон": "Телефон", "тел": "Телефон",
+    "vehicle": "Автомобиль", "car": "Автомобиль", "машина": "Автомобиль",
+    "car class": "Класс", "size class": "Класс", "класс авто": "Класс",
+    "package": "Тариф", "tariff": "Тариф", "комплекс": "Тариф",
+    "extras": "Доп. услуги", "доп услуги": "Доп. услуги",
+    "composition": "Состав", "items": "Состав", "включено": "Состав",
+    "total": "Сумма", "итого": "Сумма", "стоимость": "Сумма", "price": "Сумма",
+    "цена": "Сумма", "comment": "Комментарий", "notes": "Комментарий",
+    "примечание": "Комментарий", "telegram id": "Telegram ID",
+    "tg id": "Telegram ID", "telegram_id": "Telegram ID",
+    "username": "Username", "ник": "Username", "status": "Статус",
+    "состояние": "Статус", "service": "Услуга", "service name": "Услуга",
+    "название услуги": "Услуга", "работа": "Услуга", "описание": "Описание",
+    "description": "Описание", "available": "Доступна", "active": "Доступна",
+    "enabled": "Доступна", "discount": "Скидка %", "скидка": "Скидка %",
+    "duration": "Длительность", "начало": "Начало", "start": "Начало",
+    "конец": "Конец", "end": "Конец", "постов": "Постов", "мест": "Постов",
+    "capacity": "Постов", "bays": "Постов", "бокс": "Бокс", "bay": "Бокс",
+    "resource": "Бокс", "открытие поста": "Открытие поста",
+    "закрытие поста": "Закрытие поста", "ограничение": "Ограничение",
 }
-# Опциональные роли: их отсутствие не делает mappings неполными и не блокирует записи.
-OPTIONAL_ROLE_FIELDS = {"durations": ["Услуга", "Длительность"]}
-ALL_ROLE_FIELDS = {**ROLE_FIELDS, **OPTIONAL_ROLE_FIELDS}
-READ_REQUIRED = {
-    "bookings": {"ID", "Дата", "Время", "Telegram ID", "Статус"},
-    "slots": {"Дата", "Время", "Постов"},
-    "services": {"Услуга"},
-    "tariffs": {"Тариф", "Состав"},
-    "durations": {"Услуга", "Длительность"},
+_CANONICAL_BY_FOLD = {
+    field.casefold(): field
+    for fields in (*ROLE_FIELDS.values(), *OPTIONAL_ROLE_FIELDS.values()) for field in fields
 }
-SCHEDULE_REQUIRED = {"Начало", "Конец"}
-STATUS_MAP = {"новая": "Новая", "new": "Новая", "confirmed": "Подтверждена",
-              "подтверждена": "Подтверждена", "cancelled": "Отмена", "canceled": "Отмена",
-              "отменена": "Отмена", "отмена": "Отмена", "выполнена": "Выполнена", "done": "Выполнена"}
 
 
 class MappingError(RuntimeError):
@@ -92,8 +187,177 @@ class SlotUnavailable(MappingError):
     """Время или пост занят, запись не создана. Текст безопасен для показа клиенту."""
 
 
-DURATION_HEADER_RE = re.compile(r"длительность|duration|время (?:работы|выполнения)|^мин(?:ут\w*)?$|^час(?:ов|ы)?$")
+DURATION_HEADER_RE = re.compile(
+    r"длительность|duration|время (?:работы|выполнения)|^мин(?:ут\w*)?$|^час(?:ов|ы)?$"
+)
 DURATION_MAX_MINUTES = 12 * 60
+
+
+def _normalize_header_cached(value: str) -> str:
+    return re.sub(r"[^\w%]+", " ", value.strip().lower().replace("ё", "е")).strip()
+
+
+def normalize_header(value: Any) -> str:
+    return _normalize_header_cached(str(value))
+
+
+def fingerprint(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+
+def cell_name(row: int, column: int) -> str:
+    output = ""
+    while column:
+        column, remainder = divmod(column - 1, 26)
+        output = chr(65 + remainder) + output
+    return f"{output}{row}"
+
+
+def value_at(values: list[list], row: int, column: int) -> Any:
+    if row < 1 or column < 1:
+        return ""
+    return values[row - 1][column - 1] if row <= len(values) and column <= len(values[row - 1]) else ""
+
+
+def title_date(title: str) -> str | None:
+    from sheets import parse_date
+    matches = re.findall(r"\d{4}-\d{2}-\d{2}|\d{1,2}[./]\d{1,2}[./]\d{4}", title)
+    dates = {parsed_date.isoformat() for text in matches if (parsed_date := parse_date(text))}
+    return next(iter(dates)) if len(dates) == 1 else None
+
+
+def date_value(value: Any, transform: str = "date") -> str:
+    from sheets import parse_date
+    try:
+        if transform == "serial_date":
+            parsed_date = (datetime(1899, 12, 30) + timedelta(days=float(value))).date()
+        elif transform and transform.startswith("date:"):
+            parsed_date = datetime.strptime(str(value), transform[5:]).date()
+        else:
+            parsed_date = parse_date(value)
+        if parsed_date:
+            return parsed_date.strftime("%d.%m.%Y")
+    except (ValueError, TypeError, OverflowError):
+        pass
+    raise MappingError("Дата не соответствует выбранному преобразованию")
+
+
+def time_value(value: Any, transform: str = "time") -> str:
+    from sheets import parse_time
+    try:
+        if transform == "serial_time":
+            minutes = round(float(value) * 1440)
+            if 0 <= minutes < 1440:
+                return f"{minutes // 60:02d}:{minutes % 60:02d}"
+        elif re.fullmatch(r"\s*\d{1,2}[:.]\d{2}(?::00)?\s*", str(value)):
+            result = parse_time(value)
+            if result:
+                return result
+    except (ValueError, TypeError, OverflowError):
+        pass
+    raise MappingError("Время не соответствует выбранному преобразованию")
+
+
+def rule_signature(rule: dict) -> str:
+    return fingerprint({
+        key: value for key, value in rule.items()
+        if key not in {"structure", "fingerprint", "validation", "last_changes",
+                       "validated_rule", "last_validation_at"}
+    })
+
+
+def file_stamp(path: Path) -> tuple | None:
+    try:
+        status = path.stat()
+    except FileNotFoundError:
+        return None
+    return (status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns)
+
+
+def atomic_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    temporary_file = Path(name)
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary_file.replace(path)
+        if os.name == "posix":
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    finally:
+        temporary_file.unlink(missing_ok=True)
+
+
+def trim_headers(headers: list) -> list:
+    result = [str(header).strip() for header in headers]
+    while result and not result[-1]:
+        result.pop()
+    return result
+
+
+def structure(snapshot: dict, rule: dict) -> dict:
+    row = rule["header_row"]
+    headers = trim_headers(snapshot["values"][row - 1]) if row <= len(snapshot["values"]) else []
+    formula_columns = sorted({
+        column_index for row_index, column_index in (snapshot.get("formulas") or [])
+        if row_index >= rule["first_data_row"]
+    })
+    return {
+        "sheet_id": snapshot["id"],
+        "title": snapshot["title"],
+        "headers": headers,
+        "header_row": row,
+        "merges": snapshot.get("merges") or [],
+        "formula_columns": formula_columns,
+        "column_count": snapshot.get("column_count", len(headers)),
+        "grid_columns": rule.get("grid_columns", []),
+        "date_source": rule.get("date_source"),
+    }
+
+
+def diff_structure(before: dict, after: dict) -> dict:
+    previous_headers = before.get("headers", [])
+    current_headers = after.get("headers", [])
+    return {
+        "added": [index for index, header in enumerate(current_headers, 1)
+                  if header and header not in previous_headers],
+        "deleted": [index for index, header in enumerate(previous_headers, 1)
+                    if header and header not in current_headers],
+        "moved": [header for header in previous_headers
+                  if header and previous_headers.count(header) == current_headers.count(header) == 1
+                  and previous_headers.index(header) != current_headers.index(header)],
+        "renamed": [
+            {"column": index + 1, "before": old_header, "after": new_header}
+            for index, (old_header, new_header) in enumerate(zip(previous_headers, current_headers))
+            if old_header != new_header and old_header not in current_headers
+            and new_header not in previous_headers
+        ],
+        "other": [key for key in after if key != "headers" and before.get(key) != after[key]],
+    }
+
+
+def header_mapping(headers: list, role: str) -> tuple[dict, list[str]]:
+    """Диагностическое сопоставление по синонимам (не основной путь discovery)."""
+    columns = {}
+    errors = []
+    for field in (*ALL_ROLE_FIELDS.get(role, ()), *EXTRA_ROLE_FIELDS.get(role, ())):
+        aliases = {normalize_header(alias) for alias in ALIASES.get(field, [])}
+        hits = [index for index, header in enumerate(headers, 1)
+                if normalize_header(header) in aliases]
+        if len(hits) == 1:
+            columns[field] = hits[0]
+        elif len(hits) > 1:
+            errors.append(f"Несколько колонок для {field}")
+    return columns, errors
 
 
 def is_duration_header(value: Any) -> bool:
@@ -102,7 +366,6 @@ def is_duration_header(value: Any) -> bool:
 
 
 def duration_unit_hint(value: Any) -> str | None:
-    """Единица из названия колонки: «Длительность, ч» -> hours, «Длительность, мин» -> minutes."""
     text = normalize_header(value)
     if re.search(r"час|hour", text):
         return "hours"
@@ -111,8 +374,10 @@ def duration_unit_hint(value: Any) -> str | None:
     return None
 
 
-DURATION_WORDS = {"полчаса": 30, "час": 60, "часа": 60, "часов": 60, "часик": 60,
-                  "полтора": 90, "два": 120, "две": 120, "три": 180, "четыре": 240, "пять": 300}
+DURATION_WORDS = {
+    "полчаса": 30, "час": 60, "часа": 60, "часов": 60, "часик": 60,
+    "полтора": 90, "два": 120, "две": 120, "три": 180, "четыре": 240, "пять": 300,
+}
 
 
 def _word_duration(text: str) -> int | None:
@@ -122,7 +387,7 @@ def _word_duration(text: str) -> int | None:
         return None
     word = match.group(1)
     if word == "полтора":
-        return 90 if match.group(2) else None  # «полтора» без часа не про длительность
+        return 90 if match.group(2) else None
     return DURATION_WORDS.get(word)
 
 
@@ -132,12 +397,7 @@ def _duration_total(minutes: float) -> int | None:
 
 
 def parse_duration_minutes(value: Any, unit_hint: str | None = None) -> int | None:
-    """Длительность в целых минутах из достоверных табличных форматов, иначе None.
-
-    Понимаются: «90», «90 мин», «1,5 ч», «2 часа», «1 ч 30 мин», «1:30» и диапазон
-    «10:00-11:30». Голое число понимается как минуты, дробное — как часы, если
-    колонка сама не подсказывает единицу. Длительность не выводится из других данных.
-    """
+    """Длительность в целых минутах из достоверных табличных форматов, иначе None."""
     text = str(value or "").strip().lower().replace("ё", "е").replace(",", ".")
     if not text:
         return None
@@ -170,374 +430,67 @@ def parse_duration_minutes(value: Any, unit_hint: str | None = None) -> int | No
     return None
 
 
-@lru_cache(maxsize=4096)
-def _normalize_header_cached(value: str) -> str:
-    return re.sub(r"[^\w%]+", " ", value.strip().lower().replace("ё", "е")).strip()
-
-
-def normalize_header(value: Any) -> str:
-    return _normalize_header_cached(str(value))
-
-
-def fingerprint(value: Any) -> str:
-    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-
-
-def cell_name(row: int, column: int) -> str:
-    output = ""
-    while column:
-        column, remainder = divmod(column - 1, 26)
-        output = chr(65 + remainder) + output
-    return f"{output}{row}"
-
-
-def value_at(values: list[list], row: int, column: int) -> Any:
-    if row < 1 or column < 1:
-        return ""
-    return values[row - 1][column - 1] if row <= len(values) and column <= len(values[row - 1]) else ""
-
-
-def date_value(value: Any, transform: str = "date") -> str:
-    from sheets import parse_date
-    try:
-        if transform == "serial_date":
-            parsed_date = (datetime(1899, 12, 30) + timedelta(days=float(value))).date()
-        elif transform.startswith("date:"):
-            parsed_date = datetime.strptime(str(value), transform[5:]).date()
-        else:
-            parsed_date = parse_date(value)
-        if parsed_date:
-            return parsed_date.strftime("%d.%m.%Y")
-    except (ValueError, TypeError, OverflowError):
-        pass
-    raise MappingError("Дата не соответствует выбранному преобразованию")
-
-
-def time_value(value: Any, transform: str = "time") -> str:
-    from sheets import parse_time
-    try:
-        if transform == "serial_time":
-            minutes = round(float(value) * 1440)
-            if 0 <= minutes < 1440:
-                return f"{minutes // 60:02d}:{minutes % 60:02d}"
-        elif re.fullmatch(r"\s*\d{1,2}[:.]\d{2}(?::00)?\s*", str(value)):
-            result = parse_time(value)
-            if result:
-                return result
-    except (ValueError, TypeError, OverflowError):
-        pass
-    raise MappingError("Время не соответствует выбранному преобразованию")
-
-
-def title_date(title: str) -> str | None:
-    from sheets import parse_date
-    matches = re.findall(r"\d{4}-\d{2}-\d{2}|\d{1,2}[./]\d{1,2}[./]\d{4}", title)
-    dates = {parsed_date.isoformat() for text in matches if (parsed_date := parse_date(text))}
-    return next(iter(dates)) if len(dates) == 1 else None
-
-
-def rule_signature(rule: dict) -> str:
-    return fingerprint({field_name: field_value for field_name, field_value in rule.items()
-                   if field_name not in {"structure", "fingerprint", "validation", "last_changes", "validated_rule"}})
-
-
-def file_stamp(path: Path) -> tuple | None:
-    """Stamp for cache invalidation. Atomic replace always changes the inode, so this
-    detects rewrites even when a coarse filesystem clock gives the same mtime."""
-    try:
-        status = path.stat()
-    except FileNotFoundError:
+def canonical_status(value: Any) -> str | None:
+    text = normalize_header(value)
+    if not text:
         return None
-    return (status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns)
-
-
-def atomic_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    file_descriptor, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
-    temporary_file = Path(name)
-    try:
-        with os.fdopen(file_descriptor, "w", encoding="utf-8") as stream:
-            json.dump(data, stream, ensure_ascii=False, indent=2, allow_nan=False)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary_file.replace(path)
-        if os.name == "posix":
-            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-    finally:
-        temporary_file.unlink(missing_ok=True)
-
-
-def header_mapping(headers: list, role: str) -> tuple[dict, list[str]]:
-    columns = {}
-    errors = []
-    # Дополнительные поля (например «Госномер») мапятся, только когда колонка есть в листе.
-    for field in (*ALL_ROLE_FIELDS[role], *EXTRA_ROLE_FIELDS.get(role, ())):
-        aliases = {normalize_header(alias) for alias in ALIASES[field]}
-        hits = [index for index, header in enumerate(headers, 1) if normalize_header(header) in aliases]
-        if len(hits) == 1:
-            columns[field] = hits[0]
-        elif len(hits) > 1:
-            errors.append(f"Несколько колонок для {field}")
-    return columns, errors
-
-
-def trim_headers(headers: list) -> list:
-    result = [str(header).strip() for header in headers]
-    while result and not result[-1]:
-        result.pop()
-    return result
-
-
-def structure(snapshot: dict, rule: dict) -> dict:
-    row = rule["header_row"]
-    headers = trim_headers(snapshot["values"][row - 1]) if row <= len(snapshot["values"]) else []
-    formula_columns = sorted({column_index for row_index, column_index in snapshot["formulas"] if row_index >= rule["first_data_row"]})
-    return {"sheet_id": snapshot["id"], "title": snapshot["title"], "headers": headers,
-            "header_row": row, "merges": snapshot["merges"], "formula_columns": formula_columns,
-            "column_count": snapshot["column_count"], "grid_columns": rule.get("grid_columns", []),
-            "date_source": rule.get("date_source")}
-
-
-def diff_structure(before: dict, after: dict) -> dict:
-    previous_headers, current_headers = before.get("headers", []), after.get("headers", [])
-    return {
-        "added": [index for index, header in enumerate(current_headers, 1) if header and header not in previous_headers],
-        "deleted": [index for index, header in enumerate(previous_headers, 1) if header and header not in current_headers],
-        "moved": [header for header in previous_headers if header and previous_headers.count(header) == current_headers.count(header) == 1 and previous_headers.index(header) != current_headers.index(header)],
-        "renamed": [{"column": index + 1, "before": old_header, "after": new_header} for index, (old_header, new_header) in enumerate(zip(previous_headers, current_headers))
-                    if old_header != new_header and old_header not in current_headers and new_header not in previous_headers],
-        "other": [field_name for field_name in after if field_name != "headers" and before.get(field_name) != after[field_name]],
-    }
-
-
-def detect_duration_column(snapshot: dict, row_no: int, headers: list, used: set[int]) -> tuple[str, int] | None:
-    """Колонка длительности: название про длительность, все значения разбираются.
-
-    Возвращает (название шапки, номер колонки) или None. Служебные и ценовые
-    колонки не рассматриваются; неоднозначные значения колонку не открывают.
-    """
-    hint = None
-    for column, header in enumerate(headers, 1):
-        if not header or column in used or not is_duration_header(header):
-            continue
-        hint = duration_unit_hint(header)
-        samples = [str(value_at(snapshot["values"], row_index, column)).strip()
-                   for row_index in range(row_no + 1, min(len(snapshot["values"]), row_no + 20) + 1)]
-        samples = [sample for sample in samples if sample]
-        if samples and all(parse_duration_minutes(sample, hint) for sample in samples):
-            return str(header).strip(), column
+    if text in STATUS_MAP:
+        return STATUS_MAP[text]
+    if text.startswith(("отмен", "cancel", "отказ")):
+        return "Отмена"
+    if text.startswith(("нов", "new")):
+        return "Новая"
+    if text.startswith(("подтвержд", "confirm")):
+        return "Подтверждена"
+    if text.startswith(("выполн", "done", "complete")):
+        return "Выполнена"
+    if text.startswith(("архив", "archiv")):
+        return "Архив"
     return None
 
 
-def discover(snapshot: dict, expected: dict[str, str]) -> tuple[list[dict], list[str]]:
-    """Смотрим только заголовки и типы цен; значения клиентов остаются в памяти."""
-    rules = []
-    issues = []
-    for row_no, headers in enumerate(snapshot["values"][:20], 1):
-        for role in ALL_ROLE_FIELDS:
-            columns, errors = header_mapping(headers, role)
-            if role == "durations":
-                if any(rule["header_row"] == row_no and "Длительность" in rule.get("columns", {})
-                       for rule in rules if rule["role"] in {"services", "tariffs"}):
-                    continue  # длительность уже разобрана колонкой таблицы услуг/тарифов
-                duration_column = columns.get("Длительность")
-                if not duration_column:
-                    continue
-                samples = [str(value_at(snapshot["values"], sample_row, duration_column)).strip()
-                           for sample_row in range(row_no + 1, min(len(snapshot["values"]), row_no + 20) + 1)]
-                if not any(parse_duration_minutes(sample, duration_unit_hint(headers[duration_column - 1]))
-                           for sample in samples if sample):
-                    continue  # колонка без значений — не таблица длительностей
-            source = {"title": True} if role in {"slots", "bookings"} and "Дата" not in columns and title_date(snapshot["title"]) else None
-            present = set(columns) | ({"Дата"} if source else set())
-            tariff_prices = []
-            if (role == "tariffs" and "Тариф" in columns
-                    and "Telegram ID" not in header_mapping(headers, "bookings")[0]
-                    and "Услуга" not in header_mapping(headers, "services")[0]):
-                # Пакеты с фиксированной ценой: числовые колонки — классы вместо состава.
-                used_tariff = set(columns.values())
-                for column, header in enumerate(headers, 1):
-                    if not header or column in used_tariff or is_duration_header(header):
-                        continue
-                    if re.fullmatch(r"-?\d[\d\s]*(?:[.,]\d+)?\s*(?:₽|руб\.?|RUB)?", str(header).strip(), re.I):
-                        continue  # числовая шапка — не название класса
-                    samples = [str(value_at(snapshot["values"], row_index, column)).strip()
-                               for row_index in range(row_no + 1, min(len(snapshot["values"]), row_no + 20) + 1)]
-                    samples = [value for value in samples if value]
-                    if samples and all(re.fullmatch(r"-?\d[\d\s]*(?:[.,]\d+)?\s*(?:₽|руб\.?|RUB)?", value, re.I)
-                                       for value in samples):
-                        tariff_prices.append((str(header).strip(), column))
-            if errors and (snapshot["title"] == expected.get(role) or len(present & READ_REQUIRED[role]) >= len(READ_REQUIRED[role]) - 1):
-                issues.extend(f"Лист {snapshot['id']}, строка {row_no}: {issue}" for issue in errors)
-            if not READ_REQUIRED[role] <= present and not (
-                    role == "tariffs" and "Тариф" in columns and tariff_prices):
-                continue
-            # Слотоподобная строка записей не является отдельной таблицей слотов.
-            if role == "slots" and ("Telegram ID" in header_mapping(headers, "bookings")[0]):
-                continue
-            if role == "slots" and any(
-                normalize_header(header) in {normalize_header(alias) for alias in ALIASES["Конец"]}
-                for header in headers if header
-            ):
-                continue  # лист с «Конец» — это график работы, а не таблица слотов
-            if role == "tariffs" and ("Услуга" in header_mapping(headers, "services")[0] or
-                                      "Telegram ID" in header_mapping(headers, "bookings")[0]):
-                continue
-            if errors:
-                issues.extend(f"Лист {snapshot['id']}, строка {row_no}: {issue}" for issue in errors)
-                continue
-            if len(set(columns.values())) != len(columns):
-                issues.append(f"Лист {snapshot['id']}: неоднозначные колонки {role}")
-                continue
-            pivot = False
-            rule_price_fields = []
-            if role == "services":
-                booking_columns, _ = header_mapping(headers, "bookings")
-                if "Класс" in booking_columns and "Сумма" in booking_columns:
-                    columns.update({field: booking_columns[field] for field in ("Класс", "Сумма")})
-                    pivot = True
-                used = set(columns.values())
-                duration = detect_duration_column(snapshot, row_no, headers, used)
-                if duration:
-                    columns["Длительность"] = duration[1]
-                    used.add(duration[1])
-                prices = []
-                for column, header in enumerate(headers, 1):
-                    if not header or column in used or normalize_header(header) in NON_PRICE_HEADERS:
-                        continue
-                    samples = [value_at(snapshot["values"], row_index, column) for row_index in range(row_no + 1, min(len(snapshot["values"]), row_no + 20) + 1)]
-                    samples = [str(field_value).strip() for field_value in samples if str(field_value).strip()]
-                    # Цена должна быть числом с необязательной валютой, без произвольного текста.
-                    if samples and all(re.fullmatch(r"-?\d[\d\s]*(?:[.,]\d+)?\s*(?:₽|руб\.?|RUB)?", field_value, re.I) for field_value in samples):
-                        columns[str(header)] = column
-                        prices.append(str(header))
-                if not prices and not pivot:
-                    if not duration:
-                        issues.append(f"Лист {snapshot['id']}: классы/колонки цен требуют ручной настройки")
-                    continue
-            if role == "bookings":
-                # «Длительность» в записях нужна для занятости по интервалам; колонка
-                # опциональна и распознаётся по названию даже на пустом листе.
-                used_bookings = set(columns.values())
-                for column, header in enumerate(headers, 1):
-                    if header and column not in used_bookings and is_duration_header(header):
-                        columns["Длительность"] = column
-                        break
-            rule = {"role": role, "sheet_id": snapshot["id"], "sheet_title": snapshot["title"],
-                    "header_row": row_no, "first_data_row": row_no + 1, "end_row": None,
-                    "columns": columns, "transforms": {"Дата": "date", "Время": "time"},
-                    "status_map": dict(STATUS_MAP), "write_statuses": {"new": "Новая", "cancelled": "Отмена"},
-                    "date_source": source, "permissions": {"read": True, "write": role == "bookings"},
-                    "validation": {"read": False, "write": False, "issues": []}}
-            if role == "services":
-                rule["price_fields"] = prices
-                if not pivot:
-                    rule["unresolved_fields"] = [field for field in prices if normalize_header(field) not in KNOWN_PRICE_CLASSES]
-                if pivot:
-                    rule["pivot_prices"] = {"class_field": "Класс", "value_field": "Сумма"}
-            if role == "tariffs":
-                used = set(columns.values())
-                used.update(column for _, column in tariff_prices)
-                duration = detect_duration_column(snapshot, row_no, headers, used)
-                if duration:
-                    columns["Длительность"] = duration[1]
-                    used.add(duration[1])
-                for header, column in tariff_prices:
-                    columns[header] = column
-                if tariff_prices:
-                    rule_price_fields = [header for header, _ in tariff_prices]
-            if role == "tariffs" and rule_price_fields:
-                rule["price_fields"] = rule_price_fields
-            rule["structure"] = structure(snapshot, rule)
-            rule["fingerprint"] = fingerprint(rule["structure"])
-            rules.append(rule)
-    if not rules:
-        schedule = discover_schedule(snapshot)
-        if schedule:
-            rules.append(schedule)
-        else:
-            grid = discover_grid(snapshot)
-            if grid:
-                rules.append(grid)
-            else:
-                expected_role = next((role for role, title in expected.items() if title == snapshot["title"]), None)
-                if expected_role:
-                    issues.append(f"Лист {snapshot['id']}: ожидаемая область {expected_role} не распознана; "
-                                  "нужна ручная настройка или интерпретация моделью")
-                else:
-                    issues.append(f"Лист {snapshot['id']}: структура не распознана; нужна ручная настройка")
-    # Более одной таблицы одного назначения на листе не выбираем молча.
-    for role in ALL_ROLE_FIELDS:
-        candidates = [row_index for row_index in rules if row_index["role"] == role]
-        if len(candidates) > 1:
-            rules = [row_index for row_index in rules if row_index["role"] != role]
-            issues.append(f"Лист {snapshot['id']}: несколько областей {role}; задайте границы вручную")
-    return rules, issues
+def _canonical_field(role: str, key: str) -> tuple[str | None, bool]:
+    """Возвращает (каноническое поле, является ли ключ классом/ценой)."""
+    text = str(key).strip()
+    if not text:
+        return None, False
+    allowed = set(ROLE_FIELDS.get(role, ())) | set(EXTRA_ROLE_FIELDS.get(role, ()))
+    if text in allowed:
+        return text, False
+    folded = text.casefold()
+    by_fold = {field.casefold(): field for field in allowed}
+    if folded in by_fold:
+        return by_fold[folded], False
+    normalized = normalize_header(text)
+    if normalized in _FIELD_SYNONYMS:
+        mapped = _FIELD_SYNONYMS[normalized]
+        if mapped in allowed:
+            return mapped, False
+    if normalized in _CANONICAL_BY_FOLD:
+        mapped = _CANONICAL_BY_FOLD[normalized]
+        if mapped in allowed:
+            return mapped, False
+    return None, False
 
 
-def discover_schedule(snapshot: dict) -> dict | None:
-    """Лист графика работы: Начало + Конец, опционально Дата и Постов.
-
-    Строки без «Дата» задают ежедневный график; строка с датой переопределяет его
-    на эту дату. «Постов» — число параллельных ресурсов в этот интервал.
-    """
-    for row_no, headers in enumerate(snapshot["values"][:20], 1):
-        columns, errors = {}, []
-        for field in ("Начало", "Конец", "Дата", "Постов"):
-            aliases = {normalize_header(alias) for alias in ALIASES[field]}
-            hits = [index for index, header in enumerate(headers, 1) if normalize_header(header) in aliases]
-            if len(hits) == 1:
-                columns[field] = hits[0]
-            elif len(hits) > 1:
-                errors.append(f"Несколько колонок для {field}")
-        if errors or not SCHEDULE_REQUIRED <= set(columns):
-            continue
-        if "Время" in columns or "Telegram ID" in header_mapping(headers, "bookings")[0]:
-            continue
-        source = None
-        if "Дата" not in columns and title_date(snapshot["title"]):
-            source = {"title": True}
-        rule = {"role": "slots", "sheet_id": snapshot["id"], "sheet_title": snapshot["title"],
-                "header_row": row_no, "first_data_row": row_no + 1, "end_row": None,
-                "columns": columns, "schedule_mode": "hours",
-                "transforms": {"Дата": "date", "Начало": "time", "Конец": "time"},
-                "status_map": dict(STATUS_MAP), "write_statuses": {"new": "Новая", "cancelled": "Отмена"},
-                "date_source": source, "permissions": {"read": True, "write": False},
-                "validation": {"read": False, "write": False, "issues": []}}
-        rule["structure"] = structure(snapshot, rule)
-        rule["fingerprint"] = fingerprint(rule["structure"])
-        return rule
-    return None
+def _known_price_class(header: Any) -> bool:
+    text = normalize_header(header)
+    if text in KNOWN_PRICE_CLASSES:
+        return True
+    return any(token in text.split() for token in KNOWN_PRICE_CLASSES if " " not in token) or \
+        any(token in text for token in KNOWN_PRICE_CLASSES if " " in token)
 
 
-def discover_grid(snapshot: dict) -> dict | None:
-    """Безопасный узкий случай: датированный лист, Время + Пост 1/Бокс 2..."""
-    if not title_date(snapshot["title"]):
-        return None
-    for row_no, headers in enumerate(snapshot["values"][:20], 1):
-        columns, _ = header_mapping(headers, "slots")
-        bays = [index for index, header in enumerate(headers, 1) if re.fullmatch(r"(?:пост|бокс|bay)\s*\d+", str(header).strip(), re.I)]
-        if "Время" not in columns or not bays:
-            continue
-        rule = {"role": "slots", "sheet_id": snapshot["id"], "sheet_title": snapshot["title"],
-                "header_row": row_no, "first_data_row": row_no + 1, "end_row": None,
-                "columns": {"Время": columns["Время"]}, "grid_columns": bays,
-                "free_markers": ["", "свободно", "free", "open"], "date_source": {"title": True},
-                "transforms": {"Дата": "date", "Время": "time"},
-                "permissions": {"read": True, "write": True},
-                "validation": {"read": False, "write": False, "issues": []}}
-        rule["structure"] = structure(snapshot, rule)
-        rule["fingerprint"] = fingerprint(rule["structure"])
-        return rule
-    return None
+def _safe_error(error: Exception) -> str:
+    text = " ".join(str(error).split())[:500]
+    text = re.sub(r"(?i)(api[_-]?key|authorization|bearer)\s*[:=]\s*\S+", r"\1=<redacted>", text)
+    text = re.sub(r"sk-[A-Za-z0-9_-]{10,}", "<redacted>", text)
+    return f"{type(error).__name__}: {text}" if text else type(error).__name__
 
 
 class AdaptiveSheets:
+    """Единый mapping-backend: карта, проверка структуры и адресные операции."""
+
     def __init__(self, config, spreadsheet):
         self.config = config
         self.spreadsheet = spreadsheet
@@ -545,12 +498,16 @@ class AdaptiveSheets:
         self.lock = threading.RLock()
         self.document = None
         self.stamp = None
-        self.force_pending = config.sheets_force_schema_refresh
+        self.force_pending = bool(getattr(config, "sheets_force_schema_refresh", False))
         self.worksheets = {}
         self.read_versions = {}
+        self.named_ranges = []
+        self.unsupported_sheets = []
         self.ai_requests = 0
-        self._ai_cache_key = None
-        self.expected = {role: getattr(config, f"sheet_{role}") for role in ROLE_FIELDS}
+        self.last_error = ""
+        self.expected = {}
+
+    # ---------- загрузка и сохранение карты ----------
 
     def _load(self) -> None:
         stamp = file_stamp(self.path)
@@ -558,52 +515,77 @@ class AdaptiveSheets:
             return
         if stamp is None:
             self.document = None
+            self.stamp = None
             return
         try:
             document = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(document, dict) or document.get("version") != VERSION or document.get("spreadsheet_id") != self.config.spreadsheet_id:
-                raise ValueError
-            if not isinstance(document.get("regions"), list) or not isinstance(document.get("checked_at"), (int, float)):
-                raise ValueError
-            if not math.isfinite(document["checked_at"]):
-                raise ValueError
-        except (ValueError, OSError):
-            raise MappingError("Некорректная или чужая конфигурация Sheets; проверьте файл mappings") from None
-        for rule in document["regions"]:
-            if not isinstance(rule, dict) or rule.get("role") not in ALL_ROLE_FIELDS:
-                raise MappingError("Некорректная область mappings")
-            validation = rule.get("validation")
-            if (rule.get("validated_rule") != rule_signature(rule) or not isinstance(validation, dict) or
-                any(type(validation.get(field_name)) is not bool for field_name in ("read", "write"))):
-                rule["validation"] = {"read": False, "write": False,
-                                      "issues": ["Ручные изменения требуют --validate-mappings"]}
+            if not isinstance(document, dict) or document.get("version") != VERSION:
+                raise ValueError("версия карты не поддерживается")
+            if document.get("spreadsheet_id") != self.config.spreadsheet_id:
+                raise ValueError("карта принадлежит другой таблице")
+            if not isinstance(document.get("regions"), list):
+                raise ValueError("нет списка областей")
+            if not isinstance(document.get("checked_at"), (int, float)) or not math.isfinite(document["checked_at"]):
+                raise ValueError("нет времени проверки")
+            for rule in document["regions"]:
+                if not isinstance(rule, dict) or rule.get("role") not in ALL_ROLE_FIELDS:
+                    raise ValueError("некорректная область карты")
+                if not isinstance(rule.get("columns"), dict) or not isinstance(rule.get("header_row"), int):
+                    raise ValueError("некорректные координаты области")
+                if rule.get("validated_rule") != rule_signature(rule):
+                    rule["validation"] = {
+                        "read": False, "write": False,
+                        "issues": ["Ручные изменения требуют --validate-mappings"],
+                        "write_issues": ["Ручные изменения требуют --validate-mappings"],
+                    }
+                    rule["manual_edit"] = True
+        except (ValueError, OSError, TypeError) as error:
+            log.error("Карта Sheets не загружена: %s. Нужна новая AI-разметка", error)
+            self.document = None
+            self.stamp = stamp
+            return
         self.document = document
-        if document.get("engine_revision") != ENGINE_REVISION:
-            self.force_pending = True
-        self._summarize()
         self.stamp = stamp
+        self.named_ranges = document.get("named_ranges") or []
+        self._summarize()
+        if document.get("engine_revision") != ENGINE_REVISION:
+            log.info("Карта Sheets создана прежней версией движка; нужна детерминированная проверка")
+            self.force_pending = True
 
     def _save(self) -> None:
+        if self.document is None:
+            return
+        self.document["saved_at"] = time.time()
+        if self.path.exists():
+            try:
+                backup = self.path.with_name(self.path.stem + ".bak" + self.path.suffix)
+                backup.write_bytes(self.path.read_bytes())
+            except OSError:
+                pass
         atomic_json(self.path, self.document)
         self.stamp = file_stamp(self.path)
 
     def _worksheet(self, sheet_id: int):
-        if sheet_id not in self.worksheets:
-            self.worksheets[sheet_id] = self.spreadsheet().get_worksheet_by_id(sheet_id)
-        return self.worksheets[sheet_id]
+        # Не кэшируем объект по id: после переименования листа старый title
+        # приводил бы к ложному «структура изменилась».
+        worksheet = self.spreadsheet().get_worksheet_by_id(sheet_id)
+        self.worksheets[sheet_id] = worksheet
+        return worksheet
 
     def _typed_formulas(self, sheet_id: int, title: str, candidates: list[tuple[int, int]]) -> set[tuple[int, int]]:
-        # FORMULA render returns literal '=...' strings too; only formulaValue is authoritative.
         found = set()
-        prefix = "'" + title.replace("'", "''") + "'!"
         if not candidates:
             return found
+        prefix = "'" + title.replace("'", "''") + "'!"
         rows, columns = zip(*candidates)
         area = prefix + cell_name(min(rows), min(columns)) + ":" + cell_name(max(rows), max(columns))
         metadata = self.spreadsheet().fetch_sheet_metadata(params={
-            "includeGridData": True, "ranges": [area],
-            "fields": "sheets(properties(sheetId),data(startRow,startColumn,rowData(values(userEnteredValue(formulaValue)))))"})
-        sheets = [sheet for sheet in metadata.get("sheets", []) if sheet.get("properties", {}).get("sheetId") == sheet_id]
+            "includeGridData": True,
+            "ranges": [area],
+            "fields": "sheets(properties(sheetId),data(startRow,startColumn,rowData(values(userEnteredValue(formulaValue)))))",
+        })
+        sheets = [sheet for sheet in metadata.get("sheets", [])
+                  if sheet.get("properties", {}).get("sheetId") == sheet_id]
         if len(sheets) != 1:
             raise MappingError("Не удалось проверить тип ячеек с формулами")
         for block in sheets[0].get("data", []):
@@ -616,89 +598,739 @@ class AdaptiveSheets:
     def _snapshots(self) -> list[dict]:
         spreadsheet = self.spreadsheet()
         metadata = spreadsheet.fetch_sheet_metadata(params={"fields": "sheets(properties,merges),namedRanges"})
-        self.named_ranges = [{"name": row_index.get("name"), "range": row_index.get("range")} for row_index in metadata.get("namedRanges", [])]
-        entries = [sheet for sheet in metadata.get("sheets", []) if sheet["properties"].get("sheetType", "GRID") == "GRID"]
-        self.unsupported_sheets = [f"Лист {sheet['properties']['sheetId']}: тип {sheet['properties'].get('sheetType')} не поддерживается"
-                                   for sheet in metadata.get("sheets", []) if sheet not in entries]
+        self.named_ranges = [
+            {"name": row_index.get("name"), "range": row_index.get("range")}
+            for row_index in metadata.get("namedRanges", [])
+        ]
+        entries = [sheet for sheet in metadata.get("sheets", [])
+                   if sheet["properties"].get("sheetType", "GRID") == "GRID"]
+        self.unsupported_sheets = [
+            f"Лист {sheet['properties']['sheetId']}: тип {sheet['properties'].get('sheetType')} не поддерживается"
+            for sheet in metadata.get("sheets", []) if sheet not in entries
+        ]
         ranges = []
-        self.worksheets.clear()
         for entry in entries:
             props = entry["properties"]
             grid = props.get("gridProperties", {})
             if grid.get("rowCount", 0) * grid.get("columnCount", 0) > MAX_DISCOVERY_CELLS:
                 raise MappingError(f"Лист {props['sheetId']} слишком большой для безопасного автоанализа")
             ranges.append("'" + props["title"].replace("'", "''") + "'")
-            # Конструктор использует уже полученные метаданные, без повторного HTTP GET.
-            from gspread import Worksheet
-            self.worksheets[props["sheetId"]] = Worksheet(spreadsheet, props, spreadsheet.id, spreadsheet.client)
         formatted, formulas = [], []
         for offset in range(0, len(ranges), 50):
             group = ranges[offset:offset + 50]
-            formatted.extend(spreadsheet.values_batch_get(group, params={"valueRenderOption": "FORMATTED_VALUE"}).get("valueRanges", []))
-            formulas.extend(spreadsheet.values_batch_get(group, params={"valueRenderOption": "FORMULA"}).get("valueRanges", []))
+            formatted.extend(spreadsheet.values_batch_get(
+                group, params={"valueRenderOption": "FORMATTED_VALUE"}).get("valueRanges", []))
+            formulas.extend(spreadsheet.values_batch_get(
+                group, params={"valueRenderOption": "FORMULA"}).get("valueRanges", []))
         if len(formatted) != len(entries) or len(formulas) != len(entries):
             raise MappingError("Google вернул неполный набор диапазонов")
         snapshots = []
         for entry, values, formula_values in zip(entries, formatted, formulas):
             props = entry["properties"]
-            grid = props["gridProperties"]
-            positions = [(row_index, column_index) for row_index, row in enumerate(formula_values.get("values", []), 1)
-                         for column_index, cell_value in enumerate(row, 1) if str(cell_value).startswith("=")]
+            grid = props.get("gridProperties", {})
+            positions = [
+                (row_index, column_index)
+                for row_index, row in enumerate(formula_values.get("values", []), 1)
+                for column_index, cell_value in enumerate(row, 1)
+                if str(cell_value).startswith("=")
+            ]
             positions = sorted(self._typed_formulas(props["sheetId"], props["title"], positions))
-            snapshots.append({"id": props["sheetId"], "title": props["title"], "values": values.get("values", []),
-                              "formulas": positions, "raw_values": formula_values.get("values", []), "merges": entry.get("merges", []),
-                              "column_count": grid.get("columnCount", 0), "row_count": grid.get("rowCount", 0)})
+            snapshots.append({
+                "id": props["sheetId"],
+                "title": props["title"],
+                "values": values.get("values", []),
+                "formulas": positions,
+                "raw_values": formula_values.get("values", []),
+                "merges": entry.get("merges", []),
+                "column_count": grid.get("columnCount", 0),
+                "row_count": grid.get("rowCount", 0),
+                "index": props.get("index"),
+                "sheet_type": props.get("sheetType", "GRID"),
+            })
         return snapshots
+
+    def _probe_snapshots(self) -> list[dict]:
+        """Дешёвая проверка структуры: метаданные + строки вокруг известных шапок."""
+        spreadsheet = self.spreadsheet()
+        metadata = spreadsheet.fetch_sheet_metadata(params={"fields": "sheets(properties,merges),namedRanges"})
+        self.named_ranges = [
+            {"name": row_index.get("name"), "range": row_index.get("range")}
+            for row_index in metadata.get("namedRanges", [])
+        ]
+        regions = (self.document or {}).get("regions", [])
+        by_sheet: dict[int, list[dict]] = {}
+        for rule in regions:
+            by_sheet.setdefault(rule.get("sheet_id"), []).append(rule)
+        ranges, entries = [], []
+        for entry in metadata.get("sheets", []):
+            props = entry["properties"]
+            if props.get("sheetType", "GRID") != "GRID":
+                continue
+            grid = props.get("gridProperties", {})
+            row_count = grid.get("rowCount", 0) or 1
+            column_count = grid.get("columnCount", 0) or 1
+            rows = 20
+            wanted_columns = 60
+            for rule in by_sheet.get(props["sheetId"], []):
+                rows = max(rows, min(MAX_PROBE_ROWS, int(rule.get("header_row", 1)) + 2))
+                wanted_columns = max(wanted_columns, max(rule.get("columns", {}).values() or [0]) + 2)
+            rows = min(rows, row_count)
+            columns = min(max(wanted_columns, 1), column_count)
+            range_name = "'" + props["title"].replace("'", "''") + "'!A1:" + cell_name(rows, columns)
+            ranges.append(range_name)
+            entries.append((props, entry, grid))
+        values = []
+        for offset in range(0, len(ranges), 50):
+            values.extend(spreadsheet.values_batch_get(
+                ranges[offset:offset + 50],
+                params={"valueRenderOption": "FORMATTED_VALUE"}).get("valueRanges", []))
+        if len(values) != len(ranges):
+            raise MappingError("Google вернул неполный структурный снимок")
+        snapshots = []
+        for (props, entry, grid), value_range in zip(entries, values):
+            snapshots.append({
+                "id": props["sheetId"],
+                "title": props["title"],
+                "values": value_range.get("values", []),
+                "formulas": [],
+                "raw_values": [],
+                "merges": entry.get("merges", []),
+                "column_count": grid.get("columnCount", 0),
+                "row_count": grid.get("rowCount", 0),
+                "index": props.get("index"),
+                "sheet_type": props.get("sheetType", "GRID"),
+            })
+        return snapshots
+
+    # ---------- структурный отпечаток ----------
+
+    def _structure_signature(self, snapshots: list[dict], regions: list[dict]) -> str:
+        by_sheet: dict[int, list[dict]] = {}
+        for rule in regions:
+            by_sheet.setdefault(rule.get("sheet_id"), []).append(rule)
+        sheets = []
+        for snapshot in snapshots:
+            views = []
+            for rule in sorted(by_sheet.get(snapshot["id"], []),
+                               key=lambda item: (item.get("role", ""), item.get("header_row", 0))):
+                header_row = int(rule.get("header_row", 0))
+                headers = trim_headers(snapshot["values"][header_row - 1]) \
+                    if 0 < header_row <= len(snapshot["values"]) else []
+                views.append({
+                    "role": rule.get("role"),
+                    "header_row": header_row,
+                    "headers": headers,
+                    "first_data_row": rule.get("first_data_row"),
+                    "end_row": rule.get("end_row"),
+                    "columns": rule.get("columns", {}),
+                    "price_fields": rule.get("price_fields", []),
+                    "grid_columns": rule.get("grid_columns", []),
+                    "date_source": rule.get("date_source"),
+                    "schedule_mode": rule.get("schedule_mode"),
+                    "prices_transposed": bool(rule.get("prices_transposed")),
+                    "pivot_prices": rule.get("pivot_prices"),
+                })
+            sheets.append({
+                "id": snapshot.get("id"),
+                "title": snapshot.get("title"),
+                "type": snapshot.get("sheet_type", "GRID"),
+                "merges": snapshot.get("merges") or [],
+                "regions": views,
+            })
+        return fingerprint({
+            "spreadsheet_id": self.config.spreadsheet_id,
+            "sheets": sheets,
+            "named_ranges": self.named_ranges,
+        })
+
+    # ---------- AI-разметка и проверка ----------
+
+    def _resolve_header(self, headers: list[str], claimed: str) -> tuple[int, str] | None:
+        text = str(claimed or "").strip()
+        if not text:
+            return None
+        match = re.fullmatch(r"@\s*(\d+)|(?:column|колонка)\s*(\d+)", text, re.I)
+        if match:
+            index = int(match.group(1) or match.group(2))
+            if 1 <= index <= len(headers):
+                return index, str(headers[index - 1]).strip()
+            return None
+        exact = [index for index, header in enumerate(headers, 1) if str(header).strip() == text]
+        if len(exact) == 1:
+            return exact[0], str(headers[exact[0] - 1]).strip()
+        normalized = normalize_header(text)
+        loose = [index for index, header in enumerate(headers, 1)
+                 if normalize_header(header) == normalized]
+        if len(loose) == 1:
+            return loose[0], str(headers[loose[0] - 1]).strip()
+        return None
+
+    def _candidate_rule(self, candidate: dict, snapshots_by_id: dict[int, dict],
+                        by_title: dict[str, dict], issues: list[str]) -> dict | None:
+        role = candidate["role"]
+        snapshot = None
+        if candidate.get("sheet_id") in snapshots_by_id:
+            snapshot = snapshots_by_id[candidate["sheet_id"]]
+        if snapshot is None and candidate.get("sheet_title"):
+            snapshot = by_title.get(candidate["sheet_title"].casefold())
+        if snapshot is None:
+            issues.append(f"Модель: лист «{candidate.get('sheet_title')}» не найден в книге")
+            return None
+        values = snapshot.get("values") or []
+        header_row = candidate.get("header_row")
+        if not isinstance(header_row, int):
+            # Модель иногда не указала строку: ищем строку с максимальным числом
+            # подтверждённых заголовков среди первых строк, но не угадываем данные.
+            best_row, best_hits = None, -1
+            for row_number in range(1, min(len(values), MAX_HEADER_SCAN_ROWS) + 1):
+                headers = trim_headers(values[row_number - 1])
+                hits = 0
+                for claimed in candidate.get("columns", {}).values():
+                    if self._resolve_header(headers, claimed):
+                        hits += 1
+                if hits > best_hits:
+                    best_row, best_hits = row_number, hits
+            header_row = best_row if best_hits > 0 else 1
+        if not 1 <= header_row <= min(MAX_HEADER_SCAN_ROWS, len(values)):
+            issues.append(f"Модель: некорректная строка шапки {header_row} на листе «{snapshot['title']}»")
+            return None
+        headers = trim_headers(values[header_row - 1])
+        columns: dict[str, int] = {}
+        physical: dict[str, str] = {}
+        price_fields: list[str] = []
+        unresolved: list[str] = []
+        extra_columns: list[dict] = []
+
+        def add(field: str, claimed: str, *, price: bool = False) -> None:
+            resolved = self._resolve_header(headers, claimed)
+            if resolved is None:
+                issues.append(f"Модель: шапка «{claimed}» ({field}) не подтверждена на листе «{snapshot['title']}»")
+                unresolved.append(field)
+                return
+            index, actual = resolved
+            if index in columns.values():
+                # Одна физическая колонка не может быть двумя полями без явного правила.
+                issues.append(f"Модель: колонка {index} назначена дважды ({field})")
+                unresolved.append(field)
+                return
+            columns[field] = index
+            physical[field] = actual or (f"@{index}")
+            if price and field not in price_fields:
+                price_fields.append(field)
+
+        for key, claimed in (candidate.get("columns") or {}).items():
+            field, _ = _canonical_field(role, key)
+            if field is not None:
+                add(field, claimed)
+                continue
+            # Старый/свободный формат модели: неизвестный ключ у услуг/тарифов —
+            # это класс или услуга с ценой. Проверяем по числовым значениям.
+            if role in {"services", "tariffs"}:
+                add(str(key).strip(), claimed, price=True)
+                continue
+            resolved = self._resolve_header(headers, claimed)
+            if resolved is not None:
+                extra_columns.append({"header": resolved[1], "role": str(key).strip()})
+
+        for key, claimed in (candidate.get("price_columns") or {}).items():
+            add(str(key).strip(), claimed, price=True)
+
+        # Служебные поля, которые модель могла не назвать, но которые однозначно
+        # подтверждаются фактической шапкой. Это восстановление, не первичный поиск.
+        salvaged = []
+        for field in ("Госномер", "Бокс", "Длительность"):
+            if role in {"bookings", "archive"} and field not in columns:
+                aliases = {normalize_header(alias) for alias in ALIASES[field]}
+                hits = [index for index, header in enumerate(headers, 1)
+                        if normalize_header(header) in aliases]
+                if len(hits) == 1:
+                    columns[field] = hits[0]
+                    physical[field] = str(headers[hits[0] - 1]).strip() or f"@{hits[0]}"
+                    salvaged.append(field)
+        if role in {"bookings", "archive", "slots"}:
+            for field in ("Дата", "Время", "Постов", "Начало", "Конец"):
+                if field in columns:
+                    continue
+                aliases = {normalize_header(alias) for alias in ALIASES.get(field, [])}
+                hits = [index for index, header in enumerate(headers, 1)
+                        if normalize_header(header) in aliases]
+                if len(hits) == 1:
+                    columns[field] = hits[0]
+                    physical[field] = str(headers[hits[0] - 1]).strip() or f"@{hits[0]}"
+                    salvaged.append(field)
+
+        # Пустая шапка описания услуги: единственная текстовая колонка между
+        # «Услуга» и первой ценой. Значение подтверждается данными, а не догадкой.
+        if role == "services" and "Описание" not in columns:
+            blank_candidates = []
+            for index, header in enumerate(headers, 1):
+                if str(header).strip() or index in columns.values():
+                    continue
+                samples = [str(value_at(values, row_index, index)).strip()
+                           for row_index in range(header_row + 1, min(len(values), header_row + 8) + 1)]
+                if any(samples):
+                    blank_candidates.append(index)
+            if len(blank_candidates) == 1:
+                index = blank_candidates[0]
+                columns["Описание"] = index
+                physical["Описание"] = f"@{index}"
+                salvaged.append("Описание")
+
+        if not columns:
+            return None
+
+        # Числовые колонки, не назначенные полям: цены услуг/тарифов.
+        if role in {"services", "tariffs"} and not candidate.get("orientation") == "long_prices":
+            used = set(columns.values())
+            for index, header in enumerate(headers, 1):
+                if not str(header).strip() or index in used or is_duration_header(header):
+                    continue
+                samples = []
+                for row_index in range(header_row + 1, min(len(values), header_row + 20) + 1):
+                    text = str(value_at(values, row_index, index)).strip()
+                    if text:
+                        samples.append(text)
+                if samples and all(re.fullmatch(
+                        r"[-+]?\d[\d\s]*(?:[.,]\d+)?\s*(?:₽|руб\.?|RUB)?", sample, re.I)
+                        for sample in samples):
+                    field = str(header).strip()
+                    if field not in columns:
+                        columns[field] = index
+                        physical[field] = field
+                        if field not in price_fields:
+                            price_fields.append(field)
+                    used.add(index)
+
+        orientation = candidate.get("orientation")
+        prices_transposed = orientation in {"transposed", "services_in_columns"}
+        if prices_transposed:
+            # Ключи-услуги уже находятся в columns; поле «Класс» обязательно.
+            price_fields = [key for key in columns if key != "Класс"]
+        pivot = orientation == "long_prices" or (
+            role == "services" and "Класс" in columns and "Сумма" in columns
+        )
+        if pivot:
+            price_fields = []
+        if role in {"services", "tariffs"} and not price_fields and not pivot and not prices_transposed:
+            # Единственная цена без классов: «Сумма»/«Цена» — это price field.
+            for field in ("Сумма", "Цена", "Стоимость"):
+                if field in columns:
+                    price_fields.append(field)
+            if not price_fields:
+                if role == "tariffs" and "Состав" in columns:
+                    pass  # пакеты с составом и скидкой не обязаны иметь цены по классам
+                else:
+                    issues.append(f"Область {role} на листе «{snapshot['title']}»: не найдены колонки цен")
+                    unresolved.append("цена")
+
+        grid_columns: list[int] = []
+        for claimed in candidate.get("grid_columns") or []:
+            resolved = self._resolve_header(headers, claimed)
+            if resolved is None:
+                issues.append(f"Модель: колонка сетки «{claimed}» не подтверждена на листе «{snapshot['title']}»")
+            else:
+                grid_columns.append(resolved[0])
+        if role == "slots" and not grid_columns:
+            detected = [
+                index for index, header in enumerate(headers, 1)
+                if re.fullmatch(r"(?:пост|бокс|bay|post)\s*\d+", str(header).strip(), re.I)
+            ]
+            if detected:
+                grid_columns = detected
+
+        # Источник даты: колонка, название листа или одна ячейка.
+        date_source = None
+        raw_source = candidate.get("date_source") or {}
+        source_type = raw_source.get("type") if isinstance(raw_source, dict) else None
+        if source_type == "cell":
+            row, column = raw_source.get("row"), raw_source.get("column")
+            if isinstance(row, int) and isinstance(column, int) and row >= 1 and column >= 1:
+                date_source = {"cell": [row, column]}
+            else:
+                issues.append(f"Модель: некорректная ячейка даты на листе «{snapshot['title']}»")
+        elif source_type == "title" or (role in {"slots", "bookings", "archive"}
+                                        and "Дата" not in columns and title_date(snapshot["title"])):
+            date_source = {"title": True}
+        if "Дата" in columns:
+            date_source = None
+
+        schedule_mode = candidate.get("schedule_mode")
+        if role == "slots":
+            if {"Начало", "Конец"} <= set(columns):
+                schedule_mode = "hours"
+            elif grid_columns:
+                schedule_mode = "grid"
+            else:
+                schedule_mode = "slots"
+
+        rule = {
+            "role": role,
+            "sheet_id": snapshot["id"],
+            "sheet_title": snapshot["title"],
+            "header_row": header_row,
+            "first_data_row": header_row + 1,
+            "end_row": candidate.get("end_row") if candidate.get("end_row") and candidate["end_row"] > header_row else None,
+            "columns": columns,
+            "physical_headers": physical,
+            "price_fields": price_fields,
+            "status_map": dict(STATUS_MAP),
+            "write_statuses": {"new": "Новая", "cancelled": "Отмена"},
+            "transforms": {"Дата": "date", "Время": "time", "Начало": "time", "Конец": "time"},
+            "date_source": date_source,
+            "orientation": orientation or "records",
+            "permissions": {
+                "read": True,
+                "write": role in {"bookings"} or (role == "slots" and bool(grid_columns)),
+            },
+            "validation": {"read": False, "write": False, "issues": []},
+            "source": "ai",
+        }
+        if price_fields:
+            rule["price_fields"] = price_fields
+        if prices_transposed:
+            rule["prices_transposed"] = True
+        if pivot:
+            rule["pivot_prices"] = {"class_field": "Класс", "value_field": "Сумма"}
+        if grid_columns:
+            rule["grid_columns"] = grid_columns
+            rule["free_markers"] = ["", "свободно", "free", "open", "свободен"]
+        if schedule_mode:
+            rule["schedule_mode"] = schedule_mode
+        if salvaged:
+            rule["salvaged_fields"] = salvaged
+        if extra_columns:
+            rule["extra_columns"] = extra_columns
+        if unresolved:
+            rule["unresolved_fields"] = sorted(set(unresolved))
+        self._infer_transforms(rule, snapshot)
+        self._infer_statuses(rule, snapshot, candidate.get("status_values") or [])
+        rule["structure"] = structure(snapshot, rule)
+        rule["fingerprint"] = fingerprint(rule["structure"])
+        return rule
+
+    def _infer_transforms(self, rule: dict, snapshot: dict) -> None:
+        values = snapshot.get("values") or []
+        header_row = rule["header_row"]
+        transforms = rule.setdefault("transforms", {})
+        for field, transform_field in (("Дата", "date"), ("Время", "time"), ("Начало", "time"), ("Конец", "time")):
+            column = rule["columns"].get(field)
+            if not column:
+                continue
+            samples = []
+            for row_number in range(header_row + 1, min(len(values), header_row + 20) + 1):
+                text = str(value_at(values, row_number, column)).strip()
+                if text:
+                    samples.append(text)
+            if field == "Дата":
+                numeric = [sample for sample in samples if re.fullmatch(r"\d+(?:[.,]\d+)?", sample)]
+                if numeric and all(1 <= float(sample.replace(",", ".")) <= 100000 for sample in numeric):
+                    transforms[field] = "serial_date"
+                else:
+                    transforms[field] = "date"
+            else:
+                numeric = [sample for sample in samples if re.fullmatch(r"0?\.\d+", sample)]
+                if numeric and len(numeric) == len(samples):
+                    transforms[field] = "serial_time"
+                else:
+                    transforms[field] = "time"
+
+    def _infer_statuses(self, rule: dict, snapshot: dict, ai_values: list[str]) -> None:
+        values = snapshot.get("values") or []
+        header_row = rule["header_row"]
+        column = rule["columns"].get("Статус")
+        observed: list[str] = []
+        if column:
+            for row_number in range(header_row + 1, min(len(values), header_row + 100) + 1):
+                text = str(value_at(values, row_number, column)).strip()
+                if text:
+                    observed.append(text)
+        observed.extend(str(value).strip() for value in ai_values if str(value).strip())
+        status_map = dict(STATUS_MAP)
+        for value in observed:
+            canonical = canonical_status(value)
+            if canonical:
+                status_map[normalize_header(value)] = canonical
+        rule["status_map"] = status_map
+        new_value = next((value for value in observed if canonical_status(value) == "Новая"), "Новая")
+        cancel_value = next((value for value in observed if canonical_status(value) == "Отмена"), "Отмена")
+        rule["write_statuses"] = {"new": new_value, "cancelled": cancel_value}
+
+    def _salvage_missing_roles(self, regions: list[dict], snapshots: list[dict],
+                               issues: list[str], roles: set[str] | None = None) -> None:
+        """Неполный ответ модели: однозначное восстановление по фактическим шапкам.
+
+        Это не первичный discovery: функция вызывается только после ответа модели
+        (или при недоступности провайдера), а результат всё равно проходит полную
+        проверку координат и типов.
+        """
+        present = {rule["role"] for rule in regions}
+        wanted_roles = roles or set(CORE_ROLES)
+
+        def alias_hits(field: str) -> list[int]:
+            aliases = {normalize_header(alias) for alias in ALIASES.get(field, [])}
+            return [index for index, header in enumerate(headers, 1)
+                    if normalize_header(header) in aliases]
+
+        for snapshot in snapshots:
+            already_used = snapshot["id"] in {rule["sheet_id"] for rule in regions}
+            for row_number in range(1, min(len(snapshot["values"]), MAX_HEADER_SCAN_ROWS) + 1):
+                headers = trim_headers(snapshot["values"][row_number - 1])
+                if len([header for header in headers if str(header).strip()]) < 2:
+                    continue
+                booking_like = header_mapping(headers, "bookings")[0]
+                roles_to_try = set(wanted_roles - present)
+                if title_date(snapshot["title"]) and "slots" in present:
+                    roles_to_try.add("slots")
+                if "services" in wanted_roles and "services" in present and not already_used:
+                    roles_to_try.add("services")
+                for role in sorted(roles_to_try):
+                    if already_used and role != "services":
+                        continue  # несколько таблиц одного листа размечает AI
+                    if role == "archive" and not any(
+                            token in normalize_header(snapshot["title"])
+                            for token in ("архив", "archive")):
+                        continue  # архивный журнал должен быть явно архивным листом
+                    duplicate_price = False
+                    if role in {"services", "tariffs", "slots", "durations"} and (
+                            "Telegram ID" in booking_like or
+                            ({"ID", "Дата", "Время", "Статус"} <= set(booking_like))):
+                        continue
+                    columns, errors = header_mapping(headers, role)
+                    if role == "durations":
+                        # Отдельный справочник длительностей, а не колонка внутри
+                        # прайса услуг: иначе переопределения теряются.
+                        extra = [str(header).strip() for index, header in enumerate(headers, 1)
+                                 if str(header).strip() and index not in columns.values()
+                                 and not is_duration_header(header)]
+                        if extra:
+                            continue
+                    pivot = False
+                    if role == "services":
+                        for field in ("Класс", "Сумма"):
+                            if field in columns:
+                                continue
+                            hits = alias_hits(field)
+                            if len(hits) == 1:
+                                columns[field] = hits[0]
+                        pivot = {"Класс", "Сумма"} <= set(columns)
+                        duration_hits = alias_hits("Длительность")
+                        if "Длительность" not in columns and len(duration_hits) == 1:
+                            columns["Длительность"] = duration_hits[0]
+                        if not pivot:
+                            price_fields = []
+                            for index, header in enumerate(headers, 1):
+                                if not str(header).strip() or index in columns.values() or is_duration_header(header):
+                                    continue
+                                samples = [str(value_at(snapshot["values"], sample_row, index)).strip()
+                                           for sample_row in range(row_number + 1,
+                                                                   min(len(snapshot["values"]), row_number + 8) + 1)]
+                                samples = [sample for sample in samples if sample]
+                                class_like = _known_price_class(header) or any(
+                                    token in normalize_header(header)
+                                    for token in ("цена", "стоимость", "price"))
+                                if samples and (class_like or all(re.fullmatch(
+                                        r"[-+]?\d[\d\s]*(?:[.,]\d+)?\s*(?:₽|руб\.?|RUB)?",
+                                        sample, re.I) for sample in samples)):
+                                    normalized_header = normalize_header(header)
+                                    if normalized_header in {normalize_header(field) for field in price_fields}:
+                                        duplicate_price = True
+                                    price_fields.append(str(header).strip())
+                            if not price_fields:
+                                if errors:
+                                    issues.extend(f"Восстановление {role}: {issue}" for issue in errors)
+                                continue
+                            for field in price_fields:
+                                columns[field] = headers.index(field) + 1
+                    elif role == "tariffs":
+                        duration_hits = alias_hits("Длительность")
+                        if "Длительность" not in columns and len(duration_hits) == 1:
+                            columns["Длительность"] = duration_hits[0]
+                        used = set(columns.values())
+                        for index, header in enumerate(headers, 1):
+                            if not str(header).strip() or index in used or is_duration_header(header):
+                                continue
+                            if normalize_header(header) in {normalize_header(alias) for alias in ALIASES["Скидка %"]}:
+                                continue
+                            samples = [str(value_at(snapshot["values"], sample_row, index)).strip()
+                                       for sample_row in range(row_number + 1,
+                                                               min(len(snapshot["values"]), row_number + 8) + 1)]
+                            samples = [sample for sample in samples if sample]
+                            class_like = _known_price_class(header) or any(
+                                token in normalize_header(header)
+                                for token in ("цена", "стоимость", "price"))
+                            if samples and (class_like or all(re.fullmatch(
+                                    r"[-+]?\d[\d\s]*(?:[.,]\d+)?\s*(?:₽|руб\.?|RUB)?",
+                                    sample, re.I) for sample in samples)):
+                                if any(normalize_header(headers[column - 1]) == normalize_header(header)
+                                       for column in columns.values()):
+                                    duplicate_price = True
+                                columns[str(header).strip()] = index
+                    elif role in {"bookings", "archive"}:
+                        for field in ("Госномер", "Бокс", "Длительность"):
+                            if field in columns:
+                                continue
+                            hits = alias_hits(field)
+                            if len(hits) == 1:
+                                columns[field] = hits[0]
+                    elif role == "slots":
+                        grid = [index for index, header in enumerate(headers, 1)
+                                if re.fullmatch(r"(?:пост|бокс|bay|post)\s*\d+",
+                                                str(header).strip(), re.I)]
+                        if grid:
+                            columns["Время"] = columns.get("Время", alias_hits("Время")[0]
+                                                           if len(alias_hits("Время")) == 1 else None)
+                            columns = {key: value for key, value in columns.items() if value}
+                    if errors:
+                        issues.extend(f"Восстановление {role}: {issue}" for issue in errors)
+                        continue
+                    title_day = title_date(snapshot["title"])
+                    required = set(READ_REQUIRED[role])
+                    if role in {"bookings", "archive"} and title_day and "Дата" not in columns:
+                        required.discard("Дата")
+                    if role == "slots":
+                        if {"Начало", "Конец"} <= set(columns):
+                            required = set(SCHEDULE_REQUIRED)
+                        elif "Дата" not in columns and title_day:
+                            required = {"Время"}
+                        elif "Постов" not in columns and "Время" in columns:
+                            # Сетка постов: вместимость вычисляется по колонкам постов.
+                            pass
+                    if role == "services" and pivot:
+                        required = {"Услуга"}
+                    if not required <= set(columns):
+                        continue
+                    rule = {
+                        "role": role, "sheet_id": snapshot["id"], "sheet_title": snapshot["title"],
+                        "header_row": row_number, "first_data_row": row_number + 1, "end_row": None,
+                        "columns": columns, "physical_headers": {
+                            field: str(headers[index - 1]).strip() or f"@{index}"
+                            for field, index in columns.items()
+                        },
+                        "status_map": dict(STATUS_MAP),
+                        "write_statuses": {"new": "Новая", "cancelled": "Отмена"},
+                        "transforms": {"Дата": "date", "Время": "time", "Начало": "time", "Конец": "time"},
+                        "date_source": ({"title": True}
+                                        if role in {"slots", "bookings", "archive"}
+                                        and "Дата" not in columns and title_day else None),
+                        "orientation": "long_prices" if pivot else "records",
+                        "permissions": {"read": True, "write": role == "bookings"},
+                        "validation": {"read": False, "write": False, "issues": []},
+                        "source": "deterministic-recovery",
+                    }
+                    if role == "services":
+                        if pivot:
+                            rule["pivot_prices"] = {"class_field": "Класс", "value_field": "Сумма"}
+                        else:
+                            rule["price_fields"] = [field for field in columns
+                                                    if field not in ROLE_FIELDS["services"]
+                                                    and field not in {"Класс", "Сумма", "Длительность"}]
+                            unknown = [field for field in rule["price_fields"]
+                                       if not _known_price_class(field)]
+                            if unknown:
+                                rule["unresolved_fields"] = sorted(unknown)
+                                issues.append(
+                                    "Восстановление services: незнакомые колонки цен "
+                                    + ", ".join(unknown) + "; нужно подтверждение")
+                        if duplicate_price:
+                            rule["duplicate_price"] = True
+                            issues.append("Восстановление services: дублирующиеся колонки цен")
+                    if role == "slots":
+                        grid = [index for index, header in enumerate(headers, 1)
+                                if re.fullmatch(r"(?:пост|бокс|bay|post)\s*\d+",
+                                                str(header).strip(), re.I)]
+                        if grid:
+                            rule["grid_columns"] = grid
+                            rule["free_markers"] = ["", "свободно", "free", "open", "свободен"]
+                            rule["schedule_mode"] = "grid"
+                            rule["permissions"]["write"] = True
+                        elif {"Начало", "Конец"} <= set(columns):
+                            rule["schedule_mode"] = "hours"
+                        else:
+                            rule["schedule_mode"] = "slots"
+                    if role == "tariffs":
+                        rule["price_fields"] = [field for field in columns
+                                                if field not in ROLE_FIELDS["tariffs"]
+                                                and field not in {"Класс", "Сумма"}]
+                    if duplicate_price:
+                        rule["duplicate_price"] = True
+                        issues.append(f"Восстановление {role}: дублирующиеся колонки цен")
+                    self._infer_transforms(rule, snapshot)
+                    self._infer_statuses(rule, snapshot, [])
+                    rule["structure"] = structure(snapshot, rule)
+                    rule["fingerprint"] = fingerprint(rule["structure"])
+                    regions.append(rule)
+                    present.add(role)
+                    issues.append(f"Ответ модели был неполным: область {role} восстановлена по фактической шапке "
+                                  f"листа «{snapshot['title']}» и требует проверки")
+                    break
+
+    def _validate_rule(self, rule: dict, snapshot: dict) -> dict:
+        if rule.get("unresolved_fields"):
+            rule["unresolved_fields"] = sorted(
+                field for field in rule["unresolved_fields"]
+                if field in rule.get("columns", {}) or field in rule.get("price_fields", []))
+        errors = self._rule_structure(rule, snapshot)
+        present = self._rule_fields(rule, snapshot, errors)
+        formula_headers = self._rule_read_issues(rule, snapshot, errors)
+        write_errors = self._rule_write_issues(rule, snapshot, errors, present, formula_headers)
+        read_ok = not errors and bool(rule["permissions"].get("read"))
+        rule["validation"] = {
+            "read": read_ok,
+            "write": read_ok and not write_errors and bool(rule["permissions"].get("write")),
+            "issues": errors,
+            "write_issues": write_errors,
+            "validated_at": time.time(),
+        }
+        rule["validated_rule"] = rule_signature(rule)
+        return rule
 
     def _rule_structure(self, rule: dict, snapshot: dict) -> list[str]:
         errors = []
+        role = rule.get("role")
         columns = rule.get("columns", {})
-        if rule.get("role") not in ALL_ROLE_FIELDS or not isinstance(columns, dict):
+        if role not in ALL_ROLE_FIELDS or not isinstance(columns, dict):
             raise MappingError("Неверное назначение области или columns")
-        if any(
-            not isinstance(field, str) or type(column_index) is not int
-            for field, column_index in columns.items()
-        ):
+        if any(not isinstance(field, str) or type(column_index) is not int
+               for field, column_index in columns.items()):
             raise MappingError("columns: нужны строковые имена полей и целочисленные номера")
         for key, expected_type in (
-            ("transforms", dict),
-            ("status_map", dict),
-            ("write_statuses", dict),
-            ("price_fields", list),
-            ("grid_columns", list),
-            ("unresolved_fields", list),
+            ("transforms", dict), ("status_map", dict), ("write_statuses", dict),
+            ("price_fields", list), ("grid_columns", list), ("unresolved_fields", list),
+            ("physical_headers", dict), ("extra_columns", list),
         ):
             if key in rule and not isinstance(rule[key], expected_type):
                 raise MappingError("Некорректная структура параметра " + key)
-        if not columns or any(
-            column_index < 1 or column_index > snapshot["column_count"] for column_index in columns.values()
-        ):
+        if not columns or any(column_index < 1 or column_index > snapshot["column_count"]
+                              for column_index in columns.values()):
             errors.append("Некорректные номера колонок")
         if len(set(columns.values())) != len(columns):
             errors.append("Два поля ссылаются на одну колонку")
-        allowed = set(ROLE_FIELDS.get(rule["role"], OPTIONAL_ROLE_FIELDS.get(rule["role"], set())))
-        # Дополнительные поля (например «Госномер») разрешены, когда колонка есть в листе.
-        allowed |= set(EXTRA_ROLE_FIELDS.get(rule["role"], ()))
-        allowed = allowed | set(rule.get("price_fields", []))
+        allowed = set(ROLE_FIELDS.get(role, ())) | set(EXTRA_ROLE_FIELDS.get(role, ()))
+        allowed |= set(rule.get("price_fields", []))
         if rule.get("pivot_prices"):
             allowed.update({"Класс", "Сумма"})
         if rule.get("prices_transposed"):
             allowed.add("Класс")
-            allowed |= set(rule["columns"]) - {"Класс"}
+            allowed |= set(columns) - {"Класс"}
         if rule.get("schedule_mode") == "hours":
             allowed.update({"Начало", "Конец"})
         if "Длительность" in columns:
             allowed.add("Длительность")
         if set(columns) - allowed:
             errors.append("Неизвестные поля columns")
+        if role in {"services", "tariffs"}:
+            mapped_headers = [
+                normalize_header(snapshot["values"][rule["header_row"] - 1][column_index - 1])
+                if column_index <= len(snapshot["values"][rule["header_row"] - 1]) else ""
+                for column_index in columns.values()
+            ]
+            if len(mapped_headers) != len(set(mapped_headers)):
+                errors.append("Дублирующиеся колонки цен")
         first = rule.get("first_data_row")
         header = rule.get("header_row")
         end_row = rule.get("end_row")
-        if (
-            type(header) is not int
-            or type(first) is not int
-            or not 1 <= header < first <= snapshot["row_count"]
-        ):
+        if (type(header) is not int or type(first) is not int
+                or not 1 <= header < first <= snapshot["row_count"]):
             raise MappingError("Некорректные границы области")
         if end_row is not None and (
             type(end_row) is not int or end_row < first or end_row > snapshot["row_count"]
@@ -721,11 +1353,8 @@ class AdaptiveSheets:
             else:
                 try:
                     if "cell" in source and (
-                        not isinstance(source["cell"], list)
-                        or len(source["cell"]) != 2
-                        or any(
-                            type(field_value) is not int or field_value < 1 for field_value in source["cell"]
-                        )
+                        not isinstance(source["cell"], list) or len(source["cell"]) != 2
+                        or any(type(value) is not int or value < 1 for value in source["cell"])
                     ):
                         raise MappingError("Некорректная ссылка даты")
                     if source.get("title") is not True and "cell" not in source:
@@ -735,34 +1364,37 @@ class AdaptiveSheets:
                 except MappingError:
                     errors.append("Не подтверждён источник даты")
         if rule.get("grid_columns"):
-            if not all(
-                type(column_index) is int and 1 <= column_index <= snapshot["column_count"]
-                for column_index in rule["grid_columns"]
-            ):
+            if not all(type(column_index) is int and 1 <= column_index <= snapshot["column_count"]
+                       for column_index in rule["grid_columns"]):
                 errors.append("Некорректные grid_columns")
             present.add("Постов")
-        time_transforms = {"time", "serial_time"}
-        valid = {"Дата": {"date", "serial_date"}, "Время": time_transforms,
-                 "Начало": time_transforms, "Конец": time_transforms}
+        valid = {
+            "Дата": {"date", "serial_date"},
+            "Время": {"time", "serial_time"},
+            "Начало": {"time", "serial_time"},
+            "Конец": {"time", "serial_time"},
+        }
         for field, transform in rule.get("transforms", {}).items():
-            if (
-                field not in valid
-                or not isinstance(transform, str)
-                or not (
-                    transform in valid[field]
-                    or (field == "Дата" and transform.startswith("date:") and len(transform) > 5)
-                )
+            if field not in valid or not isinstance(transform, str) or not (
+                transform in valid[field]
+                or (field == "Дата" and transform.startswith("date:") and len(transform) > 5)
             ):
                 errors.append("Некорректное преобразование даты/времени")
-        required = SCHEDULE_REQUIRED if rule.get("schedule_mode") == "hours" else READ_REQUIRED[rule["role"]]
-        if rule.get("prices_transposed"):
-            required = {"Класс"}  # классы строками, услуги — колонки-ключи
+        required = set(READ_REQUIRED.get(rule["role"], ()))
+        if rule["role"] == "slots":
+            if rule.get("schedule_mode") == "hours":
+                required = set(SCHEDULE_REQUIRED)
+            elif rule.get("grid_columns"):
+                required = {"Время"}
+            else:
+                required = {"Дата", "Время", "Постов"}
         if rule["role"] == "tariffs":
-            required = required - {"Состав"} if rule.get("price_fields") else required
+            required -= {"Состав"} if rule.get("price_fields") else set()
         missing = required - present
         if missing:
             errors.append("Не хватает полей: " + ", ".join(sorted(missing)))
-        if rule["role"] == "services" and not rule.get("price_fields") and not rule.get("pivot_prices"):
+        if rule["role"] == "services" and not rule.get("price_fields") and not rule.get("pivot_prices") \
+                and not rule.get("prices_transposed"):
             errors.append("Не заданы price_fields или pivot_prices")
         if rule.get("pivot_prices"):
             pivot = rule["pivot_prices"]
@@ -776,18 +1408,14 @@ class AdaptiveSheets:
 
     def _rule_read_issues(self, rule: dict, snapshot: dict, errors: list[str]) -> set[int]:
         header, end_row = rule["header_row"], rule.get("end_row")
-        # Объединения в области данных/заголовка могут менять принадлежность ячеек.
-        if any(
-            merge.get("endRowIndex", 0) > header - 1
-            and merge.get("startRowIndex", 0) < (end_row or snapshot["row_count"])
-            for merge in snapshot["merges"]
-        ):
+        if any(merge.get("endRowIndex", 0) > header - 1
+               and merge.get("startRowIndex", 0) < (end_row or snapshot["row_count"])
+               for merge in snapshot.get("merges") or []):
             errors.append("Объединённые ячейки пересекают область")
         header_values = snapshot["values"][header - 1] if header <= len(snapshot["values"]) else []
-        raw_headers = snapshot["raw_values"][header - 1] if header <= len(snapshot["raw_values"]) else []
-        formula_headers = {
-            column_index for row_index, column_index in snapshot["formulas"] if row_index == header
-        }
+        raw_headers = snapshot["raw_values"][header - 1] if header <= len(snapshot.get("raw_values") or []) else []
+        formula_headers = {column_index for row_index, column_index in snapshot.get("formulas") or []
+                           if row_index == header}
         if any(
             str(value_at([header_values], 1, column_index)).strip()
             != str(value_at([raw_headers], 1, column_index)).strip()
@@ -796,14 +1424,17 @@ class AdaptiveSheets:
         ):
             errors.append("Шапка изменилась во время чтения")
         unresolved = set(rule.get("unresolved_fields", []))
-        if unresolved and (
-            rule["role"] in {"services", "tariffs"}
-            or unresolved & (READ_REQUIRED[rule["role"]] | {"date_source", "grid_columns"})
-        ):
+        if unresolved and (rule["role"] in {"services", "tariffs"}
+                           or unresolved & READ_REQUIRED.get(rule["role"], set())):
             errors.append("Не подтверждены зависимости изменённых колонок")
+        if rule.get("missing_fields"):
+            errors.append("Ранее существовавшие поля исчезли: " + ", ".join(rule["missing_fields"]))
+        if rule.get("duplicate_price"):
+            errors.append("Дублирующиеся колонки цен")
         return formula_headers
 
-    def _rule_write_issues(self, rule, snapshot, errors, present, formula_headers) -> list[str]:
+    def _rule_write_issues(self, rule: dict, snapshot: dict, errors: list[str],
+                           present: set[str], formula_headers: set[int]) -> list[str]:
         columns = rule["columns"]
         first, end_row = rule["first_data_row"], rule.get("end_row")
         unresolved = set(rule.get("unresolved_fields", []))
@@ -813,26 +1444,22 @@ class AdaptiveSheets:
         if formula_headers & set(columns.values()):
             write_errors.append("Формулы в шапке записи")
         if rule["role"] == "slots" and rule.get("grid_columns"):
-            # Сетка постов: клетка занимается маркером записи. Формулы в теле сетки блокируют запись.
-            if any(row_index >= first and (end_row is None or row_index <= end_row) and column_index in set(rule["grid_columns"]) | {columns.get("Время")}
-                   for row_index, column_index in snapshot["formulas"]):
+            if any(row_index >= first and (end_row is None or row_index <= end_row)
+                   and column_index in set(rule["grid_columns"]) | {columns.get("Время")}
+                   for row_index, column_index in snapshot.get("formulas") or []):
                 write_errors.append("Формулы в сетке постов: запись заблокирована")
         elif rule["role"] != "bookings":
             write_errors.append("Область доступна только для чтения")
-        if rule["role"] == "bookings" and set(BOOKING_FIELDS) - present:
+        if rule["role"] == "bookings" and BOOKING_WRITE_REQUIRED - present:
             write_errors.append("Для создания записей нужны все поля записи")
-        if rule["role"] == "bookings" and any(
-            column_index in columns.values()
-            and row_index >= first
-            and (end_row is None or row_index <= end_row)
-            for row_index, column_index in snapshot["formulas"]
-        ):
-            write_errors.append("Формулы в колонках записи: запись заблокирована")
+        if rule["role"] == "bookings" and self.config.car_plate_required and "Госномер" not in columns:
+            write_errors.append("Обязательный госномер не имеет подтверждённой колонки")
+        # Формулы в данных записи не блокируют создание новой строки и адресные
+        # операции: cancel/reschedule проверяют конкретную строку перед изменением.
+        # Блокируется только шапка (выше) и занятая формулами клетка сетки.
         statuses = rule.get("write_statuses", {})
-        status_map = {
-            normalize_header(field_name): field_value
-            for field_name, field_value in rule.get("status_map", {}).items()
-        }
+        status_map = {normalize_header(field_name): field_value
+                      for field_name, field_value in rule.get("status_map", {}).items()}
         if rule["role"] == "bookings" and (
             status_map.get(normalize_header(statuses.get("new", ""))) != "Новая"
             or status_map.get(normalize_header(statuses.get("cancelled", ""))) != "Отмена"
@@ -840,348 +1467,636 @@ class AdaptiveSheets:
             write_errors.append("Не подтверждены значения статусов записи/отмены")
         return write_errors
 
-    def _validate_rule(self, rule: dict, snapshot: dict) -> dict:
-        errors = self._rule_structure(rule, snapshot)
-        present = self._rule_fields(rule, snapshot, errors)
-        formula_headers = self._rule_read_issues(rule, snapshot, errors)
-        write_errors = self._rule_write_issues(rule, snapshot, errors, present, formula_headers)
-        read_ok = not errors and rule["permissions"]["read"]
-        rule["validation"] = {
-            "read": read_ok,
-            "write": read_ok and not write_errors and rule["permissions"]["write"],
-            "issues": errors,
-            "write_issues": write_errors,
+    def _validate_document(self, document: dict, snapshots: list[dict]) -> dict:
+        by_id = {snapshot["id"]: snapshot for snapshot in snapshots}
+        for rule in document.get("regions", []):
+            snapshot = by_id.get(rule.get("sheet_id"))
+            if snapshot is None:
+                rule["validation"] = {"read": False, "write": False,
+                                      "issues": ["Лист удалён"], "write_issues": ["Лист удалён"]}
+                continue
+            rule["structure"] = structure(snapshot, rule)
+            rule["fingerprint"] = fingerprint(rule["structure"])
+            self._validate_rule(rule, snapshot)
+        self._validate_relationships(document, snapshots)
+        self._summarize(document)
+        return document
+
+    def _validate_relationships(self, document: dict, snapshots: list[dict]) -> None:
+        issues = document.setdefault("issues", [])
+        by_id = {snapshot["id"]: snapshot for snapshot in snapshots}
+        service_names: set[str] = set()
+        services_rule = next((rule for rule in document["regions"] if rule["role"] == "services"), None)
+        if services_rule:
+            snapshot = by_id.get(services_rule["sheet_id"])
+            if snapshot and services_rule["validation"].get("read"):
+                try:
+                    records = self._extract_records(services_rule, snapshot["values"], snapshot["title"])
+                    service_names = {str(record.get("Услуга", "")).strip().casefold()
+                                     for record in records if str(record.get("Услуга", "")).strip()}
+                except MappingError as error:
+                    issues.append(f"Услуги: {error}")
+        for rule in document["regions"]:
+            if rule["role"] != "tariffs" or not rule["validation"].get("read"):
+                continue
+            snapshot = by_id.get(rule["sheet_id"])
+            if not snapshot:
+                continue
+            try:
+                records = self._extract_records(rule, snapshot["values"], snapshot["title"])
+            except MappingError as error:
+                issues.append(f"Тарифы: {error}")
+                rule["validation"]["read"] = False
+                continue
+            missing = set()
+            for record in records:
+                composition = str(record.get("Состав", ""))
+                for item in re.split(r"[,;\n]", composition):
+                    name = item.strip().casefold()
+                    if name and name not in service_names:
+                        missing.add(item.strip())
+            if missing:
+                message = "Тарифы ссылаются на отсутствующие услуги: " + ", ".join(sorted(missing))
+                issues.append(message)
+                rule["validation"]["issues"].append(message)
+                # Диагностируем несоответствие, но не блокируем весь прайс:
+                # существующая бизнес-логика исключает неизвестные позиции из состава.
+        document["relationships"] = [
+            {"from": "bookings", "to": "slots", "fields": ["Дата", "Время"]},
+            {"from": "tariffs", "to": "services", "fields": ["Состав", "Услуга"]},
+        ]
+
+    def _summarize(self, document: dict | None = None) -> None:
+        document = document or self.document
+        if not document:
+            return
+        regions = document.get("regions", [])
+        present = {rule["role"] for rule in regions}
+        document["missing_roles"] = sorted(set(ROLE_FIELDS) - present)
+        document["required_missing"] = sorted(CORE_ROLES - present)
+        ambiguous = []
+        for role in set(ROLE_FIELDS):
+            group = [rule for rule in regions if rule["role"] == role]
+            if len(group) > 1 and role != "services" and not all(
+                rule.get("date_source") or rule.get("grid_columns") for rule in group
+            ):
+                ambiguous.append(role)
+        document["ambiguous_roles"] = ambiguous
+        all_read = all(rule["validation"].get("read") for rule in regions
+                       if rule["role"] in set(ROLE_FIELDS) - {"archive"})
+        valid = not document.get("required_missing") and not ambiguous and all_read
+        if document.get("stale"):
+            valid = False
+        document["validation_status"] = "valid" if valid else "needs_review"
+        booking_rules = [rule for rule in regions if rule["role"] == "bookings"]
+        document["writes_enabled"] = bool(
+            valid and booking_rules and all(rule["validation"].get("write") for rule in booking_rules)
+            and not document.get("stale")
+        )
+
+    def _discover(self, snapshots: list[dict], reason: str) -> dict:
+        import schema_ai
+        compact = schema_ai.compact_workbook(snapshots, self.named_ranges)
+        issues: list[str] = []
+        began = time.time()
+        candidates: list[dict] = []
+        call_meta: dict = {}
+        recovery_reason = ""
+        if getattr(self.config, "ai_enabled", True) and getattr(self.config, "ai_api_key", ""):
+            try:
+                document = schema_ai.request_mapping(self.config, compact)
+                self.ai_requests += 1
+                call_meta = dict(getattr(schema_ai, "LAST_CALL", {}) or {})
+                call_meta.setdefault("duration_sec", round(time.time() - began, 3))
+                candidates, model_issues = schema_ai.normalize_ai_document(document)
+                issues.extend(model_issues)
+            except Exception as error:
+                recovery_reason = _safe_error(error)
+                issues.append("AI-разметка недоступна: " + recovery_reason)
+                log.error("AI-разметка Sheets не выполнена: %s; пробую проверенное "
+                          "детерминированное восстановление", recovery_reason)
+        else:
+            recovery_reason = "AI-провайдер не настроен"
+            issues.append(recovery_reason)
+        by_id = {snapshot["id"]: snapshot for snapshot in snapshots}
+        by_title = {snapshot["title"].casefold(): snapshot for snapshot in snapshots}
+        regions = []
+        covered = set()
+        for candidate in candidates:
+            snapshot = by_id.get(candidate.get("sheet_id")) or by_title.get(candidate.get("sheet_title", "").casefold())
+            if snapshot is None:
+                issues.append(f"Модель: лист «{candidate.get('sheet_title')}» не найден")
+                continue
+            key = (candidate["role"], snapshot["id"], candidate.get("header_row") or 1)
+            if key in covered:
+                continue
+            rule = self._candidate_rule(candidate, by_id, by_title, issues)
+            if rule is None:
+                continue
+            regions.append(rule)
+            covered.add(key)
+        if not regions or CORE_ROLES - {rule["role"] for rule in regions}:
+            # Неполный ответ или отказ провайдера: детерминированное восстановление
+            # только по фактическим шапкам и данным. Координаты всё равно проходят
+            # полную проверку ниже и никогда не пишутся «на глаз».
+            self._salvage_missing_roles(regions, snapshots, issues,
+                                        CORE_ROLES | {"tariffs", "durations", "classes",
+                                                      "resources", "archive"})
+        if not regions:
+            raise MappingError("Не удалось подтвердить ни одной области книги; карта не активирована")
+        self._salvage_missing_roles(regions, snapshots, issues,
+                                    CORE_ROLES | {"tariffs", "durations", "classes",
+                                                  "resources", "archive"})
+        # Несколько журналов записей без разделителя даты — неоднозначная
+        # структура. Добавляем второй кандидат, чтобы validation_status
+        # заблокировал запись, а не выбирал лист/таблицу наугад.
+        booking_keys = {(rule["sheet_id"], rule.get("header_row"))
+                        for rule in regions if rule["role"] == "bookings"}
+        for snapshot in snapshots:
+            if any(token in normalize_header(snapshot["title"])
+                   for token in ("архив", "archive")):
+                continue
+            for row_number in range(1, min(len(snapshot["values"]), MAX_HEADER_SCAN_ROWS) + 1):
+                if (snapshot["id"], row_number) in booking_keys:
+                    continue
+                headers = trim_headers(snapshot["values"][row_number - 1])
+                columns, errors = header_mapping(headers, "bookings")
+                if not errors and {"ID", "Дата", "Время", "Telegram ID", "Статус"} <= set(columns) \
+                        and not title_date(snapshot["title"]):
+                    extra = {
+                        "role": "bookings", "sheet_id": snapshot["id"], "sheet_title": snapshot["title"],
+                        "header_row": row_number, "first_data_row": row_number + 1, "end_row": None,
+                        "columns": columns, "status_map": dict(STATUS_MAP),
+                        "write_statuses": {"new": "Новая", "cancelled": "Отмена"},
+                        "transforms": {"Дата": "date", "Время": "time"},
+                        "date_source": None, "orientation": "records",
+                        "permissions": {"read": True, "write": True},
+                        "validation": {"read": False, "write": False, "issues": []},
+                        "source": "ambiguity-check",
+                    }
+                    self._infer_transforms(extra, snapshot)
+                    self._infer_statuses(extra, snapshot, [])
+                    extra["structure"] = structure(snapshot, extra)
+                    extra["fingerprint"] = fingerprint(extra["structure"])
+                    regions.append(extra)
+                    booking_keys.add((snapshot["id"], row_number))
+                    issues.append(f"Несколько похожих журналов записей: «{snapshot['title']}», "
+                                  f"строка {row_number}; запись заблокирована")
+        # Второй недатированный слот-лист (например, график работы рядом с
+        # таблицей слотов) делает расписание неоднозначным.
+        slot_sheets = {rule["sheet_id"] for rule in regions if rule["role"] == "slots"}
+        for snapshot in snapshots:
+            if snapshot["id"] in slot_sheets or title_date(snapshot["title"]):
+                continue
+            if any(token in normalize_header(snapshot["title"])
+                   for token in ("ограничен", "бокс", "ресурс", "resource")):
+                continue
+            for row_number in range(1, min(len(snapshot["values"]), MAX_HEADER_SCAN_ROWS) + 1):
+                headers = trim_headers(snapshot["values"][row_number - 1])
+                if any(normalize_header(header) in {"бокс", "открытие поста", "закрытие поста",
+                                                    "ограничение", "статус"}
+                       for header in headers if str(header).strip()):
+                    continue
+                columns, errors = header_mapping(headers, "slots")
+                if errors:
+                    continue
+                if {"Начало", "Конец"} <= set(columns) or {"Дата", "Время", "Постов"} <= set(columns):
+                    extra = {
+                        "role": "slots", "sheet_id": snapshot["id"], "sheet_title": snapshot["title"],
+                        "header_row": row_number, "first_data_row": row_number + 1, "end_row": None,
+                        "columns": columns, "status_map": dict(STATUS_MAP),
+                        "write_statuses": {"new": "Новая", "cancelled": "Отмена"},
+                        "transforms": {"Дата": "date", "Время": "time", "Начало": "time", "Конец": "time"},
+                        "date_source": None, "orientation": "records",
+                        "schedule_mode": "hours" if {"Начало", "Конец"} <= set(columns) else "slots",
+                        "permissions": {"read": True, "write": False},
+                        "validation": {"read": False, "write": False, "issues": []},
+                        "source": "ambiguity-check",
+                    }
+                    self._infer_transforms(extra, snapshot)
+                    extra["structure"] = structure(snapshot, extra)
+                    extra["fingerprint"] = fingerprint(extra["structure"])
+                    regions.append(extra)
+                    issues.append(f"Несколько расписаний без разделителя даты: «{snapshot['title']}»")
+                    break
+        previous_regions = (self.document or {}).get("regions", [])
+        for rule in regions:
+            previous_rule = next((old for old in previous_regions
+                                  if old.get("role") == rule["role"]
+                                  and old.get("sheet_id") == rule["sheet_id"]), None)
+            if previous_rule and isinstance(previous_rule.get("structure"), dict):
+                rule["last_changes"] = diff_structure(previous_rule["structure"], rule["structure"])
+                missing_fields = sorted(set(previous_rule.get("columns", {})) - set(rule.get("columns", {})))
+                if missing_fields:
+                    blocking = [field for field in missing_fields
+                                if rule["role"] in {"services", "tariffs"}
+                                or field in READ_REQUIRED.get(rule["role"], set())
+                                or (field == "Госномер" and self.config.car_plate_required)]
+                    if blocking:
+                        # Удалённая критичная колонка не должна молча менять
+                        # цену/состав/владельца записи: блокируем область.
+                        rule["missing_fields"] = blocking
+                        issues.append(
+                            f"Структура «{rule.get('sheet_title')}» изменилась: исчезли поля "
+                            + ", ".join(blocking) + "; требуется проверка карты")
+                    else:
+                        rule["missing_optional_fields"] = missing_fields
+                        issues.append(
+                            f"Структура «{rule.get('sheet_title')}»: исчезли необязательные поля "
+                            + ", ".join(missing_fields))
+        # Дубли одной роли без разделителя даты/листа неоднозначны.
+        for role in set(ROLE_FIELDS):
+            group = [rule for rule in regions if rule["role"] == role]
+            if len(group) > 1 and role != "services" and not all(
+                rule.get("date_source") or rule.get("grid_columns") for rule in group
+            ):
+                issues.append(f"Несколько областей {role} без явного разделителя даты/листа")
+        previous = self.document or {}
+        now = time.time()
+        new_document = {
+            "version": VERSION,
+            "engine_revision": ENGINE_REVISION,
+            "spreadsheet_id": self.config.spreadsheet_id,
+            "created_at": now,
+            "checked_at": now,
+            "mapping_version": int(previous.get("mapping_version", 0)) + 1,
+            "source": "ai" if not recovery_reason or candidates else "deterministic-recovery",
+            "reason": reason,
+            "regions": regions,
+            "relationships": [],
+            "issues": issues,
+            "named_ranges": self.named_ranges,
+            "ai": dict(call_meta, calls=1 if call_meta else 0,
+                       model=getattr(self.config, "sheets_ai_model", "") or self.config.ai_model,
+                       fallback_reason=recovery_reason or None),
+            "ai_total_calls": int(previous.get("ai_total_calls", 0)) + (1 if call_meta else 0),
+            "failure": None,
+            "stale": False,
+            "last_check": "rebuilt",
         }
-        rule["validated_rule"] = rule_signature(rule)
-        return rule
+        self._validate_document(new_document, snapshots)
+        new_document["structural_fingerprint"] = self._structure_signature(snapshots, regions)
+        return new_document
 
-    def _relocate(self, rule: dict, snapshot: dict) -> dict:
-        """Сохраняем ручные правила; пересчитываем только сдвинутые/изменённые колонки."""
-        updated = deepcopy(rule)
-        previous_headers = rule["structure"]["headers"]
-        current_headers = trim_headers(snapshot["values"][rule["header_row"] - 1]) if rule["header_row"] <= len(snapshot["values"]) else []
-        aliases, ambiguous = header_mapping(current_headers, rule["role"])
-        for extra_field in ("Начало", "Конец", "Длительность"):
-            if extra_field in rule.get("columns", {}) and extra_field not in aliases:
-                extra_aliases = {normalize_header(alias) for alias in ALIASES[extra_field]}
-                hits = [index for index, header in enumerate(current_headers, 1) if normalize_header(header) in extra_aliases]
-                if len(hits) == 1:
-                    aliases[extra_field] = hits[0]
-                elif len(hits) > 1:
-                    ambiguous.append(f"Несколько колонок для {extra_field}")
-        if rule.get("pivot_prices"):
-            extras, extra_errors = header_mapping(current_headers, "bookings")
-            aliases.update({field_name: field_value for field_name, field_value in extras.items() if field_name in {"Класс", "Сумма"}})
-            ambiguous.extend(issue for issue in extra_errors if any(field in issue for field in ("Класс", "Сумма")))
-        columns = {}
-        unresolved = list(rule.get("unresolved_fields", []))
-        for field, column in rule["columns"].items():
-            old_header = str(previous_headers[column - 1]) if column <= len(previous_headers) else ""
-            hits = [index for index, header in enumerate(current_headers, 1) if old_header and str(header) == old_header]
-            if len(hits) == 1:
-                columns[field] = hits[0]
-            elif field in aliases and not any(field in issue for issue in ambiguous):
-                columns[field] = aliases[field]
+    def _rebuild(self, snapshots: list[dict], fingerprint_value: str, *, explicit: bool = False) -> dict:
+        previous = self.document
+        failure = (previous or {}).get("failure") or {}
+        if (not explicit and failure.get("fingerprint") == fingerprint_value
+                and failure.get("at")):
+            if previous:
+                previous["stale"] = True
+                previous["checked_at"] = time.time()
+                previous["last_check"] = "failed_cached"
+                previous["writes_enabled"] = False
+                previous["validation_status"] = "needs_review"
+                self._save()
+                log.warning("Структура Sheets не изменилась после прошлой ошибки карты; "
+                            "повторный платный вызов не выполняется. Нужен явный --refresh-schema")
+            return previous or {}
+        try:
+            new_document = self._discover(snapshots, "startup" if previous is None else "structure changed")
+        except Exception as error:
+            message = _safe_error(error)
+            self.last_error = message
+            log.error("AI-карта Sheets не построена: %s", message)
+            now = time.time()
+            if previous is None:
+                document = {
+                    "version": VERSION,
+                    "engine_revision": ENGINE_REVISION,
+                    "spreadsheet_id": self.config.spreadsheet_id,
+                    "created_at": now,
+                    "checked_at": now,
+                    "mapping_version": 0,
+                    "regions": [],
+                    "relationships": [],
+                    "issues": [message],
+                    "named_ranges": self.named_ranges,
+                    "ai": dict(getattr(__import__("schema_ai"), "LAST_CALL", {}) or {}, calls=1),
+                    "failure": {"fingerprint": fingerprint_value, "at": now, "error": message,
+                                "attempts": int(failure.get("attempts", 0)) + 1},
+                    "stale": True,
+                    "last_check": "failed",
+                    "validation_status": "needs_review",
+                    "writes_enabled": False,
+                }
             else:
-                unresolved.append(field)
-        updated["columns"] = columns
-        if (rule.get("date_source") or {}).get("cell") and previous_headers != current_headers:
-            unresolved.append("date_source")
-        if rule.get("grid_columns"):
-            grid = []
-            for column in rule["grid_columns"]:
-                label = previous_headers[column - 1] if column <= len(previous_headers) else None
-                hits = [index for index, header in enumerate(current_headers, 1) if header == label]
-                if len(hits) != 1:
-                    unresolved.append("grid_columns")
-                else:
-                    grid.append(hits[0])
-            updated["grid_columns"] = grid
-        updated["sheet_title"] = snapshot["title"]
-        updated["structure"] = structure(snapshot, updated)
-        updated["fingerprint"] = fingerprint(updated["structure"])
-        updated["last_changes"] = diff_structure(rule["structure"], updated["structure"])
-        updated["unresolved_fields"] = sorted(set(unresolved))
-        self._validate_rule(updated, snapshot)
-        if unresolved or ambiguous:
-            if set(unresolved) & (READ_REQUIRED[rule["role"]] | set(rule.get("price_fields", []))) or ambiguous:
-                updated["validation"]["read"] = False
-            updated["validation"]["write"] = False
-            updated["validation"]["issues"].append("Требуется ручное сопоставление: " + ", ".join(unresolved + ambiguous))
-        return updated
+                document = previous
+                document["stale"] = True
+                document["failure"] = {
+                    "fingerprint": fingerprint_value, "at": now, "error": message,
+                    "attempts": int(failure.get("attempts", 0)) + 1,
+                }
+                document["checked_at"] = now
+                document["last_check"] = "failed"
+                document["validation_status"] = "needs_review"
+                document["writes_enabled"] = False
+            self.document = document
+            self._save()
+            return document
+        self.document = new_document
+        self._save()
+        self.force_pending = False
+        self.last_error = ""
+        log.info("Карта Sheets активирована: %s; областей %d; запись %s",
+                 new_document.get("validation_status"), len(new_document["regions"]),
+                 "разрешена" if new_document.get("writes_enabled") else "заблокирована")
+        return new_document
 
-    def refresh(self, force: bool = False, validate: bool = False, _observed: dict | None = None) -> dict:
+    def _fill_observed(self, observed: dict, regions: list[dict]) -> None:
+        identifiers = sorted({rule["sheet_id"] for rule in regions} - observed.keys())
+        if not identifiers:
+            return
+        ranges = ["'" + self._worksheet(sheet_id).title.replace("'", "''") + "'"
+                  for sheet_id in identifiers]
+        for offset in range(0, len(ranges), 50):
+            group = ranges[offset:offset + 50]
+            values = self.spreadsheet().values_batch_get(
+                group, params={"valueRenderOption": "FORMATTED_VALUE"}).get("valueRanges", [])
+            if len(values) != len(group):
+                raise MappingError("Google вернул неполный снимок таблиц")
+            observed.update({
+                sheet_id: {"values": value.get("values", [])}
+                for sheet_id, value in zip(identifiers[offset:offset + 50], values)
+            })
+
+    def refresh(self, force: bool = False, validate: bool = False,
+                _observed: dict | None = None, explicit: bool = False) -> dict:
+        """Проверить структуру и при необходимости перестроить карту.
+
+        force=True — выполнить структурную проверку сейчас (AI только при реальном
+        изменении). explicit=True — разрешить платный повтор после прошлой ошибки
+        (ручной --refresh-schema). validate=True — только детерминированная проверка.
+        """
         with self.lock:
             self._load()
             now = time.time()
-            if self.document and not (force or validate or self.force_pending):
-                if 0 <= now - self.document.get("checked_at", 0) < self.config.sheets_schema_check_interval_hours * 3600:
-                    return self.document
-            snapshots = self._snapshots()
-            by_id = {snapshot["id"]: snapshot for snapshot in snapshots}
-            if _observed is not None:
-                _observed.update(by_id)
-            issues = list(self.unsupported_sheets)
             if self.document is None:
-                regions = []
-                for snapshot in snapshots:
-                    rules, found_issues = discover(snapshot, self.expected)
-                    issues.extend(found_issues)
-                    regions.extend(self._validate_rule(rule, snapshot) for rule in rules)
-                self._maybe_interpret_with_ai(regions, by_id, issues)
-                self.document = {"version": VERSION, "spreadsheet_id": self.config.spreadsheet_id,
-                                 "regions": regions, "relationships": [
-                                     {"from": "bookings", "to": "slots", "fields": ["Дата", "Время"]},
-                                     {"from": "tariffs", "to": "services", "fields": ["Состав", "Услуга"]}],
-                                 "issues": issues}
-                if self._ai_cache_key:
-                    self.document["ai_regions"] = self.document.get("ai_regions", [])
-            else:
-                regions = []
-                known = set()
-                for rule in self.document["regions"]:
-                    snapshot = by_id.get(rule["sheet_id"])
-                    known.add(rule["sheet_id"])
-                    if not snapshot:
-                        rule["validation"] = {"read": False, "write": False, "issues": ["Лист удалён"]}
-                    elif validate:
-                        rule = deepcopy(rule)
-                        rule.pop("unresolved_fields", None)
-                        self._validate_rule(rule, snapshot)
-                        rule["structure"] = structure(snapshot, rule)
-                        rule["fingerprint"] = fingerprint(rule["structure"])
-                    elif rule.get("validated_rule") != rule_signature(rule):
-                        rule["validation"] = {"read": False, "write": False,
-                                              "issues": ["Ручные изменения требуют --validate-mappings"]}
-                    elif fingerprint(structure(snapshot, rule)) != rule.get("fingerprint"):
-                        rule = self._relocate(rule, snapshot)
-                    else:
-                        if self.document.get("engine_revision") != ENGINE_REVISION and rule["role"] == "services" and not rule.get("pivot_prices"):
-                            rule["unresolved_fields"] = sorted(set(rule.get("unresolved_fields", [])) |
-                                {field for field in rule.get("price_fields", []) if normalize_header(field) not in KNOWN_PRICE_CLASSES})
-                        self._validate_rule(rule, snapshot)
-                    regions.append(rule)
-                for snapshot in snapshots:
-                    if snapshot["id"] not in known:
-                        rules, found_issues = discover(snapshot, self.expected)
-                        issues.extend(found_issues)
-                        regions.extend(self._validate_rule(rule, snapshot) for rule in rules)
-                if regions != self.document["regions"] or issues != self.document.get("issues"):
-                    self._maybe_interpret_with_ai(regions, by_id, issues)
-                self.document["regions"] = regions
-                self.document["issues"] = issues
-            self.document["named_ranges"] = self.named_ranges
-            self.document["checked_at"] = now
-            self.document["structural_fingerprint"] = fingerprint([
-                {"id": snapshot["id"], "title": snapshot["title"], "columns": snapshot["column_count"], "merges": snapshot["merges"]}
-                for snapshot in snapshots] + self.named_ranges + [rule.get("fingerprint") for rule in self.document["regions"]])
-            self.document["engine_revision"] = ENGINE_REVISION
-            self._summarize()
-            self._save()
-            self.force_pending = False
-            return self.document
+                snapshots = self._snapshots()
+                if _observed is not None:
+                    _observed.update({snapshot["id"]: snapshot for snapshot in snapshots})
+                return self._rebuild(snapshots, self._structure_signature(snapshots, []), explicit=True)
+            document = self.document
+            interval = float(getattr(self.config, "sheets_schema_check_interval_hours", 6)) * 3600
+            age = now - document.get("checked_at", 0)
+            if not (force or validate or self.force_pending or age < 0 or age >= interval):
+                return document
+            if validate:
+                snapshots = self._snapshots()
+                if _observed is not None:
+                    _observed.update({snapshot["id"]: snapshot for snapshot in snapshots})
+                self._validate_document(document, snapshots)
+                document["checked_at"] = now
+                document["last_check"] = "validated"
+                document["structural_fingerprint"] = self._structure_signature(
+                    snapshots, document.get("regions", []))
+                self._save()
+                return document
+            probe = self._probe_snapshots()
+            current = self._structure_signature(probe, document.get("regions", []))
+            if current == document.get("structural_fingerprint"):
+                document["checked_at"] = now
+                document["last_check"] = "unchanged"
+                document["last_check_at"] = now
+                if document.get("stale"):
+                    # Структура вернулась к сохранённой карте: разрешаем чтение,
+                    # но запись только после полной проверки данных.
+                    snapshots = self._snapshots()
+                    self._validate_document(document, snapshots)
+                    document["stale"] = False
+                    document["failure"] = None
+                    self._summarize(document)
+                self._save()
+                if _observed is not None:
+                    try:
+                        self._fill_observed(_observed, document.get("regions", []))
+                    except Exception:
+                        pass
+                return document
+            snapshots = self._snapshots()
+            if _observed is not None:
+                _observed.update({snapshot["id"]: snapshot for snapshot in snapshots})
+            current = self._structure_signature(snapshots, document.get("regions", []))
+            return self._rebuild(snapshots, current, explicit=explicit)
 
-    # ---- интерпретация структуры моделью: кандидаты сверяются с фактической таблицей
-
-    def _ai_enabled(self) -> bool:
-        return bool(getattr(self.config, "sheets_ai_mapping_enabled", True)
-                    and getattr(self.config, "ai_api_key", ""))
-
-    def _ai_candidates(self, snapshots: list[dict], issues: list[str]) -> list[dict]:
-        """Один вызов модели на новое структурное представление книги."""
-        import schema_ai
-        compact = schema_ai.compact_workbook(snapshots)
-        key = fingerprint(compact)
-        if self._ai_cache_key == key and self.document and self.document.get("ai_regions") is not None:
-            return self.document["ai_regions"]
-        began = time.time()
-        document = schema_ai.request_mapping(self.config, compact)
-        self.ai_requests += 1
-        candidates, model_issues = schema_ai.normalize_ai_document(document)
-        issues.extend(model_issues)
-        issues.append(f"Модель: интерпретация за {time.time() - began:.1f}с")
-        self._ai_cache_key = key
-        return candidates
-
-    def _ai_rule(self, candidate: dict, snapshot: dict, issues: list[str]) -> dict | None:
-        """Кандидат модели -> правило с проверенными номерами колонок."""
-        title = candidate["sheet_title"]
-        if title != snapshot["title"]:
-            return None  # ищем только на своём листе; чужие названия — молча
-        headers_all = snapshot["values"]
-        header_row = candidate["header_row"] or 1
-        if not 1 <= header_row <= min(20, len(headers_all)):
-            issues.append(f"Модель: некорректная строка шапки {header_row} на листе «{title}»")
-            return None
-        headers = trim_headers(headers_all[header_row - 1])
-        columns: dict[str, int] = {}
-        canonical_keys = set(ALL_ROLE_FIELDS.get(role := candidate["role"], ())) | {"Класс", "Сумма", "Длительность"}
-        for key, value in candidate["columns"].items():
-            # Модель иногда меняет направление пары; нормализуем к «поле -> шапка».
-            if key in canonical_keys or key.casefold() in KNOWN_PRICE_CLASSES:
-                field, claimed = key, value
-            elif value in canonical_keys or value.casefold() in KNOWN_PRICE_CLASSES:
-                field, claimed = value, key
-            else:
-                field, claimed = key, value
-            exact = [index for index, header in enumerate(headers, 1) if header == claimed]
-            loose = [index for index, header in enumerate(headers, 1)
-                     if normalize_header(header) == normalize_header(claimed)]
-            hits = exact or loose
-            if len(hits) == 1:
-                columns[field] = hits[0]
-            else:
-                issues.append(f"Модель: шапка «{claimed}» ({field}) не подтверждена на листе «{title}»")
-        role = candidate["role"]
-        if not columns:
-            return None
-        if role in {"services", "tariffs"} and not candidate.get("orientation"):
-            # Класс заявлен, но в листе есть ещё колонка с той же шапкой: неоднозначно.
-            for field, claimed in list(candidate["columns"].items()):
-                if field in ALL_ROLE_FIELDS[role] or field in {"Класс", "Сумма", "Длительность"}:
-                    continue
-                duplicates = [header for header in headers
-                              if normalize_header(header) == normalize_header(claimed)]
-                if len(duplicates) > 1:
-                    issues.append(f"Модель: класс «{field}» неоднозначен на листе «{title}»: "
-                                  f"несколько колонок {duplicates}")
-                    return None
-        if candidate.get("duration_column"):
-            duration = detect_duration_column(snapshot, header_row, headers, set(columns.values()))
-            if duration and "Длительность" not in columns:
-                columns["Длительность"] = duration[1]
-        price_fields = []
-        if role in {"services", "tariffs"}:
-            price_fields = [field for field in columns
-                            if field not in ALL_ROLE_FIELDS[role] and field not in {"Класс", "Сумма", "Длительность"}]
-        grid_columns = []
-        for claimed in candidate.get("grid_columns", []):
-            hits = [index for index, header in enumerate(headers, 1) if header == claimed]
-            if len(hits) == 1:
-                grid_columns.append(hits[0])
-            else:
-                issues.append(f"Модель: колонка сетки «{claimed}» не подтверждена на листе «{title}»")
-        source = candidate.get("date_source")
-        date_source = {"title": True} if source == "title" else (
-            {"cell": source["cell"]} if isinstance(source, dict) and isinstance(source.get("cell"), list) else None)
-        if role in {"slots", "bookings"} and "Дата" not in columns and date_source is None                 and title_date(snapshot["title"]):
-            date_source = {"title": True}
-        # Транспонировка объявлена, но ключами оказались классы — это обычная матрица.
-        transposed = candidate.get("orientation") == "services_in_columns" and not any(
-            key.casefold() in KNOWN_PRICE_CLASSES
-            for key in candidate["columns"] if key not in ALL_ROLE_FIELDS.get(role, ()))
-        rule = {"role": role, "sheet_id": snapshot["id"], "sheet_title": snapshot["title"],
-                "header_row": header_row, "first_data_row": header_row + 1, "end_row": None,
-                "columns": columns, "source": "ai",
-                **({"prices_transposed": True} if transposed else {}),
-                "transforms": {"Дата": "date", "Время": "time", "Начало": "time", "Конец": "time"},
-                "status_map": dict(STATUS_MAP), "write_statuses": {"new": "Новая", "cancelled": "Отмена"},
-                "date_source": date_source, "permissions": {"read": True, "write": role == "bookings"},
-                "validation": {"read": False, "write": False, "issues": []}}
-        if role in {"services", "tariffs"} and price_fields:
-            rule["price_fields"] = price_fields
-        if role == "services" and "Класс" in columns and "Сумма" in columns:
-            rule["pivot_prices"] = {"class_field": "Класс", "value_field": "Сумма"}
-        if grid_columns:
-            rule["grid_columns"] = grid_columns
-            rule["free_markers"] = ["", "свободно", "free", "open"]
-        if candidate.get("schedule_mode") == "hours" and {"Начало", "Конец"} <= set(columns):
-            rule["schedule_mode"] = "hours"
-        rule["structure"] = structure(snapshot, rule)
-        rule["fingerprint"] = fingerprint(rule["structure"])
-        return rule
-
-    def _apply_ai_candidates(self, candidates: list[dict], by_id: dict[int, dict],
-                             regions: list[dict], issues: list[str]) -> None:
-        covered = {(rule["role"], rule["sheet_id"], rule["header_row"]) for rule in regions}
-        for candidate in candidates:
-            snapshot = next((item for item in by_id.values()
-                             if item["title"] == candidate["sheet_title"]), None)
-            if snapshot is None:
-                issues.append(f"Модель: лист «{candidate['sheet_title']}» не найден в книге")
-                continue
-            key = (candidate["role"], snapshot["id"], candidate["header_row"] or 1)
-            if key in covered:
-                continue  # детерминированное распознавание уже нашло эту область
-            rule = self._ai_rule(candidate, snapshot, issues)
-            if rule is None:
-                continue
-            self._validate_rule(rule, snapshot)
-            regions.append(rule)
-            covered.add(key)
-
-    def _maybe_interpret_with_ai(self, regions: list[dict], by_id: dict[int, dict],
-                                 issues: list[str]) -> None:
-        """Модель привлекается, когда детерминированного распознавания недостаточно."""
-        if not self._ai_enabled():
-            return
-        required_roles = {"bookings", "services", "tariffs", "slots"}
-        missing = required_roles - {rule["role"] for rule in regions}
-        unrecognized = any("не распознана" in issue or "требуют ручной настройки" in issue
-                           for issue in issues)
-        if not missing and not unrecognized:
-            return
-        try:
-            candidates = self._ai_candidates(list(by_id.values()), issues)
-        except Exception as error:
-            issues.append(f"Интерпретация модели недоступна ({type(error).__name__}); "
-                          "работает детерминированное распознавание")
-            log.warning("AI-интерпретация структуры не выполнена (%s)", type(error).__name__)
-            return
-        # До трёх адресных подсказок: модель иногда пропускает обязательную роль.
-        sheet_titles = ", ".join(repr(snapshot["title"]) for snapshot in by_id.values())
-        for _attempt in range(3):
-            still_missing = required_roles - {rule["role"] for rule in regions}
-            if not still_missing:
-                break
-            try:
-                import schema_ai
-                compact = schema_ai.compact_workbook(list(by_id.values()))
-                examples = {
-                    "services": '{"role": "services", "sheet_title": "...", "header_row": 1, '
-                                '"columns": {"Услуга": "<шапка>", "Легковой": "<шапка>"}}',
-                    "tariffs": '{"role": "tariffs", "sheet_title": "...", "header_row": 1, '
-                               '"columns": {"Тариф": "<шапка>", "Состав": "<шапка>", "Скидка %": "<шапка>"}}',
-                    "slots": '{"role": "slots", "sheet_title": "...", "header_row": 1, '
-                             '"columns": {"Дата": "<шапка>", "Время": "<шапка>", "Постов": "<шапка>"}}',
-                    "bookings": '{"role": "bookings", "sheet_title": "...", "header_row": 1, '
-                                '"columns": {"ID": "<шапка>", "Дата": "<шапка>", "Время": "<шапка>", '
-                                '"Telegram ID": "<шапка>", "Статус": "<шапка>"}}',
-                }
-                reminder = ("В книге листы: " + sheet_titles + ". Ты не указал области: "
-                                + ", ".join(sorted(still_missing))
-                                + ". Проверь ещё раз все листы; если данные позволяют — укажи их. Пример формы: "
-                                + "; ".join(examples[role] for role in sorted(still_missing)))
-                retry = schema_ai.request_mapping_with_hint(self.config, compact, reminder)
-                retry_candidates, retry_issues = schema_ai.normalize_ai_document(retry)
-                issues.extend(retry_issues)
-                self._apply_ai_candidates(retry_candidates, by_id, regions, issues)
-            except Exception as error:
-                issues.append(f"Повторная интерпретация модели недоступна ({type(error).__name__})")
-                break
-
-    def _summarize(self) -> None:
-        self.document["missing_roles"] = sorted(set(ROLE_FIELDS) - {rule["role"] for rule in self.document["regions"]})
-        ambiguous_roles = [role for role in ROLE_FIELDS
-                       if len(group := [rule for rule in self.document["regions"] if rule["role"] == role]) > 1
-                       and role != "services" and not all(rule.get("date_source") for rule in group)]
-        self.document["ambiguous_roles"] = ambiguous_roles
-        self.document["validation_status"] = "valid" if not self.document.get("missing_roles") and not ambiguous_roles and all(
-            rule["validation"]["read"] for rule in self.document["regions"] if rule["role"] in ROLE_FIELDS) else "needs_review"
-        self.document["writes_enabled"] = (self.document["validation_status"] == "valid" and
-            all(rule["validation"].get("write") for rule in self.document["regions"] if rule["role"] == "bookings"))
+    def check_structure(self, explicit: bool = False) -> dict:
+        """Публичная точка для фоновой проверки каждые 6 часов."""
+        return self.refresh(force=True, explicit=explicit)
 
     def _rules(self, role: str) -> list[dict]:
         self.refresh()
+        if self.document is None:
+            raise MappingError("Карта Sheets не загружена; выполните AI-разметку")
         rules = [rule for rule in self.document["regions"] if rule["role"] == role]
         if not rules:
-            raise MappingError(f"Нет подтверждённой области {role}; настройте mappings")
-        # Несколько обычных таблиц одной роли без явных дат/границ неоднозначны.
-        if len(rules) > 1 and role != "services" and not all(rule.get("date_source") for rule in rules):
+            raise MappingError(f"Нет подтверждённой области {role}; проверьте карту Sheets")
+        if len(rules) > 1 and role != "services" and not all(
+            rule.get("date_source") or rule.get("grid_columns") for rule in rules
+        ):
             raise MappingError(f"Несколько областей {role}; удалите лишние правила или задайте date_source")
         if not all(rule["validation"].get("read") for rule in rules):
-            raise MappingError(f"Чтение {role} заблокировано: требуется проверка mappings")
+            raise MappingError(f"Чтение {role} заблокировано: требуется проверка карты Sheets")
         return rules
+
+    # ---------- обслуживание журнала по физическим адресам ----------
+
+    def sort_bookings(self, sort: bool = False) -> None:
+        """Хронологическая сортировка и перенумерация ID по карте, без имён шапок."""
+        from sheets import parse_date, parse_time
+        with self.lock:
+            try:
+                self.refresh(force=True)
+                rules = self._rules("bookings")
+            except MappingError:
+                return
+            if len(rules) != 1:
+                log.info("Сортировка пропущена: несколько журналов записей")
+                return
+            rule = rules[0]
+            worksheet = self._worksheet(rule["sheet_id"])
+            if not hasattr(worksheet, "update"):
+                return
+            values = worksheet.get_all_values(value_render_option="FORMULA",
+                                              date_time_render_option="FORMATTED_STRING")
+            header_index = rule["header_row"] - 1
+            first = rule["first_data_row"]
+            if len(values) <= header_index:
+                return
+            headers = trim_headers(values[header_index])
+            if headers != rule["structure"]["headers"]:
+                raise MappingError("Шапка журнала изменилась; сортировка заблокирована")
+            if any(str(cell).startswith("=") for row in values[first - 1:] for cell in row):
+                log.warning("«Записи»: формулы в данных — сортировка/перенумерация пропущены")
+                return
+            body = values[first - 1:]
+            if sort:
+                date_column = rule["columns"].get("Дата")
+                time_column = rule["columns"].get("Время")
+                if not date_column or not time_column:
+                    return
+                def order_key(row: list):
+                    raw_date = str(value_at([row], 1, date_column)).strip()
+                    raw_time = str(value_at([row], 1, time_column)).strip()
+                    return (parse_date(raw_date) or datetime(9999, 12, 31).date(),
+                            parse_time(raw_time) or "99:99")
+                ordered = sorted(body, key=order_key)
+                if ordered != body:
+                    width = max(len(headers), max(rule["columns"].values()))
+                    grid = [(list(row) + [""] * width)[:width] for row in ordered]
+                    worksheet.update(f"A{first}:{cell_name(first + len(grid) - 1, width)}", grid,
+                                     value_input_option="RAW")
+            if sort:
+                self.renumber_bookings(rule["sheet_id"])
+
+    def renumber_bookings(self, sheet_id: int) -> int:
+        """ID = 1..N по порядку строк; только в линейном журнале без формул."""
+        with self.lock:
+            try:
+                rule = self._target(sheet_id=sheet_id)
+            except MappingError:
+                return 0
+            if rule.get("grid_columns"):
+                return 0  # маркеры сетки завязаны на текущие номера
+            worksheet = self._worksheet(sheet_id)
+            if not hasattr(worksheet, "update"):
+                return 0
+            first = rule["first_data_row"]
+            values = worksheet.get_all_values(value_render_option="FORMULA",
+                                              date_time_render_option="FORMATTED_STRING")
+            if len(values) < first or any(str(cell).startswith("=") for row in values[first - 1:] for cell in row):
+                return 0
+            filled = [row for row in range(first, len(values) + 1)
+                      if any(str(cell).strip() for cell in values[row - 1])]
+            if not filled:
+                return 0
+            last = filled[-1]
+            if len(filled) != last - first + 1:
+                return 0
+            id_column = rule["columns"].get("ID")
+            if not id_column:
+                return 0
+            current = [str(value_at(values, row, id_column)).strip()
+                       for row in range(first, last + 1)]
+            expected = [str(number) for number in range(1, len(filled) + 1)]
+            if current == expected:
+                return 0
+            column = cell_name(1, id_column)[:-1]
+            worksheet.update(f"{column}{first}:{column}{last}",
+                             [[value] for value in expected],
+                             value_input_option="RAW")
+            self.read_versions.pop("bookings", None)
+            return last
+
+    # ---------- чтение таблиц ----------
+
+    def observe(self, force: bool = False, roles=ROLE_FIELDS) -> dict:
+        """Свежий пакет выбранных ролей; кэш между операциями не используется."""
+        with self.lock:
+            observed = {}
+            self.refresh(force=force, _observed=observed)
+            rules = []
+            for role in roles:
+                try:
+                    rules.extend(self._rules(role))
+                except MappingError:
+                    if role in CORE_ROLES:
+                        raise
+                    # Необязательная область отсутствует — это допустимо.
+                    continue
+            missing = {rule["sheet_id"] for rule in rules} - observed.keys()
+            identifiers = sorted(missing)
+            for offset in range(0, len(identifiers), 50):
+                group = identifiers[offset:offset + 50]
+                ranges = ["'" + self._worksheet(sheet_id).title.replace("'", "''") + "'"
+                          for sheet_id in group]
+                try:
+                    values = self.spreadsheet().values_batch_get(
+                        ranges, params={"valueRenderOption": "FORMATTED_VALUE"}).get("valueRanges", [])
+                except Exception as error:
+                    status = getattr(getattr(error, "response", None), "status_code", None)
+                    if force or (status not in {400, 404} and type(error).__name__ != "WorksheetNotFound"):
+                        raise
+                    return self.observe(force=True, roles=roles)
+                if len(values) != len(group):
+                    raise MappingError("Google вернул неполный снимок таблиц")
+                observed.update({
+                    sheet_id: {"values": value.get("values", [])}
+                    for sheet_id, value in zip(group, values)
+                })
+            for rule in rules:
+                values = observed[rule["sheet_id"]]["values"]
+                headers = trim_headers(values[rule["header_row"] - 1]) if len(values) >= rule["header_row"] else []
+                if headers != rule["structure"]["headers"] or self._worksheet(rule["sheet_id"]).title != rule["sheet_title"]:
+                    if force:
+                        raise MappingError("Структура продолжает меняться; повторите запрос")
+                    return self.observe(force=True, roles=roles)
+            return observed
+
+    def table(self, role: str, _attempt: int = 0, _observed: dict | None = None) -> tuple[list[str], list[dict]]:
+        with self.lock:
+            rules = self._rules(role)
+            headers, records = [], []
+            dates = set()
+            for rule in rules:
+                worksheet = self._worksheet(rule["sheet_id"])
+                try:
+                    values = _observed[rule["sheet_id"]]["values"] if _observed is not None else worksheet.get_all_values()
+                except Exception as error:
+                    status = getattr(getattr(error, "response", None), "status_code", None)
+                    if not _attempt and (status in {400, 404} or type(error).__name__ == "WorksheetNotFound"):
+                        self.refresh(force=True)
+                        return self.table(role, _attempt=1)
+                    raise
+                if len(rules) > 1 and rule.get("date_source"):
+                    source_date = self._date_source(rule, values, worksheet.title)
+                    if source_date in dates:
+                        raise MappingError("Несколько областей одной роли для одной даты")
+                    dates.add(source_date)
+                current = trim_headers(values[rule["header_row"] - 1]) if len(values) >= rule["header_row"] else []
+                if current != rule["structure"]["headers"] or worksheet.title != rule["sheet_title"]:
+                    if _observed is not None:
+                        self.refresh(force=True)
+                        raise MappingError("Структура изменилась во время снимка; повторите запрос")
+                    if _attempt:
+                        raise MappingError("Структура продолжает меняться; повторите чтение позже")
+                    self.refresh(force=True)
+                    return self.table(role, _attempt=1)
+                if rule.get("prices_transposed"):
+                    records.extend(self._extract_records(rule, values, worksheet.title))
+                    continue
+                fields = list(rule["columns"])
+                if rule.get("date_source") and "Дата" not in fields:
+                    fields.append("Дата")
+                if rule.get("grid_columns"):
+                    fields.append("Постов")
+                headers.extend(field for field in fields if field not in headers)
+                records.extend(self._extract_records(rule, values, worksheet.title))
+            if role == "services" and any(rule.get("pivot_prices") for rule in rules):
+                if not all(rule.get("pivot_prices") == rules[0].get("pivot_prices") for rule in rules):
+                    raise MappingError("Распределённый прайс смешивает несовместимые представления")
+                headers, records = self._pivot_prices(rules[0], records)
+            if role == "services" and any(rule.get("prices_transposed") for rule in rules):
+                classes: list[str] = []
+                by_service: dict[str, dict] = {}
+                for record in records:
+                    service = record.get("Услуга", "")
+                    item = by_service.setdefault(service, {"Услуга": service})
+                    for key, value in record.items():
+                        if key in {"Услуга", "__row__", "__sheet_id__"} or key in item:
+                            continue
+                        item[key] = value
+                        if key not in classes:
+                            classes.append(key)
+                headers = ["Услуга", *classes]
+                records = list(by_service.values())
+            if role == "services":
+                classes = [header for header in headers
+                           if header not in {"Услуга", "Описание", "Доступна", "Длительность"}]
+                if len({normalize_header(header) for header in classes}) != len(classes):
+                    raise MappingError("Повторяющиеся классы автомобилей")
+            self._validate_records(role, records, rules)
+            self.read_versions[role] = fingerprint((headers, records))
+            return headers, records
 
     def _date_source(self, rule: dict, values: list[list], title: str) -> str:
         source = rule.get("date_source") or {}
@@ -1247,103 +2162,6 @@ class AdaptiveSheets:
             record["__row__"], record["__sheet_id__"] = row, sheet_id
             records.append(record)
         return records
-
-    def observe(self, force: bool = False, roles=ROLE_FIELDS) -> dict:
-        """Свежий пакет выбранных ролей; по умолчанию все четыре, без кэша между операциями."""
-        with self.lock:
-            observed = {}
-            self.refresh(force=force, _observed=observed)
-            rules = [rule for role in roles for rule in self._rules(role)]
-            missing = {rule["sheet_id"] for rule in rules} - observed.keys()
-            identifiers = sorted(missing)
-            for offset in range(0, len(identifiers), 50):
-                group = identifiers[offset:offset + 50]
-                ranges = ["'" + self._worksheet(sheet_id).title.replace("'", "''") + "'" for sheet_id in group]
-                try:
-                    values = self.spreadsheet().values_batch_get(ranges, params={"valueRenderOption": "FORMATTED_VALUE"}).get("valueRanges", [])
-                except Exception as error:
-                    status = getattr(getattr(error, "response", None), "status_code", None)
-                    if force or (status not in {400, 404} and type(error).__name__ != "WorksheetNotFound"):
-                        raise
-                    return self.observe(force=True, roles=roles)
-                if len(values) != len(group):
-                    raise MappingError("Google вернул неполный снимок таблиц")
-                observed.update({sheet_id: {"values": value.get("values", [])} for sheet_id, value in zip(group, values)})
-            for rule in rules:
-                values = observed[rule["sheet_id"]]["values"]
-                headers = trim_headers(values[rule["header_row"]-1]) if len(values) >= rule["header_row"] else []
-                if headers != rule["structure"]["headers"] or self._worksheet(rule["sheet_id"]).title != rule["sheet_title"]:
-                    if force:
-                        raise MappingError("Структура продолжает меняться; повторите запрос")
-                    return self.observe(force=True, roles=roles)
-            return observed
-
-    def table(self, role: str, _attempt: int = 0, _observed: dict | None = None) -> tuple[list[str], list[dict]]:
-        with self.lock:
-            rules = self._rules(role)
-            headers, records = [], []
-            dates = set()
-            for rule in rules:
-                worksheet = self._worksheet(rule["sheet_id"])
-                try:
-                    values = _observed[rule["sheet_id"]]["values"] if _observed is not None else worksheet.get_all_values()
-                except Exception as error:
-                    status = getattr(getattr(error, "response", None), "status_code", None)
-                    if not _attempt and (status in {400, 404} or type(error).__name__ == "WorksheetNotFound"):
-                        self.refresh(force=True)
-                        return self.table(role, _attempt=1)
-                    raise
-                if len(rules) > 1 and rule.get("date_source"):
-                    source_date = self._date_source(rule, values, worksheet.title)
-                    if source_date in dates:
-                        raise MappingError("Несколько областей одной роли для одной даты")
-                    dates.add(source_date)
-                current = trim_headers(values[rule["header_row"] - 1]) if len(values) >= rule["header_row"] else []
-                if current != rule["structure"]["headers"] or worksheet.title != rule["sheet_title"]:
-                    if _observed is not None:
-                        self.refresh(force=True)
-                        raise MappingError("Структура изменилась во время снимка; повторите запрос")
-                    if _attempt:
-                        raise MappingError("Структура продолжает меняться; повторите чтение позже")
-                    self.refresh(force=True)
-                    return self.table(role, _attempt=1)
-                if rule.get("prices_transposed"):
-                    # Классы строками: ключи-услуги не становятся классами, а записями «Услуга».
-                    records.extend(self._extract_records(rule, values, worksheet.title))
-                    continue
-                fields = list(rule["columns"])
-                if rule.get("date_source") and "Дата" not in fields:
-                    fields.append("Дата")
-                if rule.get("grid_columns"):
-                    fields.append("Постов")
-                headers.extend(field for field in fields if field not in headers)
-                records.extend(self._extract_records(rule, values, worksheet.title))
-            if role == "services" and any(record.get("pivot_prices") for record in rules):
-                if not all(rule.get("pivot_prices") == rules[0].get("pivot_prices") for rule in rules):
-                    raise MappingError("Распределённый прайс смешивает несовместимые представления")
-                headers, records = self._pivot_prices(rules[0], records)
-            if role == "services" and any(rule.get("prices_transposed") for rule in rules):
-                # Из длинного формата собираем привычную матрицу «услуга × класс».
-                classes: list[str] = []
-                by_service: dict[str, dict] = {}
-                for record in records:
-                    service = record.get("Услуга", "")
-                    item = by_service.setdefault(service, {"Услуга": service})
-                    for key, value in record.items():
-                        if key in {"Услуга", "__row__", "__sheet_id__"} or key in item:
-                            continue
-                        item[key] = value
-                        if key not in classes:
-                            classes.append(key)
-                headers = ["Услуга", *classes]
-                records = list(by_service.values())
-            if role == "services":
-                classes = [header for header in headers if header not in {"Услуга", "Описание", "Доступна", "Длительность"}]
-                if len({normalize_header(header) for header in classes}) != len(classes):
-                    raise MappingError("Повторяющиеся классы автомобилей")
-            self._validate_records(role, records, rules)
-            self.read_versions[role] = fingerprint((headers, records))
-            return headers, records
 
     def _pivot_prices(self, rule: dict, records: list[dict]) -> tuple[list[str], list[dict]]:
         pivot = rule["pivot_prices"]
@@ -1431,15 +2249,22 @@ class AdaptiveSheets:
                     except ValueError:
                         raise MappingError("Некорректное количество постов") from None
                 continue
-            if not parse_date(record.get("Дата", "")) or not parse_time(record.get("Время", "")):
+            record_date = parse_date(record.get("Дата", ""))
+            record_time = parse_time(record.get("Время", ""))
+            if not record_date and not record_time:
+                # Частично созданная/пустая строка не занимает место. Полностью
+                # игнорировать её нельзя (ID остаётся зарезервированным), но и
+                # блокировать чтение всего журнала из-за пустой даты нельзя.
+                continue
+            if not record_date or not record_time:
                 raise MappingError(f"Некорректная дата/время {role}, лист {record['__sheet_id__']}, строка {record['__row__']}")
             if role == "bookings":
-                key = record.get("ID", "")
-                if not key or key in identifiers or not record.get("Telegram ID", ""):
-                    raise MappingError("Отсутствует или повторяется идентификатор записи/клиента")
-                if not re.fullmatch(r"[1-9]\d*", record["Telegram ID"]):
+                # ID может быть наследственным/пустым/повторным — это разрешается
+                # адресно. Telegram ID обязан быть положительным: иначе нельзя
+                # безопасно сопоставить запись клиенту.
+                if not re.fullmatch(r"[1-9]\d*", str(record.get("Telegram ID", "")).strip()):
                     raise MappingError("Некорректный Telegram ID клиента")
-                identifiers.add(key)
+                identifiers.add(str(record.get("ID", "")))
             else:
                 raw = record.get("Постов", "")
                 try:
@@ -1634,7 +2459,7 @@ class AdaptiveSheets:
         with self.lock:
             expected_versions = dict(self.read_versions)
             _, tables = self._preflight()
-            for role in ROLE_FIELDS:
+            for role in ("services", "tariffs", "slots", "bookings"):
                 if role not in expected_versions or self.read_versions[role] != expected_versions[role]:
                     raise MappingError("Данные или зависимости изменились перед записью; обновите предложение")
                 if role == "bookings" and expected_bookings is not None and tables["bookings"][1] != expected_bookings:
@@ -1668,7 +2493,8 @@ class AdaptiveSheets:
                 raise MappingError("В области записи нет свободных строк; расширьте её вручную")
             if any(str(field_value).strip() for field_value in (values[row - 1] if row <= len(values) else [])):
                 raise MappingError("Строка назначения уже занята")
-            updates = []
+            width = max(rule["columns"].values())
+            row_values = [""] * width
             for field, column in rule["columns"].items():
                 value = data.get(field.lower(), "")
                 if field == "Статус":
@@ -1682,7 +2508,8 @@ class AdaptiveSheets:
                 if field == "Время" and rule.get("transforms", {}).get("Время") == "serial_time":
                     hour, minute = map(int, value.split(":"))
                     value = (hour * 60 + minute) / 1440
-                updates.append({"range": cell_name(row, column), "values": [[value]]})
+                row_values[column - 1] = value
+            updates = [{"range": f"A{row}:{cell_name(row, width)}", "values": [row_values]}]
             grid_rules = self._grid_rules(data["дата"])
             # Журнал пишем до занятия клетки: сбой между занятием и журналом оставлял бы
             # маркер без записи и без доказательства для ручной сверки.

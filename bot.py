@@ -577,6 +577,20 @@ async def maintain_grid_consistency(store: Store) -> None:
             log.warning("Сверка сетки постов не выполнена (%s)", type(error).__name__)
 
 
+async def maintain_schema(store: Store, interval_hours: float) -> None:
+    """Структурная проверка Sheets независимо от сообщений и бронирований."""
+    interval = max(60.0, float(interval_hours) * 3600)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            document = await asyncio.to_thread(store.check_schema)
+            log.info("Проверка структуры Sheets: %s; карта v%s; AI-вызовов всего %s",
+                     document.get("validation_status"), document.get("mapping_version"),
+                     document.get("ai_total_calls", 0))
+        except Exception as error:
+            log.warning("Проверка структуры Sheets не выполнена (%s)", type(error).__name__)
+
+
 async def archive_old_bookings(store: Store) -> None:
     """Раз в 6 часов: прошедшие заявки получают статус «Архив», записи со
     статусами «Архив» и «Отмена» переносятся в отдельный архивный лист
@@ -614,6 +628,7 @@ async def main() -> None:
     archiver = None
     vehicle_cache = None
     grid_auditor = None
+    schema_auditor = None
     outbox = None
     try:
         store = Store(config)
@@ -637,8 +652,20 @@ async def main() -> None:
         archiver = asyncio.create_task(archive_old_bookings(store))
         vehicle_cache = asyncio.create_task(maintain_vehicle_cache(agent))
         grid_auditor = asyncio.create_task(maintain_grid_consistency(store))
-        if config.sheets_adaptive_enabled and config.sheets_discover_on_start:
-            await asyncio.to_thread(store.refresh_schema, force=config.sheets_force_schema_refresh)
+        # Структурная проверка на каждом старте: без AI, если отпечаток не менялся.
+        try:
+            document = await asyncio.to_thread(
+                store.refresh_schema, force=True,
+                explicit=config.sheets_force_schema_refresh)
+            log.info("Карта Sheets на старте: %s; областей %s; запись %s; AI-вызовов %s",
+                     document.get("validation_status"), len(document.get("regions", [])),
+                     "разрешена" if document.get("writes_enabled") else "заблокирована",
+                     document.get("ai_total_calls", 0))
+        except Exception as error:
+            log.error("Стартовая проверка карты Sheets не удалась (%s); записи будут "
+                      "заблокированы до следующей успешной проверки", type(error).__name__)
+        schema_auditor = asyncio.create_task(
+            maintain_schema(store, config.sheets_schema_check_interval_hours))
         await bot.delete_webhook(drop_pending_updates=False)
         log.info("Бот запущен. Модель: %s", config.ai_model if config.ai_enabled else "AI отключён")
         await dispatcher.start_polling(bot, close_bot_session=False)
@@ -647,7 +674,7 @@ async def main() -> None:
         # обработчикам завершиться и только затем пишем один снимок диалогов.
         if dispatcher is not None:
             await finish_updates(dispatcher)
-        for task in (maintenance, archiver, vehicle_cache, grid_auditor, outbox):
+        for task in (maintenance, archiver, vehicle_cache, grid_auditor, schema_auditor, outbox):
             if task is not None:
                 task.cancel()
                 with suppress(asyncio.CancelledError):
