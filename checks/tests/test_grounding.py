@@ -99,6 +99,43 @@ class GroundingTests(unittest.IsolatedAsyncioTestCase):
                                 response("Мойка кузова, итого 700 ₽.", raw=True))
         self.assertIn("700", answer)
 
+    async def test_correct_total_with_wrong_item_price_is_not_delivered(self):
+        # Итог совпадает с проверенным расчётом, но отдельная цена взята из
+        # другого класса: общий итог не должен оправдывать такую строку.
+        answer = await self.say("Мойка для легкового, сколько?",
+                                response(calls=[("get_price_list", {})]),
+                                response(calls=[("calculate_price", {
+                                    "size_class": "Легковой", "services": ["Мойка"]})]),
+                                response("Мойка — 800 ₽, итого 700 ₽.", raw=True))
+        self.assertNotIn("800", answer)
+        self.assertIn("700", answer)
+        self.assertIn("Мойка", answer)
+
+    async def test_discounted_tariff_keeps_individual_prices_and_total(self):
+        # Цены услуг не обязаны складываться в цену пакета: скидка применяется
+        # к комплексу, но каждая названная услуга проверяется по своему классу.
+        services = self.spreadsheet.worksheet("Услуги")
+        services.values[2][-1] = "да"  # Воск снова доступен
+        self.store._invalidate("services", "tariffs")
+        answer = await self.say("Сколько стоит Базовый для легкового?",
+                                response(calls=[("get_price_list", {})]),
+                                response(calls=[("calculate_price", {
+                                    "size_class": "Легковой", "tariff": "Базовый"})]),
+                                response("Тариф «Базовый» — 810 ₽. Мойка — 700 ₽, воск — 200 ₽. "
+                                         "Скидка 10%, итого 810 ₽.", raw=True))
+        self.assertIn("810", answer)
+        self.assertIn("700", answer)
+        self.assertIn("200", answer)
+
+    async def test_correct_tariff_price_and_discount_pass(self):
+        answer = await self.say("Сколько стоит Базовый для легкового?",
+                                response(calls=[("get_price_list", {})]),
+                                response(calls=[("calculate_price", {
+                                    "size_class": "Легковой", "tariff": "Базовый"})]),
+                                response("Тариф «Базовый» — 630 ₽, скидка 10%.", raw=True))
+        self.assertIn("630", answer)
+        self.assertIn("10%", answer)
+
     # ---------- доступность ----------
     async def test_claimed_slot_without_fresh_check_is_rejected(self):
         self.agent._state[111] = {"availability": {"checked_at": "2020-01-01T00:00:00+03:00",

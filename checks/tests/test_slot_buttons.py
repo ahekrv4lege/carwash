@@ -176,6 +176,100 @@ class SlotButtonDialogTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(transport.chat.completions.create.await_count, 0)
 
 
+class SlotKeyboardDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_available_time_question_attaches_time_keyboard_immediately(self):
+        import bot
+        from aiogram.types import Message
+        with tempfile.TemporaryDirectory() as folder:
+            store, spreadsheet = fixture(folder)
+            day = upcoming_day(store)
+            add_slot(spreadsheet, day, "10:00")
+            agent, transport = make_agent(store, [])  # модель вызываться не должна
+            self.addAsyncCleanup(agent.close)
+            self.addAsyncCleanup(agent.reset, 111)
+            agent.reset(111)
+            agent._state[111]["facts"] = {"date": day.isoformat()}
+            queue = bot.MessageBatcher(0.01)
+            reporter = Mock(dialog=AsyncMock())
+            sender = Mock(__aenter__=AsyncMock(), __aexit__=AsyncMock())
+            message = Message.model_validate({"message_id": 1, "date": 0,
+                "chat": {"id": 111, "type": "private"}, "from": USER,
+                "text": "Какое есть время?"})
+            async def text_handler(event, data):
+                await bot.ask_agent(event, agent, reporter, event.text)
+            with patch.object(Message, "answer", new_callable=AsyncMock) as answer, \
+                 patch("bot.ChatActionSender.typing", return_value=sender):
+                await queue(text_handler, message, {"agent": agent})
+            text = answer.await_args.args[0]
+            self.assertIn("Выберите время записи на", text)
+            keyboard = answer.await_args.kwargs["reply_markup"]
+            self.assertEqual(keyboard.inline_keyboard[0][0].callback_data,
+                             f"slots:time:{day.isoformat()}:10:00")
+            self.assertEqual(transport.chat.completions.create.await_count, 0)
+
+    async def test_button_promise_without_service_requests_a_menu(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        store, spreadsheet = fixture(self.temp.name)
+        day = upcoming_day(store)
+        add_slot(spreadsheet, day, "10:00")
+        with patch("ai.AsyncOpenAI"):
+            agent = Agent(store.config, store)
+        self.addAsyncCleanup(agent.close)
+        agent._state[111]["facts"] = {"date": day.isoformat()}
+        agent._turn_text[111] = "Какое есть время?"
+        agent._maybe_slot_menu(111, "Завтра есть свободное время. Выберите, пожалуйста, удобный час из кнопок.")
+        self.assertEqual(agent._state[111].get("slot_menu"), "time")
+
+    async def test_keyboard_failure_keeps_pending_menu(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        store, _ = fixture(self.temp.name)
+        with patch("ai.AsyncOpenAI"):
+            agent = Agent(store.config, store)
+        self.addAsyncCleanup(agent.close)
+        user = ChatUser(111, None, "Synthetic")
+        agent._state[111]["slot_menu"] = "date"
+        with patch.object(agent, "_date_rows", side_effect=RuntimeError("synthetic")):
+            self.assertIsNone(await agent.slot_keyboard(user))
+        self.assertEqual(agent._state[111].get("slot_menu"), "date")
+
+    async def test_failed_delivery_keeps_menu_and_removes_button_promise(self):
+        import bot
+        with tempfile.TemporaryDirectory() as folder:
+            store, spreadsheet = fixture(folder)
+            day = upcoming_day(store)
+            add_slot(spreadsheet, day, "10:00")
+            with patch("ai.AsyncOpenAI"):
+                agent = Agent(store.config, store)
+            self.addAsyncCleanup(agent.close)
+            user = ChatUser(111, None, "Synthetic")
+            agent._state[111]["slot_menu"] = "date"
+            message = Mock(answer=AsyncMock(side_effect=OSError("telegram")))
+            with self.assertRaises(OSError):
+                await bot.send_answer(message, agent, Mock(dialog=AsyncMock()), user, "вопрос",
+                                      "Завтра есть свободное время. Выберите час из кнопок.")
+            self.assertEqual(agent._state[111].get("slot_menu"), "date")
+
+    async def test_no_keyboard_means_no_button_promise_in_text(self):
+        import bot
+        with tempfile.TemporaryDirectory() as folder:
+            store, _ = fixture(folder)
+            with patch("ai.AsyncOpenAI"):
+                agent = Agent(store.config, store)
+            self.addAsyncCleanup(agent.close)
+            user = ChatUser(111, None, "Synthetic")
+            agent._state[111]["slot_menu"] = "date"
+            agent.slot_keyboard = AsyncMock(return_value=None)
+            message = Mock(answer=AsyncMock())
+            await bot.send_answer(message, agent, Mock(dialog=AsyncMock()), user, "вопрос",
+                                  "Завтра есть свободное время. Выберите час из кнопок.")
+            text = message.answer.await_args.args[0]
+            self.assertNotIn("кноп", text.lower())
+            self.assertNotIn("reply_markup", message.answer.await_args.kwargs)
+            self.assertEqual(agent._state[111].get("slot_menu"), "date")
+
+
 class SlotButtonUnitTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

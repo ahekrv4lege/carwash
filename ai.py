@@ -103,7 +103,15 @@ SLOT_DATE_QUESTION = re.compile(
 SLOT_TIME_QUESTION = re.compile(
     r"на\s+какое\s+время|какое\s+(?:другое\s+)?время|"
     r"(?:день|время|дата)\s+(?:вам\s+)?(?:подход\w*|удобн\w*)|как\s+время|"
-    r"выбер\w*\s+время", re.I)
+    r"выбер\w*\s+(?:удобн\w*\s+)?(?:час|время)", re.I)
+# Клиент прямо спрашивает, когда есть свободное время. Это не «запишите меня»:
+# даже без выбранной услуги такие слоты можно показать кнопками.
+SLOT_REQUEST = re.compile(
+    r"\bсвободн\w*\b|"
+    r"\b(?:какое|какие|есть(?:\s+ли)?|во\s+сколько|когда|что)\b"
+    r"[^.?!\n]{0,40}\b(?:время|час(?:ы|ов)?|слот\w*|окно|мест[ао])\b|"
+    r"\bкогда\s+(?:можно|вы\s+можете|есть)\b", re.I)
+BUTTON_PROMISE = re.compile(r"кноп", re.I)
 
 # Подсказка модели в результате get_free_slots: слоты показываются кнопками.
 SLOTS_MENU_NOTE = ("Свободные дни и часы клиенту показываются кнопками выбора; "
@@ -683,14 +691,19 @@ class Agent:
         if user_id in self._pending:
             return
         state = self._state[user_id]
-        # Кнопки дня уместны, когда состав записи уже известен: пока не выбраны
-        # тариф или услуги, вопрос о дате преждевременен. Исключение - только
-        # что проверенные слоты: клиент сам спрашивал о свободном времени.
         facts = state.get("facts", {})
+        text = self._turn_text.get(user_id, "")
+        tools = self._turn_tools.get(user_id) or {}
+        slots_checked = any(
+            isinstance(key, tuple) and key and key[0] == "get_free_slots"
+            and isinstance(value, dict) and value.get("ok") for key, value in tools.items())
+        asks_slots = bool(SLOT_REQUEST.search(text or ""))
+        promises_buttons = bool(BUTTON_PROMISE.search(answer or ""))
+        # Кнопки дня без выбранной услуги преждевременны только для общего
+        # «запишите меня». Если клиент сам спрашивает свободное время, слоты
+        # уже проверены или ответ обещает кнопки — меню нужно показать.
         if not (facts.get("tariff") or facts.get("services") or state.get("repeat_last")):
-            tools = self._turn_tools.get(user_id) or {}
-            if not any(isinstance(key, tuple) and key and key[0] == "get_free_slots"
-                       and isinstance(value, dict) and value.get("ok") for key, value in tools.items()):
+            if not (slots_checked or asks_slots or promises_buttons):
                 # Диагностика: кнопки скрыты намеренно (услуга не выбрана), это не сбой Telegram.
                 log.info("Кнопки выбора дня отложены: тариф и услуги ещё не выбраны")
                 return
@@ -698,6 +711,9 @@ class Agent:
             menu = "date"
         elif SLOT_TIME_QUESTION.search(answer or ""):
             menu = "time"
+        elif promises_buttons or asks_slots:
+            has_day = bool(facts.get("date") or state.get("slot_pick"))
+            menu = "time" if has_day else "date"
         else:
             return
         self._offer_slot_menu(user_id, menu)
@@ -957,6 +973,10 @@ car — слова клиента с исходной цитатой; car_model 
             self._turn_text[user.id] = text
             self._turn_sources[user.id] = {}
             self._turn_start(user.id, text, user=user)
+            # Меню от прошлого хода не должно приклеиться к новому ответу.
+            # Недоставленное меню переживёт отправку: оно очищается только
+            # после успешной доставки клавиатуры (см. send_answer).
+            self._state[user.id].pop("slot_menu", None)
             # Телефон сохраняем только из одиночного числа без отрицаний, сомнений
             # и ярлыков «заказ/запись/квитанция…»: это другой номер, а не телефон клиента.
             phone_match = next(PHONE.finditer(text), None)
@@ -1086,10 +1106,20 @@ car — слова клиента с исходной цитатой; car_model 
                     apply_patch(state, choice, {})
             state.setdefault("confirmed", False)
             try:
-                if (not pending and re.search(r"\bсвободн\w*\b", text, re.I)
-                        and re.search(r"\b(?:что|ч[её]|како\w*|есть|когда|врем\w*|слот\w*|мест\w*|после\s+работы)\b", text, re.I)
+                direct_slots = bool(
+                    (re.search(r"\bсвободн\w*\b", text, re.I)
+                     and re.search(r"\b(?:что|ч[её]|како\w*|есть|когда|врем\w*|слот\w*|мест\w*|"
+                                   r"после\s+работы)\b", text, re.I))
+                    or re.search(r"\b(?:какое|какие)\s+(?:есть\s+)?(?:время|часы)\b", text, re.I)
+                    or re.search(r"\b(?:во\s+сколько|когда)\s+можно\b", text, re.I)
+                    or re.search(r"\bесть\s+ли\s+(?:свободное\s+)?время\b", text, re.I)
+                    or re.search(r"после\s+работы", text, re.I))
+                # Конкретное ЧЧ:ММ уже проверяется моделью и защитой слотов;
+                # здесь нужен именно вопрос «какое есть время / когда можно».
+                if (not pending and direct_slots and not re.search(r"\d{1,2}:\d{2}", text)
                         and not re.search(r"\b(?:не|если|или|либо)\b", text, re.I)):
-                    selected_date = source_date(text, self.store.now(), True)
+                    selected_date = (source_date(text, self.store.now(), True)
+                                     or parse_date(str((state.get("facts") or {}).get("date") or "")))
                     slots = await asyncio.wait_for(asyncio.to_thread(
                         self.store.free_slots, str(selected_date) if selected_date else None, **self._slot_options(user)), timeout=remaining())
                     if not slots.get("ok"):
@@ -1272,9 +1302,8 @@ car — слова клиента с исходной цитатой; car_model 
                                or ("stale_offer" if "Подтвердить»" in answer and user.id not in self._pending else None)
                                or ("unverified_availability" if self._unverified_availability(user.id, answer, availability_before) else None)
                                or ("unverified_price"
-                                   if re.search(rf"\d+\s*(?:{re.escape(self.config.currency)}|руб)", answer)
-                                   and not (self._price_verified(user.id)
-                                            or self._prices_grounded(user.id, answer)) else None)
+                                   if self._PRICE_CLAIM.search(answer)
+                                   and not self._prices_grounded(user.id, answer) else None)
                                or ("unverified_total" if self._unverified_total(user.id, answer) else None)
                                or ("unverified_discount" if self._unverified_discount(user.id, answer) else None))
                     if problem:
@@ -1291,8 +1320,12 @@ car — слова клиента с исходной цитатой; car_model 
                                     return self._remember(user.id, text, self._offer(user.id, self._pending[user.id]))
                                 if checked.get("error"):
                                     return self._remember(user.id, text, checked["error"])
+                        breakdown = (self._quote_breakdown(user.id, answer)
+                                     if problem in {"unverified_price", "unverified_total"} else None)
                         receipt = self._receipt(state)
-                        if receipt:
+                        if breakdown:
+                            answer = breakdown
+                        elif receipt:
                             answer = receipt
                         else:
                             # Исправление ответа не получает инструментов записи.
@@ -1314,8 +1347,8 @@ car — слова клиента с исходной цитатой; car_model 
                                 revised = _clean_text(response.choices[0].message.content or "")
                                 if not revised or leak_reason(revised) or safe_claim(revised) or (
                                         self._unverified_availability(user.id, revised, availability_before)
-                                        or re.search(rf"\d+\s*(?:{re.escape(self.config.currency)}|руб)", revised)
-                                        and not self._price_verified(user.id)
+                                        or self._PRICE_CLAIM.search(revised)
+                                        and not self._prices_grounded(user.id, revised)
                                         or self._unverified_total(user.id, revised)
                                         or self._unverified_discount(user.id, revised)):
                                     raise ValueError("unsafe_model_reply")
@@ -1442,9 +1475,13 @@ car — слова клиента с исходной цитатой; car_model 
         return self._time_buttons(day, self._free_times_of(result, day.isoformat())) or None
 
     async def slot_keyboard(self, user: ChatUser) -> list | None:
-        """Строки кнопок выбора даты/времени по актуальным слотам таблицы; None, если они не нужны."""
+        """Строки кнопок выбора даты/времени по актуальным слотам таблицы; None, если они не нужны.
+
+        Запрос меню не сбрасывается до успешной сборки: при сбое таблицы
+        состояние остаётся, а повторная доставка сможет снова собрать кнопки.
+        """
         state = self._state.get(user.id)
-        menu = state.pop("slot_menu", None) if state else None
+        menu = state.get("slot_menu") if state else None
         if not menu or user.id in self._pending:
             return None
         if state.get("stage") in {"booked", "cancelled", "uncertain", "awaiting_confirmation", "writing"}:
@@ -1459,6 +1496,12 @@ car — слова клиента с исходной цитатой; car_model 
         except Exception as error:
             log.warning("Не удалось построить кнопки расписания (%s)", type(error).__name__)
             return None
+
+    def consume_slot_menu(self, user_id: int) -> None:
+        """Убрать запрос меню только после успешной доставки клавиатуры."""
+        state = self._state.get(user_id)
+        if state:
+            state.pop("slot_menu", None)
 
     async def pick_date(self, user: ChatUser, date_str: str) -> tuple[str, list | None]:
         """Клиент выбрал день кнопкой: показываем только свободные часы этого дня."""
@@ -2432,8 +2475,9 @@ car — слова клиента с исходной цитатой; car_model 
         r"доступн\w*|подходит|можно\s+(?:запис\w*|в|на)|могу\s+(?:вас\s+)?запис\w*)\b", re.I)
 
     _TOTAL_CLAIM = re.compile(
-        r"\b(?:итого|всего|сумма|суммарно|за\s+вс[её]|общая\s+(?:стоимость|сумма))\b[^.!\n]{0,40}?"
-        r"(\d[\d\s]{0,12})\s*(?:₽|руб)", re.I)
+        r"\b(?:итог\w*|всего|сумма|суммарно|total|за\s+вс[её]|"
+        r"общ\w*\s+(?:стоимость|сумма)|к\s+оплате)\b[^.!\n]{0,40}?"
+        r"(\d[\d\s]{0,12})\s*(?:₽|руб\w*|rub\w*)", re.I)
 
     _DISCOUNT_CLAIM = re.compile(r"скидк\w*\s+(?:в\s+размере\s+|—\s*)?(\d{1,3}(?:[.,]\d+)?)\s*(?:%|проц)", re.I)
 
@@ -2533,50 +2577,237 @@ car — слова клиента с исходной цитатой; car_model 
                    and isinstance(value, dict) and value.get("ok")
                    for key, value in tools.items())
 
-    def _prices_grounded(self, user_id, text) -> bool:
-        """Все названные цены есть в свежем каталоге, даже если tool-call был раньше.
+    _PRICE_CLAIM = re.compile(
+        r"(?<!\d)(\d[\d\s.,]{0,12})\s*(?:₽|руб(?:\.|лей|ля|ль)?|rub(?:les?)?)(?!\w)", re.I)
+    _TOTAL_BEFORE = re.compile(
+        r"(?:итог\w*|всего|суммарно|сумма|общ\w*\s+(?:стоимость|сумма)|"
+        r"к\s+оплате|за\s+вс[её]|total)\b[^.;!?\n]{0,40}$", re.I)
+    _TARIFF_LINE = re.compile(r"^\s*тариф\s*[«\"]?\s*(.*?)\s*[»\"]?\s*$", re.I)
 
-        Это не ослабление проверки: выдуманная сумма или цена другого класса
-        по-прежнему отклоняется, потому что сверяется с конкретными числами
-        прайса, а не с самим фактом когда-либо вызванного инструмента.
-        """
-        catalog = self._state[user_id].get("catalog") or {}
-        if not self._state_fresh(catalog, self._catalog_ttl_sec):
-            return False
-        known = set()
-        for value in catalog.get("prices") or []:
+    @staticmethod
+    def _name_pattern(name):
+        """Шаблон названия с запасом на падежи: «Мойка» ловит и «мойку»."""
+        words = re.findall(r"[^\W_]+", folded(name or ""))
+        if not words:
+            return None
+        parts = []
+        for word in words:
+            stem = word[:4] if len(word) >= 5 else word
+            suffix = r"[а-яёa-z0-9]*" if len(word) >= 3 else ""
+            parts.append(re.escape(stem) + suffix)
+        return r"(?<!\w)" + r"\s+".join(parts) + r"(?!\w)"
+
+    @staticmethod
+    def _line_around(text, match):
+        start = text.rfind("\n", 0, match.start()) + 1
+        end = text.find("\n", match.end())
+        return start, (len(text) if end < 0 else end), text[start:(len(text) if end < 0 else end)]
+
+    @classmethod
+    def _nearest_name(cls, names, segment, price_start, price_end):
+        candidates = []
+        for name in names:
+            pattern = cls._name_pattern(name)
+            if not pattern:
+                continue
+            for hit in re.finditer(pattern, segment, re.I):
+                if hit.end() <= price_start:
+                    side, distance = 0, price_start - hit.end()
+                elif hit.start() >= price_end:
+                    side, distance = 1, hit.start() - price_end
+                else:
+                    side, distance = 0, 0
+                # Название перед ценой («Мойка — 700 ₽») важнее случайного
+                # слова после неё («…, воск сейчас недоступен»).
+                candidates.append((side, distance, -len(name), hit.start(), name))
+        if not candidates:
+            return None
+        return min(candidates)[4]
+
+    @classmethod
+    def _quote_items(cls, quote):
+        items = {}
+        for line in (quote or {}).get("lines") or []:
+            if not isinstance(line, dict):
+                continue
+            raw = str(line.get("item") or "").strip()
+            match = cls._TARIFF_LINE.match(raw)
+            name = (match.group(1) if match else raw).strip(" «»\"'")
+            if name:
+                items[folded(name)] = {
+                    "name": name, "kind": "tariff" if match else "service",
+                    "price": line.get("price"),
+                }
+            for included in line.get("includes") or []:
+                if isinstance(included, str) and included.strip():
+                    items.setdefault(folded(included), {
+                        "name": included.strip(), "kind": "include", "price": None,
+                    })
+        return items
+
+    @staticmethod
+    def _catalog_item_prices(catalog, name):
+        wanted = folded(name)
+        service = next((item for item in catalog.services.values()
+                        if folded(item.name) == wanted), None)
+        if service:
+            prices = {}
+            for size_class, price in service.prices.items():
+                try:
+                    prices[size_class] = int(price)
+                except (TypeError, ValueError):
+                    continue
+            return prices, bool(service.available)
+        tariff = next((item for item in catalog.tariffs.values()
+                       if folded(item.name) == wanted), None)
+        if tariff:
+            prices = {}
+            for size_class in catalog.size_classes:
+                try:
+                    quote = catalog.tariff_quote(tariff, size_class)
+                except Exception:
+                    quote = None
+                if quote:
+                    prices[size_class] = int(quote["price"])
+            return prices, bool(tariff.enabled)
+        return {}, False
+
+    def _quote_for_text(self, user_id, text=None):
+        """Актуальный расчёт, если ответ опирается на него; иначе None."""
+        state = self._state.get(user_id, {})
+        quote = state.get("quote")
+        if not self._state_fresh(quote, self._catalog_ttl_sec):
+            pending = self._pending.get(user_id)
+            quote = pending.get("quote") if pending else None
+        if not isinstance(quote, dict):
+            booking = state.get("booking")
+            quote = booking if isinstance(booking, dict) and booking.get("total") is not None else None
+        if not isinstance(quote, dict):
+            return None
+        if text is None:
+            return quote
+        answer = folded(text or "")
+        if any(name and name in answer for name in self._quote_items(quote)):
+            return quote
+        for match in self._TOTAL_CLAIM.finditer(text or ""):
             try:
-                known.add(int(value))
+                if int(re.sub(r"\D", "", match[1]) or 0) == int(quote.get("total", -1)):
+                    return quote
             except (TypeError, ValueError):
                 continue
-        claims, positive, negated = [], [], 0
+        return None
+
+    def _quote_breakdown(self, user_id, text=None):
+        """Детерминированная расшифровка проверенного расчёта без выдуманных цен."""
+        quote = self._quote_for_text(user_id, text)
+        if not isinstance(quote, dict):
+            return None
+        currency = quote.get("currency") or self.config.currency
+        lines = []
+        for line in quote.get("lines") or []:
+            if not isinstance(line, dict):
+                continue
+            item = str(line.get("item") or "").strip()
+            price = line.get("price")
+            if not item or price is None:
+                continue
+            lines.append(f"{item} — {price} {currency}")
+            included = [str(value) for value in (line.get("includes") or []) if str(value).strip()]
+            if included:
+                lines.append("Входит: " + ", ".join(included))
+            removed = [str(value) for value in (line.get("not_included_now") or []) if str(value).strip()]
+            if removed:
+                lines.append("Сейчас недоступно: " + ", ".join(removed))
+        if not lines:
+            return None
+        total = quote.get("total")
+        if total is not None:
+            lines.append(f"Итого: {total} {currency}")
+        return "\n".join(lines)
+
+    def _prices_grounded(self, user_id, text) -> bool:
+        """Каждая цена привязана к своему названию, классу и строке расчёта.
+
+        Общий итог проверяется отдельно и не может «оправдать» неверные цены
+        отдельных услуг. Если есть актуальный расчёт, его строки и состав
+        считаются главным источником; цены услуг сверяются с прайсом класса.
+        """
+        state = self._state.get(user_id, {})
+        catalog_state = state.get("catalog") or {}
+        if not self._state_fresh(catalog_state, self._catalog_ttl_sec):
+            return False
+        try:
+            catalog = self.store.get_catalog()
+        except Exception:
+            return False
+        claims = list(self._PRICE_CLAIM.finditer(text or ""))
+        if not claims:
+            return False
+        quote = self._quote_for_text(user_id, text)
+        quote_items = self._quote_items(quote) if quote else {}
+        quote_is_breakdown = bool(quote_items) and any(
+            self._TOTAL_BEFORE.search((text or "")[max(0, claim.start() - 60):claim.start()])
+            for claim in claims)
+        selection = state.get("selection") or {}
+        facts = state.get("facts", {})
+        quote_class = (quote or {}).get("size_class") or selection.get("size_class") or facts.get("size_class")
+        default_classes = [quote_class] if quote_class else list(catalog.size_classes)
+        names = [item.name for item in catalog.services.values()]
+        names += [item.name for item in catalog.tariffs.values()]
+        if not names:
+            return False
         negation = re.compile(r"\b(?:нет|не|без|нельзя|невозможн\w*|недоступн\w*|"
                               r"не\s+бывает|не\s+стоит|вместо)\b", re.I)
         boundary = re.compile(r"[.;!?\n]|\b(?:а|но|однако)\b", re.I)
-        for match in re.finditer(r"(\d[\d\s.,]{0,12})\s*(?:₽|руб)", text or "", re.I):
-            claims.append(match)
+        item_claims = total_claims = negated = 0
+        for match in claims:
             value = int(re.sub(r"\D", "", match[1]) or 0)
-            before = boundary.split(text[max(0, match.start() - 40):match.start()])[-1]
-            after = boundary.split(text[match.end():match.end() + 30])[0]
+            if self._TOTAL_BEFORE.search((text or "")[max(0, match.start() - 60):match.start()]):
+                total_claims += 1
+                continue
+            before = boundary.split((text or "")[max(0, match.start() - 40):match.start()])[-1]
+            after = boundary.split((text or "")[match.end():match.end() + 30])[0]
             if negation.search(before + " " + after):
                 negated += 1
                 continue
-            positive.append(value)
-        if not known or not claims:
-            return False
-        if not positive:
-            return bool(negated)  # только отказ/отрицание выдуманной цены
-        if all(value in known for value in positive):
+            line_start, _, segment = self._line_around(text or "", match)
+            price_start, price_end = match.start() - line_start, match.end() - line_start
+            name = self._nearest_name(names, segment, price_start, price_end)
+            if not name:
+                return False
+            quote_item = quote_items.get(folded(name)) if quote_items else None
+            if quote_item is None and quote_items:
+                stems = word_stems(name)
+                quote_item = next((item for key, item in quote_items.items()
+                                   if word_stems(key) == stems), None)
+            if quote_items and quote_item is None and quote_is_breakdown:
+                return False  # цена позиции, которой нет в авторитетном расчёте
+            prices, available = self._catalog_item_prices(catalog, name)
+            if not prices or not available:
+                return False
+            explicit_class = self._nearest_name(catalog.size_classes, segment, price_start, price_end)
+            if explicit_class:
+                if explicit_class not in prices:
+                    return False
+                classes = [explicit_class]
+            else:
+                classes = [size_class for size_class in default_classes if size_class in prices]
+                if not classes:
+                    return False
+            if not any(value == prices[size_class] for size_class in classes):
+                return False
+            if (quote_item and quote_item.get("kind") in {"tariff", "service"}
+                    and quote_item.get("price") is not None
+                    and (not explicit_class or explicit_class == quote_class)):
+                try:
+                    if value != int(quote_item["price"]):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+            item_claims += 1
+        if item_claims:
             return True
-        # Сумма из нескольких цен прайса, названных в том же ответе, — тоже
-        # проверяемая цена. Слагаемые берём только из каталога, поэтому
-        # выдуманная арифметика вроде «100 + 200 = 300» не проходит.
-        components = [value for value in positive if value in known]
-        possible = set(components)
-        for size in (2, 3):
-            for combination in combinations(components, size):
-                possible.add(sum(combination))
-        return all(value in known or value in possible for value in positive)
+        return bool(total_claims or negated)
 
     def _catalog_total_matches(self, user_id, text, claimed) -> bool:
         """Итог совпадает с детерминированным расчётом по свежему прайсу.
@@ -2622,7 +2853,7 @@ car — слова клиента с исходной цитатой; car_model 
             # по ценам доступных услуг одного класса. Слагаемые должны быть
             # названы в ответе, поэтому произвольная сумма не проходит.
             values = [int(re.sub(r"\D", "", match[1]) or 0)
-                      for match in re.finditer(r"(\d[\d\s.,]{0,12})\s*(?:₽|руб)", text or "", re.I)]
+                      for match in self._PRICE_CLAIM.finditer(text or "")]
             components = [value for value in values if value != claimed]
             for class_name in classes:
                 if not class_name or catalog.class_rule_problem(car, class_name):

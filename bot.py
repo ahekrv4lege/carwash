@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from collections import namedtuple
 from contextlib import nullcontext, suppress, asynccontextmanager
@@ -200,6 +201,23 @@ def markup_from_rows(rows) -> InlineKeyboardMarkup | None:
         [InlineKeyboardButton(text=label, callback_data=data) for label, data in row] for row in keyboard])
 
 
+_BUTTON_PROMISE = re.compile(r"кноп", re.I)
+
+
+def _without_button_promises(text: str) -> str:
+    """Убрать обещание кнопок, если клавиатуру прикрепить не удалось."""
+    if not _BUTTON_PROMISE.search(text or ""):
+        return text
+    kept = [part for part in re.split(r"(?<=[.!?])\s+", text) if not _BUTTON_PROMISE.search(part)]
+    result = " ".join(kept).strip()
+    fallback = "Напишите, пожалуйста, удобный день и время в чат."
+    if not result:
+        return fallback
+    if not result.endswith((".", "!", "?")):
+        result += "."
+    return result + " " + fallback
+
+
 async def send_answer(message: Message, agent: Agent, reporter: AdminReporter,
                       user: ChatUser, text: str, answer: str,
                       keyboard: InlineKeyboardMarkup | None = None) -> None:
@@ -212,18 +230,27 @@ async def send_answer(message: Message, agent: Agent, reporter: AdminReporter,
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="Подтвердить", callback_data=f"booking:confirm:{offer_id}"),
         ]])
+    slot_keyboard_sent = False
     if keyboard is None:
         # Кнопки выбора даты/времени строятся по актуальным слотам таблицы.
         try:
             keyboard = markup_from_rows(await agent.slot_keyboard(user))
+            slot_keyboard_sent = keyboard is not None
         except Exception as error:
             log.warning("Клавиатура недоступна; отправляем текст (%s)", type(error).__name__)
+    if keyboard is None and _BUTTON_PROMISE.search(answer):
+        # Обещать кнопки без клавиатуры нельзя: клиент будет искать их под сообщением.
+        log.warning("Обещание кнопок без клавиатуры заменено текстовой подсказкой")
+        answer = _without_button_promises(answer)
     chunks = split_text(answer)
     for index, chunk in enumerate(chunks):
         if keyboard is not None and index == len(chunks) - 1:
             await message.answer(chunk, reply_markup=keyboard)
         else:
             await message.answer(chunk)
+    if slot_keyboard_sent:
+        # Запрос меню снимаем только после фактической отправки клавиатуры.
+        agent.consume_slot_menu(user.id)
     agent.mark_delivered(user.id, delivery_token)
     agent.mark_turn_delivered(user.id, raw_answer)
     try:
@@ -490,10 +517,7 @@ async def resume_inbox(agent, bot, reporter, *, processed_only=False):
                 else:answer = await agent.reply(user, "\n".join(entry["texts"]))
                 await asyncio.to_thread(agent.inbox.prepare, entry["keys"], answer, agent._snapshot_payload(user.id, time.time()))
             channel = RecoveryMessage(bot, user.id)
-            if processed_only:
-                for chunk in split_text(plain_text(answer)):await channel.answer(chunk)
-            else:
-                await send_answer(channel, agent, reporter, user, "\n".join(entry["texts"]), answer)
+            await send_answer(channel, agent, reporter, user, "\n".join(entry["texts"]), answer)
             await asyncio.to_thread(agent.inbox.acknowledge, entry["keys"])
             agent.clear_recovery(user.id)
         except Exception as error:
