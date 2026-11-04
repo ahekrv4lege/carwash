@@ -1084,6 +1084,18 @@ car — слова клиента с исходной цитатой; car_model 
                                or ("unverified_discount" if self._unverified_discount(user.id, answer) else None))
                     if problem:
                         log.warning("Ответ модели отклонён (%s)", problem)
+                        if problem == "stale_offer":
+                            cancel = re.fullmatch(
+                                r"\s*(?:пожалуйста[, ]+)?(?:отмени(?:те)?|хочу\s+отменить|прошу\s+отменить)"
+                                r"\s+(?:мою\s+)?запись\s*(?:№\s*)?(\d+)\s*[.!]?\s*", text, re.I)
+                            if cancel:
+                                checked = await asyncio.wait_for(self._call_tool(
+                                    "cancel_booking", _compact_json({"booking_id": cancel[1]}), user),
+                                    timeout=remaining())
+                                if checked.get("confirmation_required"):
+                                    return self._remember(user.id, text, self._offer(user.id, self._pending[user.id]))
+                                if checked.get("error"):
+                                    return self._remember(user.id, text, checked["error"])
                         receipt = self._receipt(state)
                         if receipt:
                             answer = receipt
