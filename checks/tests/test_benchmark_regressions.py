@@ -93,6 +93,21 @@ class SchedulingRegressions(unittest.TestCase):
             self.assertIsNone(asyncio.run(agent._explicit_order(user)))
         agent.cars.close()
 
+    def test_bay_status_changed_after_preview_is_rechecked_before_write(self):
+        self.sheet.worksheet("Записи").values[0].append("Бокс")
+        bays=Worksheet(40,"Ограничения боксов",[
+            ["Бокс","Открытие поста","Закрытие поста","Статус"],
+            ["A","09:00","19:00","работает"]])
+        self.sheet.sheets.append(bays)
+        preview=self.store.free_slots("2099-01-01",size_class="Легковой",tariff="Базовый")
+        self.assertIn("10:00",preview["days"][0]["free_times"])
+        bays.values[1][3]="ремонт"
+        result=self.store.create_booking(**booking(time_str="10:00"))
+        self.assertFalse(result["ok"],result)
+        self.assertEqual(len(self.sheet.worksheet("Записи").values),1)
+        bays.values[1][3]="работает"
+        self.assertTrue(self.store.create_booking(**booking(time_str="10:00"))["ok"])
+
     def test_peak_concurrency_not_total_intersections(self):
         schedule = self.store._get_slots()
         rows = [{"Дата":"01.01.2099","Время":t,"Длительность":"60","Статус":"Новая"} for t in ["10:00","11:00"]]

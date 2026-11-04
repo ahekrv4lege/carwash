@@ -568,12 +568,12 @@ class Store:
         """Один свежий пакет для расчёта; финальный write-preflight остаётся независимым."""
         with self._write_lock, self._lock:
             previous = self._observed
-            self._invalidate("catalog", "slots", "bookings")
+            self._invalidate("catalog", "slots", "bookings", "bays")
             try:
                 self._observed = self._adaptive.observe() if self._adaptive else None
                 yield
             except BaseException:
-                self._invalidate("catalog", "slots", "bookings")
+                self._invalidate("catalog", "slots", "bookings", "bays")
                 raise
             finally:
                 self._observed = previous
