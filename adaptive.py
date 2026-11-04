@@ -672,7 +672,8 @@ class AdaptiveSheets:
             rows = 20
             wanted_columns = 60
             for rule in by_sheet.get(props["sheetId"], []):
-                rows = max(rows, min(MAX_PROBE_ROWS, int(rule.get("header_row", 1)) + 2))
+                # Даже нестандартная шапка в строке 60 должна попасть в проверку.
+                rows = max(rows, min(row_count, int(rule.get("header_row", 1)) + 2, 220))
                 wanted_columns = max(wanted_columns, max(rule.get("columns", {}).values() or [0]) + 2)
             rows = min(rows, row_count)
             columns = min(max(wanted_columns, 1), column_count)
