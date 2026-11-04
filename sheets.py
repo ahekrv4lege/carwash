@@ -99,6 +99,13 @@ def to_number(value: Any) -> float | None:
         return None
 
 
+_MONTH_NAMES = (
+    ("январ", "янв"), ("феврал", "фев"), ("март", "мар"), ("апрел", "апр"),
+    ("ма[йя]", "ма[йя]"), ("июн", "июн"), ("июл", "июл"), ("август", "авг"),
+    ("сентябр", "сен"), ("октябр", "окт"), ("ноябр", "ноя"), ("декабр", "дек"),
+)
+
+
 def parse_date(value: Any) -> date | None:
     text = str(value).strip()
     for date_format in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%d.%m.%y"):
@@ -106,6 +113,27 @@ def parse_date(value: Any) -> date | None:
             return datetime.strptime(text, date_format).date()
         except ValueError:
             continue
+    # Модель и клиенты часто пишут «5 ноября 2026» / «5 ноя»; это та же дата,
+    # что и 05.11.2026, и она не должна выпадать из проверки записи.
+    normal = text.casefold().replace("ё", "е")
+    def month_variants(full, short):
+        variants = [rf"{full}\w*", rf"{short}\.?"]
+        if len(full) > 4 and "[" not in full:
+            variants.extend((rf"{full[:-1]}\.?", rf"{full[:4]}\.?"))
+        return "|".join(variants)
+
+    month_pattern = "|".join(month_variants(full, short) for full, short in _MONTH_NAMES)
+    natural = re.fullmatch(
+        r"(\d{1,2})(?:-?го)?\s+(" + month_pattern + r")"
+        r"(?:\s+(\d{4})(?:\s*г(?:ода|\.)?)?)?", normal)
+    if natural:
+        month = next(index + 1 for index, (full, short) in enumerate(_MONTH_NAMES)
+                     if re.fullmatch(month_variants(full, short), natural[2]))
+        try:
+            return date(int(natural[3]) if natural[3] else datetime.now().year,
+                        month, int(natural[1]))
+        except ValueError:
+            return None
     return None
 
 
