@@ -1029,6 +1029,17 @@ car — слова клиента с исходной цитатой; car_model 
                         answer = " + ".join(p for p in parts if p) + f" — {explicit_quote['total']} {self.config.currency}."
                         if explicit_quote.get("duration_minutes"):
                             answer += f" Длительность: {explicit_quote['duration_minutes']} мин."
+                if (user.id not in self._pending and state.get("stage") not in {"booked", "cancelled", "uncertain", "needs_correction"}
+                        and re.search(r"\b(?:запишите|оформите\s+запись)\b", text, re.I)
+                        and not re.search(r"\b(?:не|без|если|или|либо|пока|возможно|может|ли)\b", text, re.I)
+                        and source_date(text, self.store.now(), True) is not None and source_time(text, True)
+                        and all(state.get("facts", {}).get(field) for field in BOOKING_REQUIRED)
+                        and (state["facts"].get("tariff") or state["facts"].get("services"))):
+                    result = await asyncio.wait_for(self._call_tool("create_booking", "{}", user), timeout=remaining())
+                    if result.get("confirmation_required"):
+                        return self._remember(user.id, text, self._offer(user.id, self._pending[user.id]))
+                    if result.get("direct_reply") or result.get("error"):
+                        return self._remember(user.id, text, result.get("direct_reply") or result["error"])
                 if user.id not in self._pending and re.search(r"\b(?:подтвердите\s+(?:запись|заказ)|записать\s+вас|оформить\s+запись|записыва\w*|запиш\w*|оформл\w*|подготовлен\w*|подготов\w*\s+запис\w*)\b", answer, re.I):
                     facts_net = state.setdefault("facts", {})
                     parsed_net_time = source_time(text, True) or source_time(text)
