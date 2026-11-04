@@ -3001,6 +3001,12 @@ car — слова клиента с исходной цитатой; car_model 
             mine = await asyncio.to_thread(self.store.my_bookings, user.id)
             booking = next((candidate_booking for candidate_booking in mine.get("bookings", []) if str(candidate_booking["booking_id"]) == args["booking_id"]), None)
             if not booking:
+                numbered = [candidate for number, candidate in enumerate(mine.get("bookings", []), 1)
+                            if str(number) == args["booking_id"]]
+                if len(numbered) == 1:
+                    booking = numbered[0]
+                    args = dict(args, booking_id=str(booking["booking_id"]))
+            if not booking:
                 return {"ok": False, "error": "Предстоящая запись этого клиента не найдена"}
             pending = {"action": name, "args": args, "booking": dict(booking, currency=self.config.currency)}
             if name == "reschedule_booking":
