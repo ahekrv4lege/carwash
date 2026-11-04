@@ -460,7 +460,12 @@ def main() -> int:
                 document = store.refresh_schema(force=args.refresh_schema,
                                                 validate=args.validate_mappings,
                                                 explicit=args.refresh_schema)
+                ai = document.get("ai") or {}
                 print(f"Структура: {document['validation_status']}; запись разрешена: {document['writes_enabled']}")
+                print(f"Карта: {config.sheets_mapping_file}; версия {document.get('mapping_version')}; "
+                      f"источник {document.get('source')}; областей {len(document.get('regions', []))}")
+                print(f"AI: вызовов {ai.get('calls', 0)}; токенов {ai.get('total_tokens', '?')}; "
+                      f"время {ai.get('duration_sec', '?')}с; стоимость {ai.get('cost_usd', 'нет данных')}")
                 print("Конфигурация сохранена локально; Google Sheets не изменялась")
                 return 0 if document["validation_status"] == "valid" else 2
             if args.check:
